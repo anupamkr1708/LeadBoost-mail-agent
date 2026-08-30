@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from mailer_agent.api.deps import require_api_key
-from mailer_agent.db import get_db
-from mailer_agent.followup.engine import is_suppressed, send_initial_outreach
+from mailer_agent.db import get_db, session_scope
+from mailer_agent.followup.engine import is_suppressed, send_initial_outreach, stagger_sleep
 from mailer_agent.lead_ingestion import LeadIngestionError, normalize_lead_payload
 from mailer_agent.models import Campaign, Contact, ContactStatus
 from mailer_agent.schemas import (
@@ -15,6 +17,8 @@ from mailer_agent.schemas import (
     ContactOut,
     LeadIngestRequest,
 )
+
+logger = logging.getLogger("mailer_agent.api.campaigns")
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"], dependencies=[Depends(require_api_key)])
 
@@ -153,12 +157,16 @@ def ingest_leads(campaign_id: int, payload: LeadIngestRequest, db: Session = Dep
 
 
 @router.post("/{campaign_id}/start")
-def start_campaign(campaign_id: int, db: Session = Depends(get_db)):
+def start_campaign(campaign_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
-    Immediately sends initial outreach to every NEW contact in this
-    campaign (rather than waiting for the next scheduler tick). The
-    background scheduler will still pick up any contacts added later
-    and all follow-ups/replies from here on.
+    Sends the first message immediately (so you get instant feedback for
+    testing) and dispatches the rest in the background, staggered by
+    send_delay_seconds (+jitter) apart. Running the whole batch inline
+    would (a) make every send land within the same second or two, which
+    reads as automated bulk activity to a real recipient, and (b) block
+    the HTTP request for the full staggered duration, which will exceed
+    typical reverse-proxy/gunicorn timeouts once a campaign has more
+    than a handful of contacts.
     """
     campaign = db.get(Campaign, campaign_id)
     if not campaign:
@@ -169,6 +177,41 @@ def start_campaign(campaign_id: int, db: Session = Depends(get_db)):
         .filter(Contact.campaign_id == campaign_id, Contact.status == ContactStatus.NEW.value)
         .all()
     )
-    results = [send_initial_outreach(db, c) for c in new_contacts]
+    if not new_contacts:
+        return {"campaign_id": campaign_id, "dispatched_now": 0, "queued_in_background": 0, "results": []}
+
+    first, rest = new_contacts[0], new_contacts[1:]
+    first_result = send_initial_outreach(db, first)
     db.commit()
-    return {"campaign_id": campaign_id, "dispatched": len(results), "results": results}
+
+    if rest:
+        background_tasks.add_task(_dispatch_remaining, campaign_id, [c.id for c in rest])
+
+    from mailer_agent.config import get_settings
+    delay = get_settings().send_delay_seconds
+
+    return {
+        "campaign_id": campaign_id,
+        "dispatched_now": 1,
+        "queued_in_background": len(rest),
+        "results": [first_result],
+        "note": (
+            f"Remaining {len(rest)} contact(s) are sending in the background, "
+            f"staggered ~{delay:.0f}s+ apart. Poll GET /campaigns/{campaign_id}/contacts "
+            "or a contact's /thread to see when each one lands."
+        ) if rest else None,
+    }
+
+
+def _dispatch_remaining(campaign_id: int, contact_ids: list[int]) -> None:
+    with session_scope() as db:
+        for i, contact_id in enumerate(contact_ids):
+            stagger_sleep()  # every item in this batch waits, including the first -- the very first contact already sent synchronously above
+            contact = db.get(Contact, contact_id)
+            if contact and contact.status == ContactStatus.NEW.value:
+                try:
+                    send_initial_outreach(db, contact)
+                    db.commit()
+                except Exception:
+                    logger.exception("Background dispatch failed for contact %s in campaign %s", contact_id, campaign_id)
+                    db.rollback()

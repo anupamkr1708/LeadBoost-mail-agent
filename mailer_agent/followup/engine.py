@@ -11,6 +11,8 @@ work out "how many days from now until the next touch".
 from __future__ import annotations
 
 import logging
+import random
+import time
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
@@ -184,7 +186,11 @@ def run_new_contact_cycle(db: Session, limit: int | None = None) -> list[dict]:
         .limit(limit)
         .all()
     )
-    results = [send_initial_outreach(db, c) for c in contacts]
+    results = []
+    for i, c in enumerate(contacts):
+        if i > 0:
+            stagger_sleep()
+        results.append(send_initial_outreach(db, c))
     db.commit()
     return results
 
@@ -203,6 +209,21 @@ def run_followup_cycle(db: Session, limit: int | None = None) -> list[dict]:
         .limit(limit)
         .all()
     )
-    results = [send_followup_if_due(db, c) for c in due_contacts]
+    results = []
+    for i, c in enumerate(due_contacts):
+        if i > 0:
+            stagger_sleep()
+        r = send_followup_if_due(db, c)
+        if r:
+            results.append(r)
     db.commit()
-    return [r for r in results if r]
+    return results
+
+
+def stagger_sleep() -> None:
+    """Real prospects landing seconds apart from the same sender reads
+    as automated bulk activity. Called between consecutive sends in a
+    batch -- never before the first one, since a single send shouldn't
+    be delayed for no reason."""
+    delay = settings.send_delay_seconds + random.uniform(0, settings.send_jitter_seconds)
+    time.sleep(delay)

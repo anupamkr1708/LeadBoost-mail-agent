@@ -59,7 +59,8 @@ def test_full_flow(client):
 
     r = client.post(f"/campaigns/{campaign_id}/start")
     assert r.status_code == 200
-    assert r.json()["dispatched"] == 1
+    assert r.json()["dispatched_now"] == 1
+    assert r.json()["queued_in_background"] == 0
 
     r = client.get(f"/contacts/{contact_id}/thread")
     assert len(r.json()["messages"]) == 1
@@ -164,3 +165,48 @@ def test_inbound_webhook_matches_thread(client):
     )
     assert r.status_code == 200
     assert r.json()["matched"] is True
+
+
+def test_start_campaign_sends_first_contact_immediately_and_queues_rest(client, monkeypatch):
+    # Patch the shared settings singleton directly (env-var monkeypatching
+    # doesn't reach modules that already cached their own `settings`
+    # reference at import time) so this test doesn't actually sleep --
+    # it's here to prove the *shape* of the dispatch (1 sent inline, N
+    # queued to the background task), not to time the real delay.
+    from mailer_agent.followup import engine as engine_module
+    monkeypatch.setattr(engine_module.settings, "send_delay_seconds", 0.0)
+    monkeypatch.setattr(engine_module.settings, "send_jitter_seconds", 0.0)
+
+    r = client.post(
+        "/campaigns",
+        json={
+            "name": "Stagger Campaign",
+            "sender_name": "Jordan",
+            "sender_org": "TestOrg",
+            "sender_email": "jordan@testorg.example.com",
+            "value_prop": "Same offer.",
+        },
+    )
+    campaign_id = r.json()["id"]
+
+    r = client.post(
+        f"/campaigns/{campaign_id}/contacts",
+        json={"contacts": [
+            {"email": "first@prospect.example.com"},
+            {"email": "second@prospect.example.com"},
+            {"email": "third@prospect.example.com"},
+        ]},
+    )
+    contact_ids = [c["id"] for c in r.json()]
+
+    r = client.post(f"/campaigns/{campaign_id}/start")
+    assert r.status_code == 200
+    assert r.json()["dispatched_now"] == 1
+    assert r.json()["queued_in_background"] == 2
+
+    # TestClient runs FastAPI BackgroundTasks synchronously before
+    # returning, so by the time we get here all three should have sent.
+    for cid in contact_ids:
+        thread = client.get(f"/contacts/{cid}/thread").json()
+        assert len(thread["messages"]) == 1
+        assert thread["messages"][0]["message_type"] == "initial_outreach"

@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     auto_reply_enabled: bool = False
     # Hard ceiling regardless of campaign/contact count, per poll cycle.
     max_sends_per_cycle: int = 20
+    # Real prospects landing seconds apart from the same sender reads as
+    # bot activity (and hammers your SMTP/IMAP rate limits). This is the
+    # base gap between consecutive sends within one dispatch batch;
+    # send_jitter_seconds adds a random 0-N second variation on top so
+    # the cadence doesn't look mechanically fixed either.
+    send_delay_seconds: float = 8.0
+    send_jitter_seconds: float = 7.0
 
     # --- API ------------------------------------------------------------
     api_key: str = ""  # if set, required as `X-API-Key` header on all routes
