@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from mailer_agent.config import get_settings
 from mailer_agent.llm.agent import classify_reply, draft_message
-from mailer_agent.mail.imap_reader import InboundEmail
+from mailer_agent.mail.imap_reader import InboundEmail, as_reply_subject
 from mailer_agent.mail.sender import send_email
 from mailer_agent.memory.store import build_conversation_context, maybe_summarize_older_messages
 from mailer_agent.models import Contact, ContactStatus, Message, MessageDirection, MessageStatus, MessageType, SuppressionEntry
@@ -137,14 +137,14 @@ def process_inbound_email(db: Session, email_in: InboundEmail) -> dict:
             contact_id=contact.id,
             direction=MessageDirection.OUTBOUND.value,
             message_type=MessageType.REPLY.value if action_type == "reply" else MessageType.CLOSING.value,
-            subject=draft.subject or (f"Re: {email_in.subject}" if email_in.subject else None),
+            subject=draft.subject or as_reply_subject(email_in.subject),
             body=draft.body,
             status=MessageStatus.DRAFT.value,
             in_reply_to_header=email_in.message_id,
         )
 
         if can_auto_send:
-            reply_subject = draft.subject or (f"Re: {email_in.subject}" if email_in.subject else "Re: our conversation")
+            reply_subject = draft.subject or as_reply_subject(email_in.subject)
             send_result = send_email(
                 to_email=contact.email,
                 from_email=campaign.sender_email,

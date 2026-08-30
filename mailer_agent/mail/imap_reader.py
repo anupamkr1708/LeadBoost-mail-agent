@@ -13,6 +13,7 @@ from __future__ import annotations
 import email
 import imaplib
 import logging
+import re
 from dataclasses import dataclass
 from email.header import decode_header
 from email.utils import parseaddr
@@ -22,6 +23,18 @@ from mailer_agent.config import get_settings
 logger = logging.getLogger("mailer_agent.mail.imap")
 
 settings = get_settings()
+
+_RE_PREFIX = re.compile(r"^\s*re\s*:\s*", re.IGNORECASE)
+
+
+def as_reply_subject(original_subject: str | None) -> str:
+    """'following up' -> 'Re: following up'; 'Re: following up' -> unchanged
+    (never stacks a second 'Re:' the way naive prepending does)."""
+    if not original_subject:
+        return "Re: our conversation"
+    if _RE_PREFIX.match(original_subject):
+        return original_subject.strip()
+    return f"Re: {original_subject.strip()}"
 
 
 @dataclass

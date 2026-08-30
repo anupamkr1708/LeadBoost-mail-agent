@@ -1,0 +1,73 @@
+# Render Blueprint. In the Render dashboard: New -> Blueprint -> point at
+# this repo, and Render provisions all three resources below together with
+# the env vars wired between them automatically.
+#
+# You still need to fill in secrets (GROQ_API_KEY, SMTP_*, IMAP_*, API_KEY)
+# in the Render dashboard after the first deploy -- see the README's
+# "Deploying to Render" section for exactly which ones and how to generate
+# API_KEY.
+
+databases:
+  - name: mailer-agent-db
+    plan: starter          # paid tier -- free Postgres on Render is deleted
+                            # after ~30 days and isn't meant for production
+    databaseName: mailer_agent
+    user: mailer_agent
+
+services:
+  - type: web
+    name: mailer-agent-api
+    runtime: python
+    plan: starter           # paid tier -- avoids the 15-min free-tier spin-down
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn mailer_agent.api.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT --timeout 60
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mailer-agent-db
+          property: connectionString
+      - key: RUN_SCHEDULER_IN_PROCESS
+        value: "false"       # the separate background worker below owns the scheduler
+      - key: LIVE_SENDING_ENABLED
+        value: "false"        # flip to true only after reviewing draft output
+      - key: AUTO_REPLY_ENABLED
+        value: "false"
+      - key: API_KEY
+        sync: false           # set manually in the dashboard -- see README
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: IMAP_USERNAME
+        sync: false
+      - key: IMAP_PASSWORD
+        sync: false
+
+  - type: worker
+    name: mailer-agent-worker
+    runtime: python
+    plan: starter            # background workers are not available on the free tier
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mailer-agent-db
+          property: connectionString
+      - key: LIVE_SENDING_ENABLED
+        value: "false"
+      - key: AUTO_REPLY_ENABLED
+        value: "false"
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: IMAP_USERNAME
+        sync: false
+      - key: IMAP_PASSWORD
+        sync: false

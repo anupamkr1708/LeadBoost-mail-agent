@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from mailer_agent.config import get_settings
 from mailer_agent.llm.agent import draft_message
+from mailer_agent.mail.imap_reader import as_reply_subject
 from mailer_agent.mail.sender import send_email
 from mailer_agent.memory.store import build_conversation_context, maybe_summarize_older_messages
 from mailer_agent.models import (
@@ -133,7 +134,7 @@ def send_followup_if_due(db: Session, contact: Contact) -> dict | None:
 
     prior_msg_id = _most_recent_message_id(contact)
     subject = draft.subject or (
-        f"Re: {contact.messages[0].subject}" if contact.messages and contact.messages[0].subject else None
+        as_reply_subject(contact.messages[0].subject) if contact.messages and contact.messages[0].subject else None
     )
 
     send_result = send_email(
