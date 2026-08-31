@@ -43,14 +43,27 @@ class Base(DeclarativeBase):
 
 
 class ContactStatus(str, enum.Enum):
+    """
+    Relationship state in the sales conversation.
+    
+    Enhanced to reflect B2B buying stages and conversation state.
+    """
     NEW = "new"                        # created, nothing sent yet
     ACTIVE = "active"                  # in sequence, awaiting next action or reply
     REPLIED = "replied"                # last inbound message needs a reply
+    ENGAGED = "engaged"                # positive interest shown, active conversation
+    QUALIFYING = "qualifying"          # asking questions, gathering info
+    EVALUATING = "evaluating"          # comparing solutions, commercial discussion
+    MEETING_REQUESTED = "meeting_requested"  # prospect wants to meet
+    MEETING_SCHEDULED = "meeting_scheduled"  # meeting confirmed
+    NEGOTIATING = "negotiating"        # discussing terms, pricing, contract
+    NURTURE = "nurture"                # interested but not ready (future opportunity)
     SEQUENCE_COMPLETE = "sequence_complete"  # ran out of follow-ups, no reply
     CLOSED_WON = "closed_won"
     CLOSED_LOST = "closed_lost"
     SUPPRESSED = "suppressed"          # opted out / bounced -- never message again
     PAUSED = "paused"                  # human paused it manually
+    NEEDS_REVIEW = "needs_review"      # requires human attention
 
 
 class MessageDirection(str, enum.Enum):
@@ -66,9 +79,18 @@ class MessageType(str, enum.Enum):
 
 
 class MessageStatus(str, enum.Enum):
+    """
+    Message send/receive state with explicit lifecycle.
+    
+    Enhanced to track send lifecycle and ambiguous outcomes.
+    """
     DRAFT = "draft"          # generated, not sent (live_sending_enabled=False, or awaiting approval)
-    SENT = "sent"
-    FAILED = "failed"
+    APPROVED = "approved"    # approved for sending, not yet sent
+    PENDING = "pending"      # send requested, queued for execution
+    SENDING = "sending"      # SMTP connection in progress
+    SENT = "sent"            # successfully sent and confirmed
+    FAILED = "failed"        # send failed permanently
+    UNKNOWN = "unknown"      # provider may have sent, but we don't know (crash window)
     RECEIVED = "received"    # inbound messages are always "received", never draft/sent
 
 
@@ -128,6 +150,12 @@ class Contact(Base):
     status = Column(String, default=ContactStatus.NEW.value)
     follow_up_index = Column(Integer, default=0)  # how many follow-ups sent so far
     next_action_at = Column(DateTime, nullable=True)  # when the scheduler should act next
+    
+    # Enhanced relationship tracking
+    last_reply_at = Column(DateTime, nullable=True)  # When prospect last replied
+    last_outbound_at = Column(DateTime, nullable=True)  # When we last sent
+    buying_stage = Column(String, nullable=True)  # From semantic analysis
+    engagement_score = Column(Float, default=0.0)  # 0-1 score based on interactions
 
     # Rolling LLM-generated summary of older messages, used to keep
     # long threads' prompts bounded. See memory/store.py.
@@ -164,6 +192,11 @@ class Message(Base):
     # Only set for inbound messages, by the reply classifier.
     detected_intent = Column(String, nullable=True)  # interested/objection/question/not_interested/oos/unsubscribe/neutral
     intent_confidence = Column(Float, nullable=True)
+    
+    # Enhanced semantic analysis (JSON stored)
+    semantic_analysis = Column(JSON, nullable=True)  # Full SemanticIntent as JSON
+    classification_success = Column(Boolean, nullable=True)  # Did classification succeed?
+    classification_failure_reason = Column(String, nullable=True)  # If failed, why?
 
     error_message = Column(Text, nullable=True)  # populated when status=failed
 
