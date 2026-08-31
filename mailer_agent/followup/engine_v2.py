@@ -7,7 +7,7 @@ Combines semantic intelligence, state machine, and conversation-aware scheduling
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -31,6 +31,7 @@ from mailer_agent.state_machine import (
     can_send_followup,
     transition_contact_state,
 )
+from mailer_agent.utils.datetime_utils import utcnow
 
 logger = logging.getLogger("mailer_agent.followup.engine_v2")
 settings = get_settings()
@@ -69,6 +70,30 @@ class IntegratedFollowUpEngine:
             action_type="initial_outreach",
             context_transcript=context_transcript
         )
+
+        # Grounding gate: hold for human review if unsupported claims found
+        if draft.grounding and not draft.grounding.is_safe_to_send:
+            logger.info(
+                "Contact %s initial outreach held for grounding review: %s",
+                contact.id, draft.grounding.validation_notes,
+            )
+            msg = Message(
+                contact_id=contact.id,
+                direction=MessageDirection.OUTBOUND.value,
+                message_type=MessageType.INITIAL.value,
+                subject=draft.subject or f"{campaign.sender_org} <> {contact.company or contact.name}",
+                body=draft.body,
+                status=MessageStatus.DRAFT.value,
+            )
+            db.add(msg)
+            db.add(contact)
+            db.flush()
+            return {
+                "contact_id": contact.id,
+                "action": "held_grounding_review",
+                "grounding_notes": draft.grounding.validation_notes,
+                "source": draft.source,
+            }
         
         # Send email
         send_result = send_email(
@@ -102,7 +127,7 @@ class IntegratedFollowUpEngine:
             )
             
             # Update timestamps
-            contact.last_outbound_at = datetime.utcnow()
+            contact.last_outbound_at = utcnow()
             
             # Schedule next follow-up using conversation-aware logic
             contact.next_action_at = self.scheduler.compute_next_followup(
@@ -157,7 +182,7 @@ class IntegratedFollowUpEngine:
         # Calculate days waited
         days_waited = None
         if contact.last_outbound_at:
-            days_waited = (datetime.utcnow() - contact.last_outbound_at).days
+            days_waited = (utcnow() - contact.last_outbound_at).days
         
         # Get conversation-aware hints
         message_hints = self.scheduler.get_followup_message_hint(contact)
@@ -171,6 +196,33 @@ class IntegratedFollowUpEngine:
             context_transcript=context_transcript,
             days_waited=days_waited
         )
+
+        # Grounding gate: hold for human review if unsupported claims found
+        if draft.grounding and not draft.grounding.is_safe_to_send:
+            logger.info(
+                "Contact %s follow-up held for grounding review: %s",
+                contact.id, draft.grounding.validation_notes,
+            )
+            prior_msg_id_g = self._most_recent_message_id(contact)
+            subject_g = draft.subject or f"Following up -- {campaign.sender_org}"
+            msg = Message(
+                contact_id=contact.id,
+                direction=MessageDirection.OUTBOUND.value,
+                message_type=MessageType.FOLLOW_UP.value,
+                subject=subject_g,
+                body=draft.body,
+                status=MessageStatus.DRAFT.value,
+                in_reply_to_header=prior_msg_id_g,
+            )
+            db.add(msg)
+            db.add(contact)
+            db.flush()
+            return {
+                "contact_id": contact.id,
+                "action": "held_grounding_review",
+                "grounding_notes": draft.grounding.validation_notes,
+                "source": draft.source,
+            }
         
         # Prepare subject
         prior_msg_id = self._most_recent_message_id(contact)
@@ -214,7 +266,7 @@ class IntegratedFollowUpEngine:
             )
             
             # Update timestamps
-            contact.last_outbound_at = datetime.utcnow()
+            contact.last_outbound_at = utcnow()
             contact.follow_up_index += 1
             
             # Schedule next follow-up using conversation-aware logic
@@ -249,39 +301,105 @@ class IntegratedFollowUpEngine:
                 return m.message_id_header
         return None
     
-    def run_followup_cycle(self, db: Session, limit: Optional[int] = None) -> list[dict]:
+    def run_followup_cycle(
+        self,
+        db: Session,
+        limit: Optional[int] = None,
+        worker_id: Optional[str] = None,
+    ) -> list[dict]:
         """
-        Run follow-up cycle with conversation-aware checks.
+        Run follow-up cycle with conversation-aware checks and safe work claiming.
+
+        Work claiming (Phase 8)
+        -----------------------
+        Rather than a plain SELECT that every concurrent worker would see
+        simultaneously, this method atomically claims each contact row using
+        a database-level lock before processing it.
+
+        PostgreSQL (production): uses ``SELECT … FOR UPDATE SKIP LOCKED``
+          -- competing workers skip already-locked rows instead of blocking,
+          so two workers never process the same contact simultaneously.
+
+        SQLite (dev/tests): uses an optimistic UPDATE with a WHERE guard;
+          SQLite serialises writes anyway so races don't occur in practice.
+
+        Lease expiry / recovery
+        -----------------------
+        Each claim records ``(claimed_by, claimed_at)`` on the Contact row.
+        If the worker crashes before releasing a claim, any subsequent worker
+        cycle will reclaim the row once ``claimed_at`` is older than
+        ``CLAIM_LEASE_SECONDS`` (default 300 s).  Stale leases from a crashed
+        previous process are also swept on each call via
+        ``recover_expired_claims()``.
         """
-        limit = limit or settings.max_sends_per_cycle
-        
-        # Find due contacts
+        from mailer_agent.followup.work_claiming import (
+            claim_due_contacts,
+            make_worker_id,
+            recover_expired_claims,
+            release_claim,
+        )
+        from mailer_agent.followup.engine import stagger_sleep
+
+        effective_limit = limit or settings.max_sends_per_cycle
+        effective_worker_id = worker_id or make_worker_id()
+
+        # --- Startup sweep: recover any leases left by a crashed worker ----
+        recovered = recover_expired_claims(db)
+        if recovered:
+            logger.warning(
+                "Recovered %d expired claim(s) at start of follow-up cycle", recovered
+            )
+
+        # --- Atomically claim due contacts ---------------------------------
+        due_contacts = claim_due_contacts(
+            db,
+            worker_id=effective_worker_id,
+            status=ContactStatus.ACTIVE.value,
+            limit=effective_limit,
+        )
+
+        # Reload full objects with campaign relationship so joins are present.
+        # claim_due_contacts already returns ORM objects but we refetch to
+        # ensure the Campaign join is eagerly available.
+        contact_ids = [c.id for c in due_contacts]
+        if not contact_ids:
+            return []
+
         due_contacts = (
             db.query(Contact)
             .join(Campaign)
             .filter(
-                Contact.status == ContactStatus.ACTIVE.value,
-                Contact.next_action_at.isnot(None),
-                Contact.next_action_at <= datetime.utcnow(),
+                Contact.id.in_(contact_ids),
                 Campaign.is_active.is_(True),
             )
-            .limit(limit)
             .all()
         )
-        
+
+        # --- Process each claimed contact ----------------------------------
         results = []
         for i, contact in enumerate(due_contacts):
             if i > 0:
-                from mailer_agent.followup.engine import stagger_sleep
                 stagger_sleep()
-            
-            result = self.send_followup_if_due(db, contact)
-            if result:
-                results.append(result)
-        
+
+            try:
+                result = self.send_followup_if_due(db, contact)
+                if result:
+                    results.append(result)
+            except Exception:
+                logger.exception("Error processing contact %d", contact.id)
+            finally:
+                # Always release — even on error — so the lease doesn't expire
+                # unnecessarily and block this contact from being retried.
+                release_claim(db, contact)
+
         db.commit()
-        
-        logger.info(f"Follow-up cycle completed: {len(results)} sent")
+
+        logger.info(
+            "Follow-up cycle completed (worker=%s): %d claimed, %d processed",
+            effective_worker_id,
+            len(contact_ids),
+            len(results),
+        )
         return results
 
 

@@ -8,12 +8,13 @@ Prevents invalid transitions and enforces business rules.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
 from mailer_agent.models import Contact, ContactStatus
 from mailer_agent.semantic_models import BuyingStage, IntentType, SemanticIntent
+from mailer_agent.utils.datetime_utils import utcnow
 
 logger = logging.getLogger("mailer_agent.state_machine")
 
@@ -184,7 +185,7 @@ def transition_contact_state(
     )
     
     contact.status = new_state
-    contact.updated_at = datetime.utcnow()
+    contact.updated_at = utcnow()
     
     return True
 
@@ -268,7 +269,7 @@ def can_send_followup(contact: Contact) -> bool:
         return False
     
     # Must be due
-    if contact.next_action_at > datetime.utcnow():
+    if contact.next_action_at > utcnow():
         return False
     
     return True

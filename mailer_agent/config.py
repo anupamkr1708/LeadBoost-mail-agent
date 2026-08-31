@@ -74,7 +74,10 @@ class Settings(BaseSettings):
     send_delay_seconds: float = 8.0
     send_jitter_seconds: float = 7.0
 
-    # --- API ------------------------------------------------------------
+    # --- API / Multi-tenancy --------------------------------------------
+    # Single legacy key (maps to org "default"). For multi-tenant use,
+    # prefer ORG_KEY_MAP (JSON) or individual ORG_KEYS_<org_id>=<key> vars
+    # -- see mailer_agent/api/deps.py for the full resolution order.
     api_key: str = ""  # if set, required as `X-API-Key` header on all routes
 
 

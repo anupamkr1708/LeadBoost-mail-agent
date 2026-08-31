@@ -24,16 +24,26 @@ class CampaignCreate(BaseModel):
         description="Days to wait before each successive follow-up, e.g. [3,7,14] = 3 days after send, "
         "then 7 more, then 14 more. Fully configurable per campaign.",
     )
+    timezone: str = Field(
+        default="UTC",
+        description=(
+            "IANA timezone string for campaign scheduling and business-hours logic, "
+            "e.g. 'America/New_York', 'Europe/London', 'Asia/Kolkata'. "
+            "Defaults to UTC."
+        ),
+    )
 
 
 class CampaignOut(BaseModel):
     id: int
     name: str
+    organization_id: str | None
     sender_name: str
     sender_org: str
     sender_email: str
     is_active: bool
     follow_up_days: list[int]
+    timezone: str
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

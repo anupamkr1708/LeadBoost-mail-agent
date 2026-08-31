@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -39,6 +39,7 @@ from mailer_agent.state_machine import (
     infer_event_from_semantic_intent,
     transition_contact_state,
 )
+from mailer_agent.utils.datetime_utils import utcnow
 
 logger = logging.getLogger("mailer_agent.mail.reply_handler_v2")
 settings = get_settings()
@@ -100,7 +101,7 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
     db.flush()
     
     # Update contact timestamps
-    contact.last_reply_at = datetime.utcnow()
+    contact.last_reply_at = utcnow()
     
     # Step 4: Semantic classification
     context_transcript = build_conversation_context(db, contact)
@@ -296,9 +297,18 @@ def _draft_and_maybe_send_reply(
         action_type=action_type,
         context_transcript=context_transcript
     )
+
+    # Grounding gate: if unsupported claims found, force draft status
+    # regardless of auto-reply settings.
+    grounding_blocked = draft.grounding and not draft.grounding.is_safe_to_send
+    if grounding_blocked:
+        logger.info(
+            "Contact %s reply held for grounding review: %s",
+            contact.id, draft.grounding.validation_notes,
+        )
     
     # Determine if we can auto-send
-    can_auto_send = _can_auto_send_reply(intent)
+    can_auto_send = _can_auto_send_reply(intent) and not grounding_blocked
     
     # Create reply message
     reply_msg = Message(
@@ -330,7 +340,7 @@ def _draft_and_maybe_send_reply(
         reply_msg.subject = reply_subject
         
         if send_result.success:
-            contact.last_outbound_at = datetime.utcnow()
+            contact.last_outbound_at = utcnow()
         
         result["action"] = "auto_replied" if send_result.success else "auto_reply_failed"
         result["message_id"] = reply_msg.id
@@ -339,7 +349,12 @@ def _draft_and_maybe_send_reply(
         # Requires human approval
         result["action"] = "reply_drafted_awaiting_approval"
         result["message_id"] = reply_msg.id
-        result["approval_reason"] = _get_approval_reason(intent)
+        if grounding_blocked and draft.grounding:
+            result["approval_reason"] = (
+                f"Grounding: {draft.grounding.validation_notes}"
+            )
+        else:
+            result["approval_reason"] = _get_approval_reason(intent)
     
     db.add(reply_msg)
 

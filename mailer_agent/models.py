@@ -22,7 +22,7 @@ Design notes:
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
@@ -34,8 +34,11 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
+
+from mailer_agent.utils.datetime_utils import utcnow
 
 
 class Base(DeclarativeBase):
@@ -99,6 +102,10 @@ class Campaign(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
+    
+    # Multi-tenancy: Organization ownership
+    # Each campaign belongs to exactly one organization (LeadBoost customer)
+    organization_id = Column(String, nullable=True, index=True)  # Nullable for migration compatibility
 
     # Sender identity -- who this campaign is "from"
     sender_name = Column(String, nullable=False)
@@ -121,18 +128,29 @@ class Campaign(Base):
     # Cadence -- dynamic, per campaign, not fixed in code.
     follow_up_days = Column(JSON, default=lambda: [3, 7, 14])
     max_follow_ups = Column(Integer, nullable=True)  # defaults to len(follow_up_days)
+    
+    # Timezone for campaign scheduling
+    # Used for interpreting "business hours" and prospect local time
+    # Format: IANA timezone string (e.g., "America/New_York", "UTC", "Asia/Kolkata")
+    timezone = Column(String, default="UTC")
 
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
     contacts = relationship("Contact", back_populates="campaign")
 
 
 class Contact(Base):
     __tablename__ = "contacts"
+    __table_args__ = (
+        # Enforce idempotency: same email cannot appear twice in one campaign.
+        # This is the DB-level backstop; the application checks first to give
+        # a friendly error, but this constraint prevents races.
+        UniqueConstraint("campaign_id", "email", name="uq_contacts_campaign_email"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=False)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False)
 
     name = Column(String, nullable=True)
     email = Column(String, nullable=False, index=True)
@@ -161,8 +179,18 @@ class Contact(Base):
     # long threads' prompts bounded. See memory/store.py.
     memory_summary = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Distributed work claiming (Phase 8 — safe work claiming).
+    # When a scheduler worker picks up a contact for outreach/follow-up
+    # it writes its worker_id here and sets claimed_at to now().
+    # Only the claiming worker should then process this contact.
+    # Lease expiry: if claimed_at < now() - CLAIM_LEASE_SECONDS (default 5 min)
+    # the record is considered abandoned and can be re-claimed by any worker.
+    # These fields are NULL when the contact is not currently being processed.
+    claimed_by = Column(String, nullable=True, index=True)    # worker identity string
+    claimed_at = Column(DateTime, nullable=True)              # when the lease was taken
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     campaign = relationship("Campaign", back_populates="contacts")
     messages = relationship(
@@ -174,7 +202,7 @@ class Message(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, index=True)
-    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=False)
+    contact_id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False)
 
     direction = Column(String, nullable=False)  # MessageDirection
     message_type = Column(String, nullable=True)  # MessageType (null for inbound)
@@ -200,7 +228,7 @@ class Message(Base):
 
     error_message = Column(Text, nullable=True)  # populated when status=failed
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
     contact = relationship("Contact", back_populates="messages")
 
@@ -209,6 +237,14 @@ class SuppressionEntry(Base):
     __tablename__ = "suppression_list"
 
     id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, nullable=False, index=True, unique=True)
+    email = Column(String, nullable=False, index=True)
+    # Org-scoped: an unsubscribe in org "acme" should not suppress the same
+    # address in org "leadboost" unless they share mailboxes.
+    # The unique constraint is therefore on (email, organization_id).
+    organization_id = Column(String, nullable=True, index=True)
     reason = Column(String, nullable=True)  # unsubscribed / bounced / manual
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("email", "organization_id", name="uq_suppression_email_org"),
+    )

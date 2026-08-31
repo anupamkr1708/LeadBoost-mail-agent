@@ -8,7 +8,7 @@ Respects prospect-requested timing and relationship state.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from mailer_agent.models import Campaign, Contact, ContactStatus
 from mailer_agent.semantic_models import BuyingStage, IntentType, SemanticIntent, UrgencyLevel
 from mailer_agent.state_machine import can_send_followup, should_cancel_scheduled_followup
+from mailer_agent.utils.datetime_utils import utcnow
 
 logger = logging.getLogger("mailer_agent.followup.conversation_aware")
 
@@ -69,7 +70,7 @@ class FollowUpScheduler:
         
         # Use campaign cadence
         days_to_wait = campaign.follow_up_days[contact.follow_up_index]
-        next_time = datetime.utcnow() + timedelta(days=days_to_wait)
+        next_time = utcnow() + timedelta(days=days_to_wait)
         
         logger.debug(
             f"Contact {contact.id} next follow-up in {days_to_wait} days "
@@ -94,13 +95,13 @@ class FollowUpScheduler:
             return False, "No next_action_at scheduled"
         
         # Must be due
-        if contact.next_action_at > datetime.utcnow():
-            wait_seconds = (contact.next_action_at - datetime.utcnow()).total_seconds()
+        if contact.next_action_at > utcnow():
+            wait_seconds = (contact.next_action_at - utcnow()).total_seconds()
             return False, f"Not due yet (wait {wait_seconds:.0f}s)"
         
         # Check if recently replied
         if contact.last_reply_at:
-            time_since_reply = datetime.utcnow() - contact.last_reply_at
+            time_since_reply = utcnow() - contact.last_reply_at
             if time_since_reply.days < 1:
                 return False, f"Prospect replied {time_since_reply.seconds // 3600}h ago - conversation active"
         
@@ -119,7 +120,7 @@ class FollowUpScheduler:
         Based on semantic analysis, may:
         - Cancel follow-up (active conversation)
         - Schedule for requested time (timing constraint)
-        - Schedule for long-term nurture
+        - Schedule for long-term nurture (using campaign cadence)
         - Keep existing schedule
         """
         
@@ -134,11 +135,19 @@ class FollowUpScheduler:
         
         # Check urgency
         if semantic_intent.urgency == UrgencyLevel.LONG_TERM:
-            # Long-term opportunity - schedule far out
-            nurture_days = 90  # 3 months
-            next_time = datetime.utcnow() + timedelta(days=nurture_days)
+            # Long-term opportunity - use campaign's max follow-up delay or default
+            follow_up_days = campaign.follow_up_days or []
+            if follow_up_days:
+                # Use the longest delay from campaign cadence
+                nurture_days = max(follow_up_days) * 2  # Double the longest follow-up
+            else:
+                # No campaign cadence defined, use reasonable default
+                nurture_days = 30  # 1 month as fallback
+            
+            next_time = utcnow() + timedelta(days=nurture_days)
             logger.info(
-                f"Contact {contact.id} long-term opportunity - scheduling {nurture_days} days out"
+                f"Contact {contact.id} long-term opportunity - scheduling {nurture_days} days out "
+                f"(based on campaign cadence)"
             )
             return next_time
         
@@ -152,11 +161,19 @@ class FollowUpScheduler:
             )
             return None
         
-        # Default: resume normal cadence after short delay
-        delay_days = 3  # Standard delay after reply
-        next_time = datetime.utcnow() + timedelta(days=delay_days)
+        # Default: resume normal cadence using campaign's first follow-up delay
+        follow_up_days = campaign.follow_up_days or []
+        if follow_up_days:
+            # Use campaign's first follow-up delay
+            delay_days = follow_up_days[0]
+        else:
+            # No campaign cadence, must have a fallback
+            delay_days = 7  # One week as absolute minimum default
+        
+        next_time = utcnow() + timedelta(days=delay_days)
         logger.debug(
-            f"Contact {contact.id} neutral reply - resuming cadence in {delay_days} days"
+            f"Contact {contact.id} neutral reply - resuming cadence in {delay_days} days "
+            f"(from campaign policy)"
         )
         return next_time
     
@@ -178,7 +195,7 @@ class FollowUpScheduler:
             return None
         
         timing_str = semantic_intent.requested_timing.lower()
-        now = datetime.utcnow()
+        now = utcnow()
         
         # Explicit month references
         if "next month" in timing_str or "in a month" in timing_str:
@@ -200,7 +217,8 @@ class FollowUpScheduler:
                 year = now.year
                 if month < now.month:  # Quarter already passed this year
                     year += 1
-                return datetime(year, month, day)
+                from mailer_agent.utils.datetime_utils import UTC
+                return datetime(year, month, day, tzinfo=UTC)
         
         # Month count (e.g., "18 months", "6 months")
         import re
@@ -223,7 +241,8 @@ class FollowUpScheduler:
         
         # Year references
         if "next year" in timing_str:
-            return datetime(now.year + 1, 1, 1)
+            from mailer_agent.utils.datetime_utils import UTC
+            return datetime(now.year + 1, 1, 1, tzinfo=UTC)
         
         # Default: if we can't parse, schedule for 1 month
         logger.warning(
@@ -246,7 +265,7 @@ class FollowUpScheduler:
         
         # Add timing context
         if contact.last_outbound_at:
-            days_since = (datetime.utcnow() - contact.last_outbound_at).days
+            days_since = (utcnow() - contact.last_outbound_at).days
             hints["days_since_last_outbound"] = days_since
             
             if days_since > 14:
@@ -254,7 +273,7 @@ class FollowUpScheduler:
                 hints["mention_previous_outreach"] = True
         
         if contact.last_reply_at:
-            days_since = (datetime.utcnow() - contact.last_reply_at).days
+            days_since = (utcnow() - contact.last_reply_at).days
             hints["days_since_last_reply"] = days_since
         
         return hints
