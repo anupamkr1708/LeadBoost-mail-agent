@@ -3,7 +3,8 @@ Pytest configuration and shared fixtures.
 """
 
 import pytest
-from tests.fake_llm_provider import FakeLLMProvider
+
+from tests.fake_llm_provider import FakeLLMProvider, install_fake_llm_provider
 
 
 @pytest.fixture(autouse=True)
@@ -19,11 +20,18 @@ def fake_llm(monkeypatch, request):
     - API costs
     - Flaky network-dependent tests
     - Non-deterministic LLM outputs
-    
-    Usage (automatic):
-        def test_something():
-            # fake_llm is automatically active
-            
+
+    The fake never infers a response from prompt content -- it only
+    returns whatever was explicitly queued via fake_llm.queue_response(...).
+    A test that calls code which reaches the LLM provider without queuing
+    a response first will get a clear AssertionError, not a guess.
+
+    Usage:
+        def test_something(fake_llm):
+            fake_llm.queue_response({...})
+            result = classify_prospect_reply(...)
+            ...
+
     Usage (explicitly disable for integration test):
         @pytest.mark.integration
         def test_with_real_llm():
@@ -33,17 +41,8 @@ def fake_llm(monkeypatch, request):
     if "integration" in request.keywords:
         yield None
         return
-    
-    import mailer_agent.llm.provider_v2 as provider_module
-    
-    fake = FakeLLMProvider()
-    
-    # Patch provider_v2 functions
-    monkeypatch.setattr(provider_module, "call_llm_json", fake.call_llm_json)
-    monkeypatch.setattr(provider_module, "call_llm_text", fake.call_llm_text)
-    monkeypatch.setattr(provider_module, "is_llm_available", lambda: True)
-    
-    yield fake
+
+    yield install_fake_llm_provider(monkeypatch)
 
 
 @pytest.fixture

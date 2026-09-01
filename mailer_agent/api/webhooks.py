@@ -43,6 +43,7 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"], dependencies=[Depends(
 
 class InboundEmailWebhook(BaseModel):
     from_email: str
+    to_email: str | None = None  # The inbox this was sent to (for tenant resolution)
     subject: str | None = None
     body_text: str
     message_id: str | None = None
@@ -59,6 +60,7 @@ def receive_inbound_email(payload: InboundEmailWebhook, db: Session = Depends(ge
         message_id=payload.message_id,
         in_reply_to=payload.in_reply_to,
         references=payload.references,
+        to_email=payload.to_email,  # Pass through for tenant resolution
     )
     result = process_inbound_email(db, email_in)
     db.commit()

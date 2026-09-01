@@ -12,7 +12,9 @@ from sqlalchemy.orm import Session
 from mailer_agent.api.deps import get_current_org_id, require_api_key
 from mailer_agent.db import get_db
 from mailer_agent.followup.engine import is_suppressed
+from mailer_agent.llm.grounding import validate_grounding
 from mailer_agent.mail.sender import send_email
+from mailer_agent.memory.store import build_conversation_context
 from mailer_agent.models import Campaign, Contact, Message, MessageStatus, SuppressionEntry
 from mailer_agent.schemas import MessageOut, SuppressRequest
 
@@ -60,6 +62,18 @@ def approve_and_send_draft(
     - Messages generated when live_sending_enabled=False
     - Replies held for approval because auto_reply_enabled=False or the
       intent required review (objections, pricing questions, etc.)
+
+    Final outbound safety gate
+    ---------------------------
+    Approval is not just a suppression re-check. The draft's body was
+    grounded against campaign/contact data *at the time it was
+    generated* -- but campaign proof_points, contact context_notes, or
+    the conversation itself may have changed since then (a human edited
+    the campaign, the contact replied again, etc). This endpoint always
+    re-runs grounding validation against the *current* state right
+    before sending, and blocks the send if the draft is no longer
+    supported. This is the one path every approval must go through --
+    there is no way to mark a message SENT without passing this check.
     """
     msg = _get_message_or_404(db, message_id, org_id)
 
@@ -78,6 +92,28 @@ def approve_and_send_draft(
             detail="This contact is on the suppression list — cannot send",
         )
 
+    # --- Final safety gate: re-validate grounding against current state ---
+    # (Approval must not be able to bypass grounding just because the
+    # unsafe draft was generated in the past.)
+    conversation_transcript = build_conversation_context(db, contact)
+    grounding = validate_grounding(
+        msg.body,
+        proof_points=campaign.proof_points,
+        context_notes=contact.context_notes,
+        conversation_transcript=conversation_transcript,
+        value_prop=campaign.value_prop,
+    )
+    if not grounding.is_safe_to_send:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Draft failed final grounding recheck and cannot be sent: "
+                f"{grounding.validation_notes}. Unsupported claims: "
+                f"{grounding.unsupported_claims}. Edit the draft or the "
+                "campaign/contact data, then try approval again."
+            ),
+        )
+
     prior = msg.in_reply_to_header
     subject = msg.subject or (
         f"Re: {contact.messages[0].subject}"
@@ -94,7 +130,10 @@ def approve_and_send_draft(
         reply_to=campaign.reply_to_email,
         in_reply_to_header=prior,
     )
-    msg.status = MessageStatus.SENT.value if result.success else MessageStatus.FAILED.value
+    # Status mirrors the outcome directly (sent/failed/unknown) -- see
+    # mail/sender.py: an ambiguous SMTP outcome is never recorded as a
+    # plain "failed" that looks safe to blindly retry.
+    msg.status = result.outcome.value
     msg.message_id_header = result.message_id
     msg.subject = subject
     msg.error_message = result.error

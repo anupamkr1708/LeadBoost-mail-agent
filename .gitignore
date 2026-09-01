@@ -1,8 +1,32 @@
+# Secrets and environment
 .env
+
+# Database files
 *.db
+
+# Python compilation artifacts
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test artifacts
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environment
 venv/
-test_e2e.sh
-docs/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

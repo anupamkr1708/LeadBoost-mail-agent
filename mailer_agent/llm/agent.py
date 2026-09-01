@@ -1,13 +1,12 @@
 """
 SalesAgent: the decision-making + drafting core.
 
-Two entry points used by the rest of the system:
+One entry point used by the rest of the system:
   - draft_message(...)   -- write the next outbound email (initial /
                              follow-up / reply / closing push)
-  - classify_reply(...)  -- figure out what an inbound reply actually means
 
-Both prefer the LLM path. If the LLM is unavailable or returns something
-unusable, both fall back to a single deterministic path -- not a library
+Prefers the LLM path. If the LLM is unavailable or returns something
+unusable, falls back to a single deterministic path -- not a library
 of per-industry templates, just one honest, data-driven message built
 from the same campaign/contact fields the LLM would have used, so a
 transient outage degrades gracefully instead of blocking the send.
@@ -17,6 +16,13 @@ synchronously before the result is returned.  The validation uses only
 keyword/regex heuristics (no LLM) and never blocks the pipeline -- it
 sets AgentDraft.grounding so callers can decide whether to auto-send or
 route to human review.
+
+Note on inbound classification: reply intent is handled by
+semantic/classifier.py (classify_prospect_reply), which produces a
+multi-dimensional SemanticIntent rather than a single label. An earlier,
+single-intent classify_reply() used to live in this module; it was never
+called anywhere once the semantic classifier replaced it, so it has been
+removed rather than kept as unused dead code.
 """
 
 from __future__ import annotations
@@ -28,9 +34,7 @@ from typing import Optional
 from mailer_agent.llm.grounding import validate_grounding
 from mailer_agent.llm.prompts import (
     AGENT_SYSTEM_PROMPT,
-    REPLY_CLASSIFIER_SYSTEM_PROMPT,
     build_action_instruction,
-    build_classifier_prompt,
     build_context_block,
 )
 from mailer_agent.llm.provider import LLMOutputError, LLMUnavailableError, call_llm_json, is_llm_available
@@ -38,16 +42,6 @@ from mailer_agent.models import Campaign, Contact
 from mailer_agent.semantic_models import GroundingValidation
 
 logger = logging.getLogger("mailer_agent.agent")
-
-VALID_INTENTS = {
-    "interested",
-    "question",
-    "objection",
-    "not_interested",
-    "unsubscribe",
-    "out_of_office",
-    "neutral",
-}
 
 
 @dataclass
@@ -58,14 +52,6 @@ class AgentDraft:
     source: str  # "llm" or "fallback"
     # Grounding validation result — always set, never None after draft_message()
     grounding: Optional[GroundingValidation] = field(default=None)
-
-
-@dataclass
-class ReplyClassification:
-    intent: str
-    confidence: float
-    reasoning: str
-    source: str
 
 
 def draft_message(
@@ -209,36 +195,3 @@ def _draft_fallback(campaign: Campaign, contact: Contact, action_type: str) -> A
 
     logger.info("Used deterministic fallback draft for contact %s (%s)", contact.id, action_type)
     return AgentDraft(subject=subject, body=body, reasoning="LLM unavailable; deterministic fallback used.", source="fallback")
-
-
-def classify_reply(
-    *, campaign: Campaign, contact: Contact, inbound_body: str, context_transcript: str
-) -> ReplyClassification:
-    if is_llm_available():
-        try:
-            human_prompt = build_classifier_prompt(inbound_body, context_transcript)
-            payload = call_llm_json(REPLY_CLASSIFIER_SYSTEM_PROMPT, human_prompt, max_tokens=150)
-            intent = payload.get("intent", "neutral")
-            if intent not in VALID_INTENTS:
-                intent = "neutral"
-            confidence = float(payload.get("confidence", 0.5))
-            return ReplyClassification(
-                intent=intent,
-                confidence=confidence,
-                reasoning=payload.get("reasoning", ""),
-                source="llm",
-            )
-        except (LLMUnavailableError, LLMOutputError) as e:
-            logger.warning("Reply classification failed for contact %s: %s", contact.id, e)
-
-    # Fallback: crude keyword check, purely so an unsubscribe request is
-    # never silently dropped even if the LLM is down. Everything else
-    # defaults to "neutral" -> routed to human review by the caller.
-    lowered = inbound_body.lower()
-    if any(w in lowered for w in ("unsubscribe", "remove me", "stop emailing", "opt out", "opt-out")):
-        return ReplyClassification(
-            intent="unsubscribe", confidence=0.9, reasoning="Keyword match (LLM unavailable).", source="fallback"
-        )
-    return ReplyClassification(
-        intent="neutral", confidence=0.2, reasoning="LLM unavailable; defaulted to neutral for human review.", source="fallback"
-    )

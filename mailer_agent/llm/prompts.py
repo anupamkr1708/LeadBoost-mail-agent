@@ -118,16 +118,3 @@ def build_action_instruction(action_type: str, follow_up_index: int, days_waited
             "decision process, or propose sending a proposal/contract."
         )
     return "Write the next appropriate message in this conversation."
-
-
-REPLY_CLASSIFIER_SYSTEM_PROMPT = """You classify a single inbound email reply in a B2B sales \
-conversation. Respond ONLY with JSON: {"intent": "...", "confidence": 0.0-1.0, "reasoning": "..."} \
-where intent is exactly one of: interested, question, objection, not_interested, \
-unsubscribe, out_of_office, neutral."""
-
-
-def build_classifier_prompt(inbound_body: str, context_transcript: str) -> str:
-    return (
-        f"Conversation so far:\n{context_transcript}\n\n"
-        f"Most recent inbound reply to classify:\n{inbound_body}"
-    )

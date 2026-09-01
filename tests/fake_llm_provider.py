@@ -1,25 +1,52 @@
 """
 Fake LLM provider for deterministic testing.
 
-This allows semantic regression tests to run without calling the live Groq API,
-preventing rate limits and ensuring consistent test results.
+Design
+------
+This is a deterministic response *fixture* provider, not a second
+semantic engine. It does not try to infer what a scenario "means" from
+the prompt text -- no keyword lists, no substring matching, nothing that
+could itself drift out of sync with the real classifier's prompts. Each
+test explicitly queues the exact structured result it wants the LLM
+"provider" to return, then exercises the real application code
+(classify_prospect_reply, draft_message, etc), and asserts on how the
+real code processed that canned response.
 
-Usage in tests:
+That split matters: these tests are regression tests for
+mailer_agent's parsing/policy/grounding logic, not for the LLM's
+semantic judgment (there is no LLM here to judge anything -- that's the
+live-provider smoke suite's job, tests/test_business_context.py,
+@pytest.mark.integration).
 
-    from tests.fake_llm_provider import FakeLLMProvider
-    import mailer_agent.llm.provider_v2 as provider_module
-    
-    @pytest.fixture
-    def fake_llm(monkeypatch):
-        fake = FakeLLMProvider({
-            "meeting": {...},  # Predetermined JSON response
-            "pricing": {...},
-            "not interested": {...},
+Usage in a test:
+
+    def test_meeting_request_routes_to_coordinate_meeting(fake_llm, ...):
+        fake_llm.queue_response({
+            "intents": ["meeting_request"],
+            "sentiment": "positive",
+            "buying_stage": "evaluating",
+            "urgency": "near_term",
+            "requested_timing": "next week",
+            "has_pricing_question": False,
+            "has_budget_signal": False,
+            "questions_asked": ["When can we meet?"],
+            "objections_raised": [],
+            "requires_human_review": False,
+            "confidence": 0.9,
+            "reasoning": "Prospect explicitly requested a meeting",
         })
-        monkeypatch.setattr(provider_module, "call_llm_json", fake.call_llm_json)
-        monkeypatch.setattr(provider_module, "call_llm_text", fake.call_llm_text)
-        return fake
+        result = classify_prospect_reply(...)
+        assert IntentType.MEETING_REQUEST in result.intents
+        ...
+
+If a test exercises a code path that calls the LLM without first
+queuing a response, call_llm_json/call_llm_text raise a clear
+AssertionError rather than silently guessing -- a missing fixture is a
+test bug, and failing loudly is much cheaper to debug than a test that
+"passes" against an unintended default.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -30,278 +57,117 @@ logger = logging.getLogger(__name__)
 
 class FakeLLMProvider:
     """
-    Deterministic LLM provider for testing.
-    
-    Returns predetermined responses based on pattern matching in prompts.
+    Deterministic response-fixture provider for tests.
+
+    Responses are consumed in FIFO order from an explicit queue. There is
+    no prompt inspection and no pattern matching: what you queue is
+    exactly what comes back, in the order you queued it.
     """
-    
-    def __init__(self, responses: dict[str, dict | str] = None):
+
+    def __init__(self) -> None:
+        self._queue: list[dict | str | BaseException] = []
+        self._default: dict | str | None = None
+        self.call_count = 0
+        self.last_prompts: list[tuple[str, str]] = []
+
+    # -- fixture setup ----------------------------------------------------
+
+    def queue_response(self, response: dict | str) -> None:
+        """Queue one predetermined response for the next LLM call."""
+        self._queue.append(response)
+
+    def queue_responses(self, responses: list[dict | str]) -> None:
+        """Queue several predetermined responses, consumed in order."""
+        self._queue.extend(responses)
+
+    def queue_error(self, error: BaseException) -> None:
         """
-        Initialize with predetermined responses.
-        
-        Args:
-            responses: Dict mapping prompt keywords to responses
-                      e.g., {"meeting": {"intent": "meeting_request", ...}}
+        Queue an exception instance to be raised (not returned) on the
+        next call -- for testing provider-failure handling (rate limits,
+        timeouts, malformed output) without needing a real provider
+        outage. e.g. fake_llm.queue_error(RateLimitError("429")).
         """
-        self.responses = responses or self._default_responses()
+        self._queue.append(error)
+
+    def set_default_response(self, response: dict | str | None) -> None:
+        """
+        Optional: set a response returned whenever the queue is empty,
+        for tests that need many identical calls (e.g. a loop over many
+        contacts) and don't want to queue one entry per call. Most tests
+        should prefer queue_response for an explicit, scenario-scoped
+        fixture instead.
+        """
+        self._default = response
+
+    def reset(self) -> None:
+        self._queue = []
+        self._default = None
         self.call_count = 0
         self.last_prompts = []
-    
-    def call_llm_text(
-        self,
-        system_prompt: str,
-        human_prompt: str,
-        *,
-        temperature: float = None,
-        max_tokens: int = None
-    ) -> str:
-        """
-        Return predetermined text response.
-        """
-        self.call_count += 1
-        self.last_prompts.append((system_prompt, human_prompt))
-        
-        # Match prompt to response
-        prompt_lower = (system_prompt + " " + human_prompt).lower()
-        
-        for keyword, response in self.responses.items():
-            if keyword.lower() in prompt_lower:
-                if isinstance(response, dict):
-                    # If response is dict, convert to string
-                    return json.dumps(response)
-                return response
-        
-        # Default response
-        return self._default_text_response(human_prompt)
-    
+
+    # -- provider interface -----------------------------------------------
+
     def call_llm_json(
         self,
         system_prompt: str,
         human_prompt: str,
         *,
-        temperature: float = None,
-        max_tokens: int = None
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
-        """
-        Return predetermined JSON response.
-        """
         self.call_count += 1
         self.last_prompts.append((system_prompt, human_prompt))
-        
-        # Match prompt to response
-        prompt_lower = (system_prompt + " " + human_prompt).lower()
-        
-        # Sort responses by number of keywords (more specific matches first)
-        sorted_responses = sorted(
-            self.responses.items(),
-            key=lambda x: len(x[0].split()),
-            reverse=True
+        response = self._next_response()
+        if isinstance(response, BaseException):
+            raise response
+        if isinstance(response, str):
+            return json.loads(response)
+        return response
+
+    def call_llm_text(
+        self,
+        system_prompt: str,
+        human_prompt: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        self.call_count += 1
+        self.last_prompts.append((system_prompt, human_prompt))
+        response = self._next_response()
+        if isinstance(response, BaseException):
+            raise response
+        if isinstance(response, dict):
+            return json.dumps(response)
+        return response
+
+    def _next_response(self) -> dict | str | BaseException:
+        if self._queue:
+            return self._queue.pop(0)
+        if self._default is not None:
+            return self._default
+        raise AssertionError(
+            "FakeLLMProvider was called with no fixture response queued. "
+            "Call fake_llm.queue_response({...}) with the exact structured "
+            "result this scenario needs before exercising code that calls "
+            "the LLM provider. (This fake never infers a response from "
+            "prompt content -- see tests/fake_llm_provider.py.)"
         )
-        
-        for keyword, response in sorted_responses:
-            # For multi-word keys, ALL words must be present
-            keywords = keyword.lower().split()
-            if all(kw in prompt_lower for kw in keywords):
-                if isinstance(response, str):
-                    # If response is string, try to parse as JSON
-                    try:
-                        return json.loads(response)
-                    except json.JSONDecodeError:
-                        return {"text": response}
-                return response
-        
-        # Default JSON response
-        return self._default_json_response(human_prompt)
-    
-    def _default_text_response(self, prompt: str) -> str:
-        """Generate default text response."""
-        return "Thank you for your interest. I'll follow up with more details."
-    
-    def _default_json_response(self, prompt: str) -> dict:
-        """Generate default JSON response."""
-        return {
-            "intents": ["neutral"],
-            "sentiment": "neutral",
-            "buying_stage": "awareness",
-            "urgency": "none",
-            "confidence": 0.5,
-            "reasoning": "Default fake LLM response"
-        }
-    
-    def _default_responses(self) -> dict[str, dict]:
-        """
-        Default predetermined responses for common scenarios.
-        """
-        return {
-            # Combined meeting + pricing (check this FIRST before individual keywords)
-            "meeting pricing cost": {
-                "intents": ["meeting_request", "pricing_request", "positive_interest"],
-                "sentiment": "positive",
-                "buying_stage": "evaluating",
-                "urgency": "near_term",  # "next week" indicates near-term urgency
-                "requested_timing": "next week",
-                "has_pricing_question": True,
-                "has_budget_signal": True,  # Asking about team size shows budget consideration
-                "questions_asked": ["When can we meet?", "What does this cost?"],
-                "objections_raised": [],
-                "requires_human_review": True,  # Pricing always requires review
-                "confidence": 0.85,
-                "reasoning": "Prospect requested meeting and asked about pricing"
-            },
-            
-            # Meeting requests
-            "meeting": {
-                "intents": ["meeting_request", "positive_interest"],
-                "sentiment": "positive",
-                "buying_stage": "evaluating",
-                "urgency": "medium",
-                "requested_timing": "next week",
-                "has_pricing_question": False,
-                "has_budget_signal": False,
-                "questions_asked": ["When can we meet?"],
-                "objections_raised": [],
-                "requires_human_review": False,
-                "confidence": 0.9,
-                "reasoning": "Prospect explicitly requested a meeting"
-            },
-            
-            # Pricing questions
-            "pricing": {
-                "intents": ["pricing_request", "positive_interest"],
-                "sentiment": "neutral",
-                "buying_stage": "evaluating",
-                "urgency": "medium",
-                "requested_timing": None,
-                "has_pricing_question": True,
-                "has_budget_signal": False,
-                "questions_asked": ["What does this cost?"],
-                "objections_raised": [],
-                "requires_human_review": True,
-                "confidence": 0.85,
-                "reasoning": "Prospect asked about pricing"
-            },
-            
-            # Not interested
-            "not interested": {
-                "intents": ["not_interested"],
-                "sentiment": "negative",
-                "buying_stage": "awareness",
-                "urgency": "none",
-                "requested_timing": None,
-                "has_pricing_question": False,
-                "has_budget_signal": False,
-                "questions_asked": [],
-                "objections_raised": ["Not a good fit"],
-                "requires_human_review": False,
-                "confidence": 0.95,
-                "reasoning": "Prospect explicitly declined interest"
-            },
-            
-            # Unsubscribe
-            "unsubscribe": {
-                "intents": ["unsubscribe"],
-                "sentiment": "negative",
-                "buying_stage": "awareness",
-                "urgency": "none",
-                "requested_timing": None,
-                "has_pricing_question": False,
-                "has_budget_signal": False,
-                "questions_asked": [],
-                "objections_raised": [],
-                "requires_human_review": False,
-                "confidence": 1.0,
-                "reasoning": "Unsubscribe keyword detected"
-            },
-            
-            # Positive interest with timing
-            "interested": {
-                "intents": ["positive_interest", "timing_constraint"],
-                "sentiment": "positive",
-                "buying_stage": "interest",
-                "urgency": "medium",
-                "requested_timing": "next quarter",
-                "has_pricing_question": False,
-                "has_budget_signal": False,
-                "questions_asked": [],
-                "objections_raised": [],
-                "requires_human_review": False,
-                "confidence": 0.8,
-                "reasoning": "Prospect showed interest with future timing"
-            },
-            
-            # Out of office
-            "out of office": {
-                "intents": ["out_of_office"],
-                "sentiment": "neutral",
-                "buying_stage": "awareness",
-                "urgency": "none",
-                "requested_timing": None,
-                "has_pricing_question": False,
-                "has_budget_signal": False,
-                "questions_asked": [],
-                "objections_raised": [],
-                "requires_human_review": False,
-                "confidence": 1.0,
-                "reasoning": "Automatic out-of-office reply"
-            },
-            
-            # Question
-            "question": {
-                "intents": ["information_request"],
-                "sentiment": "neutral",
-                "buying_stage": "interest",
-                "urgency": "low",
-                "requested_timing": None,
-                "has_pricing_question": False,
-                "has_budget_signal": False,
-                "questions_asked": ["Can you tell me more?"],
-                "objections_raised": [],
-                "requires_human_review": False,
-                "confidence": 0.7,
-                "reasoning": "Prospect asked for more information"
-            },
-            
-            # Objection
-            "objection": {
-                "intents": ["objection"],
-                "sentiment": "neutral",
-                "buying_stage": "evaluating",
-                "urgency": "medium",
-                "requested_timing": None,
-                "has_pricing_question": False,
-                "has_budget_signal": False,
-                "questions_asked": [],
-                "objections_raised": ["Too expensive", "Already have a solution"],
-                "requires_human_review": True,
-                "confidence": 0.75,
-                "reasoning": "Prospect raised concerns"
-            },
-        }
-    
-    def reset(self):
-        """Reset call tracking."""
-        self.call_count = 0
-        self.last_prompts = []
 
 
-def create_fake_provider_fixture():
+def install_fake_llm_provider(monkeypatch) -> FakeLLMProvider:
     """
-    Create a pytest fixture for the fake LLM provider.
-    
-    Usage in conftest.py:
-    
-        @pytest.fixture
-        def fake_llm(monkeypatch):
-            return create_fake_provider_fixture()(monkeypatch)
+    Patch mailer_agent.llm.provider_v2 to use a fresh FakeLLMProvider
+    instance and report the LLM as available (so callers take the LLM
+    code path rather than their deterministic/keyword fallback path --
+    tests that want to exercise the fallback path instead should force
+    is_llm_available() to return False, e.g. via GROQ_API_KEY="", the
+    way tests/test_grounding.py does).
     """
-    def fixture(monkeypatch):
-        import mailer_agent.llm.provider_v2 as provider_module
-        
-        fake = FakeLLMProvider()
-        monkeypatch.setattr(provider_module, "call_llm_json", fake.call_llm_json)
-        monkeypatch.setattr(provider_module, "call_llm_text", fake.call_llm_text)
-        monkeypatch.setattr(provider_module, "is_llm_available", lambda: True)
-        
-        return fake
-    
-    return fixture
+    import mailer_agent.llm.provider_v2 as provider_module
+
+    fake = FakeLLMProvider()
+    monkeypatch.setattr(provider_module, "call_llm_json", fake.call_llm_json)
+    monkeypatch.setattr(provider_module, "call_llm_text", fake.call_llm_text)
+    monkeypatch.setattr(provider_module, "is_llm_available", lambda: True)
+    return fake

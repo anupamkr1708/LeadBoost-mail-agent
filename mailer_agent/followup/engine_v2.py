@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from mailer_agent.config import get_settings
 from mailer_agent.followup.conversation_aware import FollowUpScheduler
 from mailer_agent.llm.agent import draft_message
-from mailer_agent.mail.sender import send_email
+from mailer_agent.mail.sender import SendOutcome, send_email
 from mailer_agent.memory.store import build_conversation_context, maybe_summarize_older_messages
 from mailer_agent.models import (
     Campaign,
@@ -57,7 +57,8 @@ class IntegratedFollowUpEngine:
         
         # Suppression check
         if is_suppressed(db, contact.email):
-            contact.status = ContactStatus.SUPPRESSED.value
+            # Use state machine for transition instead of direct assignment
+            transition_contact_state(contact, StateTransitionEvent.UNSUBSCRIBED)
             db.add(contact)
             db.flush()
             return {"contact_id": contact.id, "action": "skipped_suppressed"}
@@ -105,14 +106,18 @@ class IntegratedFollowUpEngine:
             reply_to=campaign.reply_to_email,
         )
         
-        # Persist message
+        # Persist message. send_result.outcome is authoritative (SENT /
+        # FAILED / UNKNOWN) -- UNKNOWN means the SMTP call raised during
+        # or after transmission and delivery status is genuinely
+        # ambiguous, so it must NOT collapse into "failed" (which would
+        # imply it's safe to blindly retry and risk a duplicate send).
         msg = Message(
             contact_id=contact.id,
             direction=MessageDirection.OUTBOUND.value,
             message_type=MessageType.INITIAL.value,
             subject=draft.subject,
             body=draft.body,
-            status=MessageStatus.SENT.value if send_result.success else MessageStatus.FAILED.value,
+            status=send_result.outcome.value,
             message_id_header=send_result.message_id,
             error_message=send_result.error,
         )
@@ -133,6 +138,20 @@ class IntegratedFollowUpEngine:
             contact.next_action_at = self.scheduler.compute_next_followup(
                 contact, campaign, semantic_intent=None
             )
+        elif send_result.outcome == SendOutcome.UNKNOWN:
+            # Delivery status is genuinely ambiguous -- do NOT leave
+            # next_action_at in the past (which would make the next
+            # scheduler pass blindly retry and risk a duplicate send).
+            # Route to human review instead.
+            transition_contact_state(
+                contact,
+                StateTransitionEvent.NEEDS_HUMAN,
+                reason=f"Initial outreach send outcome unknown: {send_result.error}",
+            )
+            contact.next_action_at = None
+        # else: outcome == FAILED -- contact stays NEW with next_action_at
+        # already due, so the next dispatch cycle retries safely (nothing
+        # was ever transmitted).
         
         db.add(contact)
         db.flush()
@@ -140,7 +159,7 @@ class IntegratedFollowUpEngine:
         
         return {
             "contact_id": contact.id,
-            "action": "sent" if send_result.success else "failed",
+            "action": send_result.outcome.value,
             "source": draft.source,
             "next_action_at": contact.next_action_at.isoformat() if contact.next_action_at else None
         }
@@ -243,14 +262,16 @@ class IntegratedFollowUpEngine:
             in_reply_to_header=prior_msg_id,
         )
         
-        # Persist message
+        # Persist message. Status mirrors send_result.outcome (sent /
+        # failed / unknown) directly -- see mail/sender.py for why
+        # "unknown" must never collapse into "failed".
         msg = Message(
             contact_id=contact.id,
             direction=MessageDirection.OUTBOUND.value,
             message_type=MessageType.FOLLOW_UP.value,
             subject=subject,
             body=draft.body,
-            status=MessageStatus.SENT.value if send_result.success else MessageStatus.FAILED.value,
+            status=send_result.outcome.value,
             message_id_header=send_result.message_id,
             in_reply_to_header=prior_msg_id,
             error_message=send_result.error,
@@ -281,6 +302,18 @@ class IntegratedFollowUpEngine:
                 )
             
             contact.next_action_at = next_at
+        elif send_result.outcome == SendOutcome.UNKNOWN:
+            # Ambiguous delivery -- escalate to a human instead of
+            # leaving this contact eligible for an automatic retry that
+            # could duplicate a message that actually went out.
+            transition_contact_state(
+                contact,
+                StateTransitionEvent.NEEDS_HUMAN,
+                reason=f"Follow-up send outcome unknown: {send_result.error}",
+            )
+            contact.next_action_at = None
+        # else: FAILED -- next_action_at is left as-is (already due), so
+        # the next cycle retries; nothing was ever transmitted.
         
         db.add(contact)
         db.flush()
@@ -288,7 +321,7 @@ class IntegratedFollowUpEngine:
         
         return {
             "contact_id": contact.id,
-            "action": "sent" if send_result.success else "failed",
+            "action": send_result.outcome.value,
             "source": draft.source,
             "follow_up_index": contact.follow_up_index,
             "next_action_at": contact.next_action_at.isoformat() if contact.next_action_at else None

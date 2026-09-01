@@ -1,4 +1,22 @@
 """
+DEPRECATED -- superseded by migrations/002_work_claiming.py.
+
+This file and 002_work_claiming.py were both written to add the same two
+work-claiming columns (claimed_by, claimed_at) to `contacts`, independently,
+at some point. See migrations/README.md for the canonical migration order.
+
+This script is left in place (not deleted) because a real deployment may
+have already run it, and rewriting migration history that a production
+database may have already applied is riskier than leaving a confirmed-safe,
+idempotent duplicate in place. It remains safe to run: every statement below
+is guarded by add_column_if_not_exists / create_index_if_not_exists, so
+running this file after (or instead of) 002_work_claiming.py is a no-op
+against a database that already has these columns.
+
+For new deployments, run 002_work_claiming.py instead -- it additionally
+creates the composite (status, next_action_at) index used by the work-claim
+query in followup/work_claiming.py, which this file does not.
+
 Database migration: Add work claiming fields to contacts table.
 
 Adds:

@@ -360,8 +360,20 @@ class TestValidateGrounding:
 class TestDraftMessageGrounding:
     """
     Tests that grounding is wired into draft_message().
-    Uses the deterministic fallback (GROQ_API_KEY="") so no network calls.
+    Uses the deterministic fallback path exclusively -- every test in this
+    class forces is_llm_available() to False via the autouse fixture below,
+    rather than relying on the module-level GROQ_API_KEY="" env var. Relying
+    on ambient env state was fragile: it depended on import order and on
+    settings caching, and it silently stopped working once agent.py's LLM
+    calls correctly started honoring the fake_llm fixture's patches (see
+    mailer_agent/llm/provider.py). Explicit per-class monkeypatching is
+    robust regardless of what else runs in the same session.
     """
+
+    @pytest.fixture(autouse=True)
+    def _force_fallback(self, monkeypatch):
+        import mailer_agent.llm.agent as agent_mod
+        monkeypatch.setattr(agent_mod, "is_llm_available", lambda: False)
 
     def _make_campaign_contact(self, proof_points=None, context_notes=None):
         campaign = Campaign(
@@ -391,37 +403,23 @@ class TestDraftMessageGrounding:
         assert isinstance(draft.grounding, GroundingValidation)
 
     def test_fallback_draft_no_claims_is_grounded(self):
-        """
-        The deterministic fallback never invents metrics — test it directly
-        by monkey-patching is_llm_available to return False.
-        """
-        from mailer_agent.llm import agent as agent_module
-        import mailer_agent.llm.agent as agent_mod
-
-        original_available = agent_mod.is_llm_available
-
-        try:
-            # Force fallback path
-            agent_mod.is_llm_available = lambda: False
-
-            from mailer_agent.llm.agent import draft_message
-            campaign, contact = self._make_campaign_contact()
-            draft = draft_message(
-                campaign=campaign,
-                contact=contact,
-                action_type="initial_outreach",
-                context_transcript="(no messages sent yet)",
-            )
-            assert draft.source == "fallback"
-            # Fallback body contains no numeric claims
-            assert draft.grounding is not None
-            assert draft.grounding.is_grounded, (
-                f"Fallback draft should be grounded but got: "
-                f"unsupported={draft.grounding.unsupported_claims}, "
-                f"notes={draft.grounding.validation_notes}"
-            )
-        finally:
-            agent_mod.is_llm_available = original_available
+        """The deterministic fallback never invents metrics."""
+        from mailer_agent.llm.agent import draft_message
+        campaign, contact = self._make_campaign_contact()
+        draft = draft_message(
+            campaign=campaign,
+            contact=contact,
+            action_type="initial_outreach",
+            context_transcript="(no messages sent yet)",
+        )
+        assert draft.source == "fallback"
+        # Fallback body contains no numeric claims
+        assert draft.grounding is not None
+        assert draft.grounding.is_grounded, (
+            f"Fallback draft should be grounded but got: "
+            f"unsupported={draft.grounding.unsupported_claims}, "
+            f"notes={draft.grounding.validation_notes}"
+        )
 
     def test_campaign_proof_point_supports_value_prop_metric(self):
         """
@@ -449,16 +447,13 @@ class TestDraftMessageGrounding:
         # Grounding result present; either clean or only pricing-flagged
         assert draft.grounding is not None
 
-    def test_grounding_result_logged_for_unsafe_draft(self, caplog):
+    def test_grounding_result_logged_for_unsafe_draft(self, caplog, monkeypatch):
         """
         If a draft contains pricing language, the grounding result
         should be logged at INFO level.
         """
         import logging
         from mailer_agent.llm import agent as agent_module
-
-        # Monkey-patch _draft_fallback to return a pricing-laden body
-        original_fallback = agent_module._draft_fallback
 
         def _pricing_fallback(campaign, contact, action_type):
             from mailer_agent.llm.agent import AgentDraft
@@ -469,22 +464,19 @@ class TestDraftMessageGrounding:
                 source="fallback",
             )
 
-        agent_module._draft_fallback = _pricing_fallback
+        monkeypatch.setattr(agent_module, "_draft_fallback", _pricing_fallback)
 
-        try:
-            from mailer_agent.llm.agent import draft_message
-            campaign, contact = self._make_campaign_contact()
-            with caplog.at_level(logging.INFO, logger="mailer_agent.agent"):
-                draft = draft_message(
-                    campaign=campaign,
-                    contact=contact,
-                    action_type="initial_outreach",
-                    context_transcript="(no messages)",
-                )
-            assert not draft.grounding.is_safe_to_send
-            # Log should mention grounding
-            assert any(
-                "grounding" in r.message.lower() for r in caplog.records
-            ), f"Log records: {[r.message for r in caplog.records]}"
-        finally:
-            agent_module._draft_fallback = original_fallback
+        from mailer_agent.llm.agent import draft_message
+        campaign, contact = self._make_campaign_contact()
+        with caplog.at_level(logging.INFO, logger="mailer_agent.agent"):
+            draft = draft_message(
+                campaign=campaign,
+                contact=contact,
+                action_type="initial_outreach",
+                context_transcript="(no messages)",
+            )
+        assert not draft.grounding.is_safe_to_send
+        # Log should mention grounding
+        assert any(
+            "grounding" in r.message.lower() for r in caplog.records
+        ), f"Log records: {[r.message for r in caplog.records]}"

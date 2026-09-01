@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from mailer_agent.config import get_settings
 from mailer_agent.llm.agent import draft_message
 from mailer_agent.mail.imap_reader import InboundEmail, as_reply_subject
-from mailer_agent.mail.sender import send_email
+from mailer_agent.mail.sender import SendOutcome, send_email
 from mailer_agent.memory.store import build_conversation_context, maybe_summarize_older_messages
 from mailer_agent.models import (
     Contact,
@@ -246,23 +246,54 @@ def _find_contact_by_message_id(db: Session, email_in: InboundEmail) -> Contact 
 
 
 def _find_contact_by_email(db: Session, email_in: InboundEmail) -> Contact | None:
-    """Find contact by email address (fallback method)."""
-    return (
-        db.query(Contact)
-        .filter(
-            Contact.email == email_in.from_email,
-            Contact.status != ContactStatus.SUPPRESSED.value,
-        )
-        .order_by(Contact.updated_at.desc())
-        .first()
+    """
+    Find contact by email address (fallback method).
+    
+    CRITICAL: This fallback is used when threading headers are stripped.
+    If to_email is provided (webhook or IMAP with known inbox), we resolve
+    it to an organization to prevent cross-tenant data leakage.
+    
+    If to_email is not available, we search globally but this is UNSAFE
+    in multi-tenant production environments.
+    """
+    query = db.query(Contact).filter(
+        Contact.email == email_in.from_email,
+        Contact.status != ContactStatus.SUPPRESSED.value,
     )
+    
+    # Tenant-safe correlation: if we know which inbox received this email,
+    # find the organization that owns that sender_email
+    if email_in.to_email:
+        from mailer_agent.models import Campaign
+        # Join to Campaign and filter by sender_email to get the right org
+        query = (
+            query.join(Campaign, Contact.campaign_id == Campaign.id)
+            .filter(Campaign.sender_email == email_in.to_email)
+        )
+    
+    return query.order_by(Contact.updated_at.desc()).first()
 
 
 def _handle_unsubscribe(db: Session, contact: Contact, result: dict):
     """Handle unsubscribe request."""
     # Add to suppression list if not already there
-    if not db.query(SuppressionEntry).filter_by(email=contact.email).first():
-        db.add(SuppressionEntry(email=contact.email, reason="unsubscribed"))
+    # CRITICAL: Include organization_id to properly scope suppression
+    from mailer_agent.models import Campaign
+    campaign = db.query(Campaign).filter_by(id=contact.campaign_id).first()
+    org_id = campaign.organization_id if campaign else None
+    
+    existing = (
+        db.query(SuppressionEntry)
+        .filter_by(email=contact.email, organization_id=org_id)
+        .first()
+    )
+    
+    if not existing:
+        db.add(SuppressionEntry(
+            email=contact.email,
+            organization_id=org_id,
+            reason="unsubscribed"
+        ))
     
     # Transition to suppressed
     transition_contact_state(contact, StateTransitionEvent.UNSUBSCRIBED)
@@ -334,15 +365,32 @@ def _draft_and_maybe_send_reply(
             in_reply_to_header=email_in.message_id,
         )
         
-        reply_msg.status = MessageStatus.SENT.value if send_result.success else MessageStatus.FAILED.value
+        # Status mirrors send_result.outcome directly (sent/failed/unknown)
+        # -- an ambiguous SMTP outcome must never be recorded as a plain
+        # "failed" that a caller might treat as safe to blindly retry.
+        reply_msg.status = send_result.outcome.value
         reply_msg.message_id_header = send_result.message_id
         reply_msg.error_message = send_result.error
         reply_msg.subject = reply_subject
         
         if send_result.success:
             contact.last_outbound_at = utcnow()
+        elif send_result.outcome == SendOutcome.UNKNOWN:
+            # Ambiguous delivery -- escalate instead of leaving the
+            # contact in a state where an automatic follow-up cycle
+            # could duplicate a reply that may have already gone out.
+            transition_contact_state(
+                contact,
+                StateTransitionEvent.NEEDS_HUMAN,
+                reason=f"Auto-reply send outcome unknown: {send_result.error}",
+            )
+            contact.next_action_at = None
         
-        result["action"] = "auto_replied" if send_result.success else "auto_reply_failed"
+        result["action"] = {
+            "sent": "auto_replied",
+            "failed": "auto_reply_failed",
+            "unknown": "auto_reply_unknown",
+        }[send_result.outcome.value]
         result["message_id"] = reply_msg.id
         
     else:

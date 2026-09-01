@@ -45,6 +45,7 @@ class InboundEmail:
     message_id: str | None
     in_reply_to: str | None
     references: list[str]
+    to_email: str | None = None  # The inbox this was sent to (for tenant resolution)
 
 
 def _decode(value: str | None) -> str:
