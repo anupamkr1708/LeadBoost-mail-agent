@@ -46,6 +46,15 @@ class InboundEmail:
     in_reply_to: str | None
     references: list[str]
     to_email: str | None = None  # The inbox this was sent to (for tenant resolution)
+    # Structured protocol-level signal, not a semantic guess: RFC 3834's
+    # Auto-Submitted header ("auto-replied" for genuine autoresponders).
+    # When available, this is a deterministic fact -- prefer it over
+    # asking the LLM (or worse, keyword-matching the body) to guess
+    # whether a message is an autoresponder. False (the default) does
+    # NOT mean "not an OOO reply" -- it means this signal wasn't
+    # available, so OOO-or-not falls through to genuine semantic
+    # classification instead (see semantic/classifier.py).
+    auto_submitted: bool = False
 
 
 def _decode(value: str | None) -> str:
@@ -109,6 +118,11 @@ def fetch_unseen_replies() -> list[InboundEmail]:
             _, from_addr = parseaddr(msg.get("From", ""))
             references_raw = msg.get("References", "")
             references = references_raw.split() if references_raw else []
+            # RFC 3834: a compliant autoresponder sets this to
+            # "auto-replied" (or "auto-generated" / "auto-notified").
+            # Anything other than absent/"no" is treated as auto-submitted
+            # -- a real deterministic signal, not a body-text guess.
+            auto_submitted_header = (msg.get("Auto-Submitted") or "no").strip().lower()
 
             results.append(
                 InboundEmail(
@@ -118,6 +132,7 @@ def fetch_unseen_replies() -> list[InboundEmail]:
                     message_id=msg.get("Message-ID"),
                     in_reply_to=msg.get("In-Reply-To"),
                     references=references,
+                    auto_submitted=auto_submitted_header != "no",
                 )
             )
 

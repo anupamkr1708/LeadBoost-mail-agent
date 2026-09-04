@@ -49,6 +49,13 @@ class InboundEmailWebhook(BaseModel):
     message_id: str | None = None
     in_reply_to: str | None = None
     references: list[str] = []
+    # Optional: pass through if your inbound-parse provider surfaces the
+    # Auto-Submitted header or an equivalent "this is an autoresponder"
+    # flag (Postmark and Mailgun both expose raw headers you can map
+    # this from). Defaults to False, meaning "signal not available" --
+    # NOT "confirmed not an autoresponder" -- so OOO detection falls
+    # through to semantic classification when this isn't provided.
+    auto_submitted: bool = False
 
 
 @router.post("/inbound-email")
@@ -61,6 +68,7 @@ def receive_inbound_email(payload: InboundEmailWebhook, db: Session = Depends(ge
         in_reply_to=payload.in_reply_to,
         references=payload.references,
         to_email=payload.to_email,  # Pass through for tenant resolution
+        auto_submitted=payload.auto_submitted,
     )
     result = process_inbound_email(db, email_in)
     db.commit()

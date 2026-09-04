@@ -30,12 +30,25 @@ def _get_message_or_404(db: Session, message_id: int, org_id: str) -> Message:
     """
     Fetch message and verify it belongs to the calling org.
     Returns 404 for both missing and cross-org messages.
+
+    Takes a row lock (SELECT ... FOR UPDATE on PostgreSQL; SQLAlchemy's
+    SQLite dialect compiles this away as a no-op, since SQLite has no
+    such clause -- harmless there, load-bearing on PostgreSQL). This is
+    the only caller of this helper (approve_and_send_draft), and
+    approval is exactly the kind of read-then-mutate-then-commit
+    operation where two truly concurrent requests for the same message
+    could otherwise both pass the DRAFT-status check below before either
+    commits, and both send. The lock makes the second concurrent request
+    block until the first transaction commits or rolls back, so it then
+    sees the already-updated status and correctly hits the "not a draft"
+    rejection instead of racing past it.
     """
     msg = (
         db.query(Message)
         .join(Contact, Message.contact_id == Contact.id)
         .join(Campaign, Contact.campaign_id == Campaign.id)
         .filter(Message.id == message_id, Campaign.organization_id == org_id)
+        .with_for_update()
         .first()
     )
     if not msg:

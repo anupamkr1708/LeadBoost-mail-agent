@@ -64,9 +64,28 @@ class ValidationError(LLMProviderError):
 
 
 class ProviderUnavailableError(LLMProviderError):
-    """Provider service unavailable."""
+    """Provider service unavailable (connection issue, 5xx, etc) -- worth retrying."""
     def __init__(self, message: str):
         super().__init__(message, ClassificationFailureReason.PROVIDER_UNAVAILABLE, retryable=True)
+
+
+class AuthenticationError(LLMProviderError):
+    """
+    Invalid/expired/missing API credentials.
+
+    Deliberately NOT a subclass of ProviderUnavailableError and
+    deliberately excluded from _chat_with_retry's retry-eligible
+    exception tuple: a bad API key fails identically on every attempt,
+    so retrying it doesn't just fail to help, it triples the latency of
+    a failure that was already certain on the first try. This is what
+    "authentication failures should not be retried" means in practice --
+    tenacity's retry_if_exception_type matches by isinstance(), not by
+    consulting an instance attribute, so this has to be a genuinely
+    separate exception type to actually be excluded, not merely flagged
+    with retryable=False.
+    """
+    def __init__(self, message: str):
+        super().__init__(message, ClassificationFailureReason.PROVIDER_UNAVAILABLE, retryable=False)
 
 
 def _get_client():
@@ -86,9 +105,19 @@ def _get_client():
 
 def _classify_error(error: Exception) -> LLMProviderError:
     """Convert generic exceptions to classified LLM errors."""
+    if isinstance(error, LLMProviderError):
+        return error
+
     error_str = str(error).lower()
-    
-    # Check for specific error patterns
+
+    # Order matters: check authentication before the generic 4xx/5xx
+    # checks below, since "401"/"403" would otherwise also incidentally
+    # not match any other branch and fall through to UNKNOWN_ERROR --
+    # but auth failures need their own non-retryable classification,
+    # not the generic unknown-error path.
+    if "401" in error_str or "403" in error_str or "authentication" in error_str or "invalid api key" in error_str:
+        return AuthenticationError(f"Authentication failed: {error}")
+
     if "429" in error_str or "rate_limit" in error_str or "too many requests" in error_str:
         return RateLimitError(f"Rate limit exceeded: {error}")
     
@@ -101,24 +130,11 @@ def _classify_error(error: Exception) -> LLMProviderError:
     if "400" in error_str:
         return ValidationError(f"Bad request: {error}")
     
-    if "401" in error_str or "403" in error_str or "authentication" in error_str:
-        return ProviderUnavailableError(f"Authentication failed: {error}")
-    
     if "500" in error_str or "502" in error_str or "503" in error_str or "504" in error_str:
         return ProviderUnavailableError(f"Provider server error: {error}")
     
     # Unknown error - not retryable by default
     return LLMProviderError(str(error), ClassificationFailureReason.UNKNOWN_ERROR, retryable=False)
-
-
-def _should_retry(exception) -> bool:
-    """Determine if an exception should trigger retry."""
-    if isinstance(exception, LLMProviderError):
-        return exception.retryable
-    
-    # Classify unknown exceptions
-    classified = _classify_error(exception)
-    return classified.retryable
 
 
 @retry(

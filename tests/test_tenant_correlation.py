@@ -181,3 +181,169 @@ def test_inbound_reply_correlates_by_thread_header_regardless_of_email_collision
 
     assert result["matched"] is True
     assert result["contact_id"] == contact_a.id
+
+
+def test_ambiguous_correlation_is_not_guessed(db_session, caplog):
+    """
+    Spec requirement (section 33): "Never globally choose an arbitrary
+    contact only because the email address matches. If correlation
+    remains ambiguous: mark unresolved or human review."
+
+    Two organizations both have a contact with the same email address.
+    The inbound email has NO thread-header match (first-ever reply from
+    this address, or headers stripped by some relay) AND no to_email
+    (e.g. a webhook payload that doesn't tell us which inbox received
+    it). There is genuinely no reliable signal for which organization
+    this belongs to -- the correct behavior is to leave it unresolved,
+    never to pick one by a tiebreaker like "most recently updated".
+    """
+    import logging
+    campaign_a, campaign_b, contact_a, contact_b = _seed_two_orgs_with_colliding_contact_email(db_session)
+
+    email_in = InboundEmail(
+        from_email="prospect@shared-prospect.example.com",
+        subject="Hello",
+        body_text="Following up on your message.",
+        message_id=None,
+        in_reply_to=None,
+        references=[],
+        to_email=None,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = process_inbound_email_v2(db_session, email_in)
+
+    assert result["matched"] is False, (
+        "Ambiguous correlation must be left unresolved, not guessed at -- "
+        f"got: {result}"
+    )
+    assert any("ambiguous" in r.message.lower() for r in caplog.records), (
+        "Ambiguous correlation should be logged clearly for ops follow-up"
+    )
+
+    # And confirm nothing was persisted against either contact as a side effect.
+    from mailer_agent.models import Message
+    assert db_session.query(Message).filter(Message.contact_id.in_([contact_a.id, contact_b.id])).count() == 0
+
+
+def test_single_unambiguous_email_match_without_to_email_still_resolves(db_session):
+    """
+    The ambiguity guard must not become overly conservative: if only ONE
+    contact anywhere has this from_email (the common case -- most email
+    addresses are not simultaneously being prospected by two different
+    organizations), correlation should still succeed even without
+    to_email or a thread-header match.
+    """
+    campaign = Campaign(
+        name="Solo Org Campaign",
+        organization_id="org-solo",
+        sender_name="Casey",
+        sender_org="Solo Org Inc",
+        sender_email="casey@solo-org.example.com",
+        value_prop="Solo org's value prop",
+    )
+    db_session.add(campaign)
+    db_session.flush()
+    contact = Contact(
+        campaign_id=campaign.id,
+        name="Unique Prospect",
+        email="unique-prospect@example.com",
+        status="active",
+    )
+    db_session.add(contact)
+    db_session.commit()
+
+    email_in = InboundEmail(
+        from_email="unique-prospect@example.com",
+        subject="Hello",
+        body_text="Following up.",
+        message_id=None,
+        in_reply_to=None,
+        references=[],
+        to_email=None,
+    )
+
+    result = process_inbound_email_v2(db_session, email_in)
+
+    assert result["matched"] is True
+    assert result["contact_id"] == contact.id
+
+
+def test_same_email_via_webhook_then_imap_is_deduplicated_despite_format_difference(db_session):
+    """
+    Spec section 35: the same message arriving via webhook and then via
+    IMAP polling (a realistic double-delivery: e.g. the webhook fires,
+    but the reply also sits unseen in the mailbox and gets picked up by
+    the next poll before whatever suppression the provider offers kicks
+    in) must produce exactly one logical inbound message -- not two.
+
+    The subtlety this test targets specifically: IMAP preserves the raw
+    `Message-ID` header, which normally includes angle brackets
+    (e.g. "<abc123@prospect.example.com>"). A webhook JSON payload has
+    no such guarantee -- a provider or a hand-rolled payload template
+    might send the bare id without brackets. If the two channels'
+    representations of the *same* Message-ID aren't normalized to a
+    common form before the dedup check runs, this scenario would
+    silently create two inbound messages (and could trigger two separate
+    auto-replies) instead of being caught as a duplicate.
+    """
+    campaign = Campaign(
+        name="Dedup Test Campaign",
+        organization_id="org-dedup",
+        sender_name="Dana",
+        sender_org="Dedup Test Inc",
+        sender_email="dana@dedup-test.example.com",
+        value_prop="Dedup test value prop",
+    )
+    db_session.add(campaign)
+    db_session.flush()
+    contact = Contact(
+        campaign_id=campaign.id,
+        name="Reply Sender",
+        email="replier@example.com",
+        status="active",
+    )
+    db_session.add(contact)
+    db_session.commit()
+
+    # First delivery: webhook payload, bare Message-ID with no angle brackets
+    # (a realistic shape for a provider/template that strips them).
+    email_via_webhook = InboundEmail(
+        from_email="replier@example.com",
+        subject="Re: intro",
+        body_text="Sounds good, tell me more.",
+        message_id="dupe-check-123@prospect.example.com",  # no angle brackets
+        in_reply_to=None,
+        references=[],
+        to_email="dana@dedup-test.example.com",
+    )
+    result1 = process_inbound_email_v2(db_session, email_via_webhook)
+    assert result1["matched"] is True
+    assert result1["action"] != "skipped_duplicate"
+
+    # Second delivery: the identical email, now arriving via IMAP, whose
+    # raw header parsing yields the angle-bracketed form of the SAME id.
+    email_via_imap = InboundEmail(
+        from_email="replier@example.com",
+        subject="Re: intro",
+        body_text="Sounds good, tell me more.",
+        message_id="<dupe-check-123@prospect.example.com>",  # with brackets
+        in_reply_to=None,
+        references=[],
+        to_email="dana@dedup-test.example.com",
+    )
+    result2 = process_inbound_email_v2(db_session, email_via_imap)
+
+    assert result2["matched"] is True
+    assert result2["action"] == "skipped_duplicate", (
+        "Same Message-ID in a different (but equivalent) string format "
+        f"must be recognized as a duplicate, not processed again. Got: {result2}"
+    )
+
+    from mailer_agent.models import Message, MessageDirection
+    inbound_count = (
+        db_session.query(Message)
+        .filter(Message.contact_id == contact.id, Message.direction == MessageDirection.INBOUND.value)
+        .count()
+    )
+    assert inbound_count == 1, "Exactly one inbound message should be persisted, not two"

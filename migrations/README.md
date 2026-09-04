@@ -36,6 +36,12 @@ Run once, in this order, against a fresh or partially-migrated database:
    `last_outbound_at`, `buying_stage`, `engagement_score`,
    `semantic_analysis`, `classification_success`,
    `classification_failure_reason`.
+5. `003_message_id_unique_constraint.py` -- unique constraint on
+   `messages.message_id_header`, closing a check-then-insert
+   deduplication race under true concurrency (see the migration's own
+   docstring, and `tests/test_postgresql_concurrency.py`). Checks for
+   existing duplicate values first and refuses to apply (with a clear
+   error) rather than silently failing mid-`ALTER` if any are found.
 
 ## Known duplicate
 
@@ -61,6 +67,7 @@ python migrations/001_production_hardening.py
 python migrations/002_constraints_and_multitenancy.py
 python migrations/002_work_claiming.py
 python migrate_db.py
+python migrations/003_message_id_unique_constraint.py
 ```
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/

@@ -13,7 +13,7 @@ from enum import Enum
 from typing import Optional
 
 from mailer_agent.models import Contact, ContactStatus
-from mailer_agent.semantic_models import BuyingStage, IntentType, SemanticIntent
+from mailer_agent.semantic_models import IntentType, SemanticIntent
 from mailer_agent.utils.datetime_utils import utcnow
 
 logger = logging.getLogger("mailer_agent.state_machine")
@@ -192,13 +192,34 @@ def transition_contact_state(
 
 def infer_event_from_semantic_intent(intent: SemanticIntent) -> StateTransitionEvent:
     """
-    Infer state transition event from semantic analysis.
-    
-    Maps multi-dimensional intent to primary state-changing event.
+    Map DIRECTLY-communicated intent to a lifecycle event.
+
+    This function used to also infer PRICING_DISCUSSED from
+    POSITIVE_INTEREST + buying_stage in (EVALUATING, DECIDING) -- i.e.
+    it would decide "this reply is basically about pricing" from a
+    *combination* of signals the prospect didn't directly state that
+    together. That's semantic interpretation, not lifecycle validation,
+    and it doesn't belong here: the state machine's job is to recognize
+    which event occurred and check whether that event is a legal
+    transition from the current state, not to draw a compound inference
+    about what a reply "really means" commercially. That kind of
+    reasoning belongs in the planner (policy/next_action.py), which has
+    the full context (business objective, known facts, conversation
+    history) to do it properly -- this function only has one
+    SemanticIntent and no state machine table entry for "maybe."
+
+    Every branch below is now a direct, single-signal mapping: the
+    prospect explicitly requested a meeting -> MEETING_REQUESTED; the
+    prospect explicitly asked about pricing -> PRICING_DISCUSSED (that
+    IS what the intent means, not an inference from it); positive
+    interest -> POSITIVE_INTEREST, full stop, regardless of buying
+    stage. Ordering below still matters for events that can co-occur in
+    one intents list (e.g. unsubscribe should win over a stray
+    "interested" misclassification), but no branch here combines two
+    different signal types to invent a third meaning.
     """
-    # Priority order matters
-    
-    # Terminal/critical intents first
+    # Terminal/critical intents first -- explicit signals that should
+    # never be shadowed by a co-occurring, lower-priority one.
     if IntentType.UNSUBSCRIBE in intent.intents:
         return StateTransitionEvent.UNSUBSCRIBED
     
@@ -208,21 +229,15 @@ def infer_event_from_semantic_intent(intent: SemanticIntent) -> StateTransitionE
     if IntentType.OUT_OF_OFFICE in intent.intents:
         return StateTransitionEvent.OUT_OF_OFFICE
     
-    # High-value intents
     if IntentType.MEETING_REQUEST in intent.intents:
         return StateTransitionEvent.MEETING_REQUESTED
     
-    if IntentType.PRICING_REQUEST in intent.intents and intent.has_budget_signal:
+    if IntentType.PRICING_REQUEST in intent.intents:
         return StateTransitionEvent.PRICING_DISCUSSED
     
-    # Interest signals
     if IntentType.POSITIVE_INTEREST in intent.intents:
-        # Check buying stage to determine if this is engagement or negotiation
-        if intent.buying_stage in [BuyingStage.EVALUATING, BuyingStage.DECIDING]:
-            return StateTransitionEvent.PRICING_DISCUSSED
         return StateTransitionEvent.POSITIVE_INTEREST
     
-    # Objection handling
     if IntentType.OBJECTION in intent.intents:
         return StateTransitionEvent.OBJECTION_RAISED
     

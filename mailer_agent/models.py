@@ -86,11 +86,24 @@ class MessageStatus(str, enum.Enum):
     Message send/receive state with explicit lifecycle.
     
     Enhanced to track send lifecycle and ambiguous outcomes.
+
+    Verified-in-use vs reserved: DRAFT, SENT, FAILED, UNKNOWN, and
+    RECEIVED are actually set by the current send paths (api/messages.py,
+    followup/engine_v2.py, mail/reply_handler_v2.py) -- send is
+    synchronous within one request/job, so a message goes straight from
+    DRAFT to a terminal outcome. APPROVED, PENDING, and SENDING are
+    defined but currently unused by any code path: they describe an
+    asynchronous approve -> queue -> in-flight pipeline this system
+    doesn't currently have (approval triggers a synchronous send in the
+    same call). Kept in the enum as forward-reserved states for if that
+    changes, not because anything sets them today -- don't assume a
+    message will ever be observed in one of these three states via the
+    current API.
     """
     DRAFT = "draft"          # generated, not sent (live_sending_enabled=False, or awaiting approval)
-    APPROVED = "approved"    # approved for sending, not yet sent
-    PENDING = "pending"      # send requested, queued for execution
-    SENDING = "sending"      # SMTP connection in progress
+    APPROVED = "approved"    # reserved, not currently set -- see class docstring
+    PENDING = "pending"      # reserved, not currently set -- see class docstring
+    SENDING = "sending"      # reserved, not currently set -- see class docstring
     SENT = "sent"            # successfully sent and confirmed
     FAILED = "failed"        # send failed permanently
     UNKNOWN = "unknown"      # provider may have sent, but we don't know (crash window)
@@ -231,6 +244,33 @@ class Message(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     contact = relationship("Contact", back_populates="messages")
+
+    __table_args__ = (
+        # Message-ID is meant to be globally unique by construction (ours
+        # are generated via email.utils.make_msgid(); real inbound ones
+        # are unique per email infrastructure convention), so this is a
+        # plain global constraint, not organization-scoped.
+        #
+        # Without this, the dedup check in
+        # mail/reply_handler_v2.py::process_inbound_email_v2 ("does a
+        # Message with this message_id_header already exist? if not,
+        # insert") is a classic check-then-insert race: under true
+        # concurrency (the same email arriving via webhook and IMAP
+        # nearly simultaneously, or a retried webhook delivery), two
+        # transactions can both see "not found" before either commits,
+        # and both insert -- producing two logical messages for what
+        # should be one. NULL values remain unconstrained (multiple
+        # DRAFT/unsent messages with no Message-ID yet are expected and
+        # fine) -- only non-NULL collisions are rejected.
+        #
+        # The application-level check-then-insert is kept (it avoids an
+        # exception on the common, non-racing path and gives a cleaner
+        # log message), but this constraint is what actually makes
+        # duplicate-prevention correct under concurrency: see
+        # mail/reply_handler_v2.py's IntegrityError handling around the
+        # inbound-message insert, and tests/test_postgresql_concurrency.py.
+        UniqueConstraint("message_id_header", name="uq_messages_message_id_header"),
+    )
 
 
 class SuppressionEntry(Base):

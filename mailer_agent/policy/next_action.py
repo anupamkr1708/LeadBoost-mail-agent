@@ -1,428 +1,207 @@
 """
-Next-best-action policy layer.
+Planner: decides WHAT the agent should try to accomplish next.
 
-Separates semantic understanding (what the prospect meant) from action
-selection (what we should do about it). This layer applies business rules
-and policies to determine appropriate responses.
+This module used to be a 428-line rule-based policy engine (fixed
+priority chain: meeting request > pricing > information request >
+objection > interest > ...) that was never actually called by any
+production code path -- its only reference anywhere in the codebase was
+a dead import-check inside a health endpoint. That's exactly the "Zheimon
+orphan architecture" failure mode: a subsystem that exists, is
+internally coherent, and is completely disconnected from the real
+system. See docs/FINAL_PRODUCTION_READINESS.md for how that was found.
+
+This rewrite does two things differently:
+
+1. It's a genuine reasoning step, not a bigger if/elif tree. Planning --
+   "given this business objective, this prospect's own goal, and what we
+   currently understand, what's the single most useful next action?" --
+   is exactly the kind of judgment call a fixed priority chain gets
+   wrong in ways that are hard to enumerate in advance (see this
+   module's docstring history for the removed
+   "positive_interest -> pricing_discussed" style shortcuts). So the
+   planner is LLM-backed, structurally separate from classification
+   (semantic/classifier.py answers "what did they mean?"; this answers
+   "what should we do about it?") and structurally separate from wording
+   (llm/agent.py's Responder answers "how do we say it?").
+
+2. It is actually called by mail/reply_handler_v2.py's real reply path.
+   No new subsystem ships without a production caller in this codebase
+   going forward -- that's the whole point of this rewrite.
+
+The planner PROPOSES. It is not the safety authority: policy/guardrails.py
+authorizes or rejects the proposal deterministically before anything is
+drafted or sent, and grounding/suppression checks downstream are
+unaffected by anything the planner said. See guardrails.py's docstring
+for that boundary.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from mailer_agent.models import Contact, ContactStatus
-from mailer_agent.semantic_models import BuyingStage, IntentType, SemanticIntent, UrgencyLevel
+from mailer_agent.llm.prompts import PLANNER_SYSTEM_PROMPT, build_planner_prompt
+from mailer_agent.llm.provider import LLMOutputError, LLMUnavailableError, call_llm_json, is_llm_available
+from mailer_agent.semantic_models import SemanticIntent
 
-logger = logging.getLogger("mailer_agent.policy")
+logger = logging.getLogger("mailer_agent.policy.next_action")
+
+PLANNER_PROMPT_VERSION = "planner-v1"
+
+# The universal objective for this kind of B2B outreach agent. Not a
+# per-campaign DB field (yet) -- campaigns don't currently express a
+# distinct objective beyond "have a legitimate commercial conversation
+# about value_prop", and adding a new required column for a single
+# constant string didn't seem justified. If campaigns ever need
+# genuinely different objectives (e.g. "collect a referral" vs "book a
+# meeting"), this is the one place that would need to become
+# campaign-aware.
+DEFAULT_BUSINESS_OBJECTIVE = (
+    "Progress toward a qualified next step (a call, meeting, or other "
+    "concrete conversation) by being genuinely useful and honest in "
+    "response to what the prospect actually says -- never by pushing "
+    "toward that step at the cost of relevance or honesty."
+)
 
 
 class ActionType(str, Enum):
-    """Types of actions the system can take."""
-    NO_ACTION = "no_action"                    # Do nothing (e.g., OOO)
-    DRAFT_REPLY = "draft_reply"                # Generate reply, await human approval
-    AUTO_REPLY = "auto_reply"                  # Generate and send reply automatically
-    REQUEST_INFORMATION = "request_information"  # Ask prospect for more details
-    ANSWER_QUESTION = "answer_question"        # Answer prospect's question
-    HANDLE_OBJECTION = "handle_objection"      # Address objection
-    PROPOSE_MEETING = "propose_meeting"        # Suggest call/meeting
-    PROVIDE_PRICING = "provide_pricing"        # Share pricing information
-    SEND_MATERIALS = "send_materials"          # Send case studies, docs, etc.
-    NURTURE_SCHEDULE = "nurture_schedule"      # Schedule future follow-up
-    ESCALATE_HUMAN = "escalate_human"          # Require human intervention
-    CLOSE_DEAL = "close_deal"                  # Move to close
-    MARK_LOST = "mark_lost"                    # End pursuit
-    SUPPRESS = "suppress"                      # Add to suppression list
+    ACKNOWLEDGE = "acknowledge"
+    ANSWER = "answer"
+    CLARIFY = "clarify"
+    ASK_TARGETED_QUESTION = "ask_targeted_question"
+    ADDRESS_OBJECTION = "address_objection"
+    PROVIDE_REQUESTED_INFORMATION = "provide_requested_information"
+    PROPOSE_NEXT_STEP = "propose_next_step"
+    REQUEST_MISSING_INFORMATION = "request_missing_information"
+    DEFER = "defer"
+    NURTURE = "nurture"
+    ESCALATE = "escalate"
 
 
 @dataclass
-class NextBestAction:
+class NextActionProposal:
     """
-    Recommended next action based on semantic analysis + business policy.
+    Typed output of the planner. Crossing this typed contract (rather
+    than the LLM's raw JSON) is what lets policy/guardrails.py validate
+    a fixed, known shape instead of trusting arbitrary output -- see
+    guardrails.py.
     """
-    
-    # Primary action
-    action: ActionType
-    
-    # Action parameters/context
-    message_type: Optional[str] = None  # "reply", "closing", "nurture", etc.
-    requires_human_approval: bool = False
-    approval_reason: Optional[str] = None
-    
-    # Timing
-    execute_immediately: bool = True
-    schedule_for: Optional[str] = None  # Future datetime or relative ("next_month")
-    
-    # Content guidance
-    content_hints: dict = None  # Hints for message generation
-    
-    # Confidence and reasoning
+    action_type: ActionType
+    objective: str
+    reason: str
+    required_information: list[str] = field(default_factory=list)
     confidence: float = 0.0
-    reasoning: str = ""
-    alternative_actions: list[ActionType] = None
-    
-    def __post_init__(self):
-        if self.content_hints is None:
-            self.content_hints = {}
-        if self.alternative_actions is None:
-            self.alternative_actions = []
+    requires_human_review: bool = False
+    review_reason: Optional[str] = None
+    source: str = "llm"  # "llm" or "fallback"
 
 
-class NextBestActionPolicy:
+# Fallback proposal used when the LLM is unavailable. Deliberately the
+# most conservative possible plan -- it does not guess at what action
+# would be useful (that would just be a smaller, hidden version of the
+# heuristic-planning problem this module exists to avoid), it defers to
+# a human.
+_FALLBACK_PROPOSAL = NextActionProposal(
+    action_type=ActionType.ESCALATE,
+    objective="Have a human review this reply and decide the right response.",
+    reason="Planner LLM unavailable -- no safe automated plan.",
+    confidence=0.0,
+    requires_human_review=True,
+    review_reason="Planner unavailable",
+    source="fallback",
+)
+
+
+def _semantic_summary(intent: SemanticIntent) -> str:
+    """Compact plain-text summary of the classifier's structured output, for the planner prompt."""
+    lines = [
+        f"intents: {[i.value for i in intent.intents]}",
+        f"speech_act: {intent.speech_act.value if intent.speech_act else 'unknown'}",
+        f"sentiment: {intent.sentiment.value}",
+        f"buying_stage: {intent.buying_stage.value}",
+        f"urgency: {intent.urgency.value}",
+    ]
+    if intent.user_goal:
+        lines.append(f"prospect's stated/inferred goal: {intent.user_goal}")
+    if intent.objections_raised:
+        lines.append(f"objections: {intent.objections_raised}")
+    if intent.questions_asked:
+        lines.append(f"questions asked: {intent.questions_asked}")
+    if intent.requested_information:
+        lines.append(f"information requested: {intent.requested_information}")
+    if intent.has_pricing_question:
+        lines.append("has_pricing_question: true")
+    if intent.timing:
+        lines.append(
+            f"timing: expression={intent.timing.expression!r} "
+            f"normalized_target={intent.timing.normalized_target} "
+            f"requires_clarification={intent.timing.requires_clarification}"
+        )
+    if intent.current_solution:
+        lines.append(
+            f"current_solution: {intent.current_solution.value} "
+            f"(certainty={intent.current_solution.certainty.value})"
+        )
+    lines.append(f"classifier confidence: {intent.confidence}")
+    if intent.uncertain_aspects:
+        lines.append(f"classifier-flagged uncertainty: {intent.uncertain_aspects}")
+    return "\n".join(lines)
+
+
+def plan_next_action(
+    *,
+    intent: SemanticIntent,
+    context_transcript: str,
+    known_facts: str = "",
+    business_objective: str = DEFAULT_BUSINESS_OBJECTIVE,
+) -> NextActionProposal:
     """
-    Policy engine for determining next best action.
-    
-    Applies business rules to semantic understanding.
+    Propose the next conversational action. Never raises -- returns the
+    conservative ESCALATE fallback if the LLM is unavailable or fails,
+    since a wrong guess about what to do next is worse than asking a
+    human (this mirrors llm/agent.py's ContextualFallbackUnavailable
+    reasoning, but the planner has a real fallback value to return where
+    the responder deliberately does not, because "have a human look at
+    it" is itself always a valid plan, unlike invented reply content).
     """
-    
-    def __init__(self, auto_reply_enabled: bool = False):
-        self.auto_reply_enabled = auto_reply_enabled
-    
-    def determine_next_action(
-        self,
-        *,
-        contact: Contact,
-        semantic_intent: SemanticIntent,
-        has_approved_pricing: bool = False,
-        has_case_studies: bool = False
-    ) -> NextBestAction:
-        """
-        Determine next best action based on semantic understanding and context.
-        
-        Args:
-            contact: The contact/prospect
-            semantic_intent: Semantic analysis of their reply
-            has_approved_pricing: Whether campaign has approved pricing info
-            has_case_studies: Whether campaign has case studies/materials
-        """
-        
-        # Rule 1: Terminal/critical intents override everything
-        if IntentType.UNSUBSCRIBE in semantic_intent.intents:
-            return NextBestAction(
-                action=ActionType.SUPPRESS,
-                execute_immediately=True,
-                confidence=1.0,
-                reasoning="Explicit unsubscribe request"
-            )
-        
-        if IntentType.NOT_INTERESTED in semantic_intent.intents:
-            # But check confidence - might be misclassified
-            if semantic_intent.confidence >= 0.7:
-                return NextBestAction(
-                    action=ActionType.MARK_LOST,
-                    requires_human_approval=True,
-                    approval_reason="Confirm prospect truly not interested",
-                    confidence=semantic_intent.confidence,
-                    reasoning="Prospect explicitly not interested"
-                )
-            else:
-                # Low confidence - human should review
-                return NextBestAction(
-                    action=ActionType.ESCALATE_HUMAN,
-                    requires_human_approval=True,
-                    approval_reason="Low confidence 'not interested' classification",
-                    confidence=semantic_intent.confidence,
-                    reasoning="Ambiguous rejection, needs human review"
-                )
-        
-        # Rule 2: Out of office - do nothing
-        if IntentType.OUT_OF_OFFICE in semantic_intent.intents:
-            return NextBestAction(
-                action=ActionType.NO_ACTION,
-                execute_immediately=False,
-                confidence=0.95,
-                reasoning="Out of office auto-reply, will wait for real response"
-            )
-        
-        # Rule 3: Meeting requests get highest priority
-        if IntentType.MEETING_REQUEST in semantic_intent.intents:
-            return self._handle_meeting_request(contact, semantic_intent)
-        
-        # Rule 4: Pricing requests need careful handling
-        if IntentType.PRICING_REQUEST in semantic_intent.intents or semantic_intent.has_pricing_question:
-            return self._handle_pricing_request(
-                contact,
-                semantic_intent,
-                has_approved_pricing
-            )
-        
-        # Rule 5: Information requests
-        if IntentType.INFORMATION_REQUEST in semantic_intent.intents:
-            return self._handle_information_request(
-                contact,
-                semantic_intent,
-                has_case_studies
-            )
-        
-        # Rule 6: Objections require thoughtful response
-        if IntentType.OBJECTION in semantic_intent.intents:
-            return self._handle_objection(contact, semantic_intent)
-        
-        # Rule 7: Positive interest -> move forward
-        if IntentType.POSITIVE_INTEREST in semantic_intent.intents:
-            return self._handle_positive_interest(contact, semantic_intent)
-        
-        # Rule 8: Timing constraints
-        if IntentType.TIMING_CONSTRAINT in semantic_intent.intents:
-            return self._handle_timing_constraint(contact, semantic_intent)
-        
-        # Rule 9: Questions that don't fit other categories
-        if IntentType.QUESTION in semantic_intent.intents:
-            return self._handle_question(contact, semantic_intent)
-        
-        # Rule 10: Low confidence or ambiguous - human review
-        if semantic_intent.confidence < 0.5 or semantic_intent.requires_human_review:
-            return NextBestAction(
-                action=ActionType.ESCALATE_HUMAN,
-                requires_human_approval=True,
-                approval_reason=semantic_intent.human_review_reason or f"Low confidence ({semantic_intent.confidence:.2f})",
-                confidence=semantic_intent.confidence,
-                reasoning="Ambiguous intent, requires human judgment"
-            )
-        
-        # Default: Draft reply with human approval
-        return NextBestAction(
-            action=ActionType.DRAFT_REPLY,
-            message_type="reply",
-            requires_human_approval=True,
-            approval_reason="Neutral/unclear intent",
-            confidence=semantic_intent.confidence,
-            reasoning="No clear high-value action identified"
+    if not is_llm_available():
+        logger.info("Planner: LLM unavailable, returning conservative escalate fallback")
+        return _FALLBACK_PROPOSAL
+
+    try:
+        human_prompt = build_planner_prompt(
+            business_objective=business_objective,
+            prospect_goal=intent.user_goal,
+            semantic_summary=_semantic_summary(intent),
+            known_facts=known_facts,
+            unresolved_items="\n".join(intent.unresolved_items) if intent.unresolved_items else "",
+            context_transcript=context_transcript,
         )
-    
-    def _handle_meeting_request(
-        self,
-        contact: Contact,
-        intent: SemanticIntent
-    ) -> NextBestAction:
-        """Handle meeting/call requests."""
-        
-        # Meeting requests should always involve human for scheduling
-        return NextBestAction(
-            action=ActionType.PROPOSE_MEETING,
-            message_type="closing",
-            requires_human_approval=True,  # Human needs to confirm availability
-            approval_reason="Meeting scheduling requires calendar coordination",
-            content_hints={
-                "acknowledge_interest": True,
-                "confirm_meeting_request": True,
-                "requested_timing": intent.requested_timing,
-                "urgency": intent.urgency.value
-            },
-            confidence=intent.confidence,
-            reasoning="Prospect wants to meet - high-value opportunity"
+        payload = call_llm_json(PLANNER_SYSTEM_PROMPT, human_prompt, max_tokens=400, temperature=0.3)
+
+        try:
+            action_type = ActionType(payload.get("action_type"))
+        except ValueError:
+            logger.warning("Planner returned unknown action_type %r, escalating", payload.get("action_type"))
+            return _FALLBACK_PROPOSAL
+
+        objective = (payload.get("objective") or "").strip()
+        if not objective:
+            logger.warning("Planner returned empty objective, escalating")
+            return _FALLBACK_PROPOSAL
+
+        return NextActionProposal(
+            action_type=action_type,
+            objective=objective,
+            reason=payload.get("reason", ""),
+            required_information=payload.get("required_information", []) or [],
+            confidence=float(payload.get("confidence", 0.5)),
+            requires_human_review=bool(payload.get("requires_human_review", False)),
+            review_reason=payload.get("review_reason"),
+            source="llm",
         )
-    
-    def _handle_pricing_request(
-        self,
-        contact: Contact,
-        intent: SemanticIntent,
-        has_approved_pricing: bool
-    ) -> NextBestAction:
-        """Handle pricing questions."""
-        
-        if has_approved_pricing:
-            # We have approved pricing - can respond but should review
-            return NextBestAction(
-                action=ActionType.PROVIDE_PRICING,
-                message_type="reply",
-                requires_human_approval=True,  # Pricing is sensitive
-                approval_reason="Pricing discussion requires approval",
-                content_hints={
-                    "has_pricing_data": True,
-                    "pricing_context": intent.requested_information,
-                    "has_budget_signal": intent.has_budget_signal
-                },
-                confidence=intent.confidence,
-                reasoning="Pricing request with approved data available"
-            )
-        else:
-            # No approved pricing - must escalate
-            return NextBestAction(
-                action=ActionType.ESCALATE_HUMAN,
-                requires_human_approval=True,
-                approval_reason="Pricing request but no approved pricing data",
-                content_hints={
-                    "needs_pricing_data": True,
-                    "pricing_context": intent.requested_information
-                },
-                confidence=intent.confidence,
-                reasoning="Cannot auto-respond to pricing without approved data"
-            )
-    
-    def _handle_information_request(
-        self,
-        contact: Contact,
-        intent: SemanticIntent,
-        has_materials: bool
-    ) -> NextBestAction:
-        """Handle requests for information, case studies, etc."""
-        
-        if not intent.requested_information:
-            # Vague request
-            return NextBestAction(
-                action=ActionType.REQUEST_INFORMATION,
-                message_type="reply",
-                requires_human_approval=False if self.auto_reply_enabled and intent.confidence >= 0.7 else True,
-                approval_reason="Clarifying information request" if not self.auto_reply_enabled else None,
-                content_hints={
-                    "ask_for_specifics": True
-                },
-                confidence=intent.confidence,
-                reasoning="Vague information request, need clarification"
-            )
-        
-        # Specific request
-        return NextBestAction(
-            action=ActionType.SEND_MATERIALS,
-            message_type="reply",
-            requires_human_approval=True,  # Materials should be reviewed
-            approval_reason="Verify materials match request",
-            content_hints={
-                "requested_items": intent.requested_information,
-                "has_materials": has_materials
-            },
-            confidence=intent.confidence,
-            reasoning=f"Specific information requested: {', '.join(intent.requested_information[:3])}"
-        )
-    
-    def _handle_objection(
-        self,
-        contact: Contact,
-        intent: SemanticIntent
-    ) -> NextBestAction:
-        """Handle objections."""
-        
-        # Objections always require thoughtful responses
-        return NextBestAction(
-            action=ActionType.HANDLE_OBJECTION,
-            message_type="reply",
-            requires_human_approval=True,
-            approval_reason="Objections require careful, accurate responses",
-            content_hints={
-                "objections": intent.objections_raised,
-                "sentiment": intent.sentiment.value,
-                "has_interest": IntentType.POSITIVE_INTEREST in intent.intents
-            },
-            confidence=intent.confidence,
-            reasoning=f"Objection raised: {', '.join(intent.objections_raised[:2])}"
-        )
-    
-    def _handle_positive_interest(
-        self,
-        contact: Contact,
-        intent: SemanticIntent
-    ) -> NextBestAction:
-        """Handle positive interest."""
-        
-        # Check buying stage to determine aggressiveness
-        if intent.buying_stage in [BuyingStage.DECIDING, BuyingStage.COMMITTED]:
-            # Hot lead - move to close
-            return NextBestAction(
-                action=ActionType.CLOSE_DEAL,
-                message_type="closing",
-                requires_human_approval=True,
-                approval_reason="High-value closing opportunity",
-                content_hints={
-                    "buying_stage": intent.buying_stage.value,
-                    "urgency": intent.urgency.value,
-                    "push_for_commitment": True
-                },
-                confidence=intent.confidence,
-                reasoning="Strong buying signals, ready to close"
-            )
-        
-        elif intent.buying_stage in [BuyingStage.EVALUATING]:
-            # Evaluation stage - provide value
-            auto_send = self.auto_reply_enabled and intent.confidence >= 0.75
-            
-            return NextBestAction(
-                action=ActionType.AUTO_REPLY if auto_send else ActionType.DRAFT_REPLY,
-                message_type="reply",
-                requires_human_approval=not auto_send,
-                approval_reason=None if auto_send else "Evaluation stage, high-value conversation",
-                content_hints={
-                    "buying_stage": intent.buying_stage.value,
-                    "provide_proof": True,
-                    "address_questions": intent.questions_asked
-                },
-                confidence=intent.confidence,
-                reasoning="Prospect evaluating, continue value conversation"
-            )
-        
-        else:
-            # Early stage interest
-            auto_send = self.auto_reply_enabled and intent.confidence >= 0.7
-            
-            return NextBestAction(
-                action=ActionType.AUTO_REPLY if auto_send else ActionType.DRAFT_REPLY,
-                message_type="reply",
-                requires_human_approval=not auto_send,
-                content_hints={
-                    "buying_stage": intent.buying_stage.value,
-                    "nurture_interest": True
-                },
-                confidence=intent.confidence,
-                reasoning="Early interest, nurture relationship"
-            )
-    
-    def _handle_timing_constraint(
-        self,
-        contact: Contact,
-        intent: SemanticIntent
-    ) -> NextBestAction:
-        """Handle timing constraints (contact me later)."""
-        
-        return NextBestAction(
-            action=ActionType.NURTURE_SCHEDULE,
-            message_type="nurture",
-            execute_immediately=False,
-            schedule_for=intent.requested_timing,
-            requires_human_approval=True,
-            approval_reason="Verify timing interpretation",
-            content_hints={
-                "requested_timing": intent.requested_timing,
-                "acknowledge_timing": True
-            },
-            confidence=intent.confidence,
-            reasoning=f"Prospect requested contact at: {intent.requested_timing}"
-        )
-    
-    def _handle_question(
-        self,
-        contact: Contact,
-        intent: SemanticIntent
-    ) -> NextBestAction:
-        """Handle general questions."""
-        
-        # Questions can be auto-answered if high confidence and simple
-        if intent.confidence >= 0.75 and len(intent.questions_asked) <= 2:
-            auto_send = self.auto_reply_enabled
-            
-            return NextBestAction(
-                action=ActionType.ANSWER_QUESTION if auto_send else ActionType.DRAFT_REPLY,
-                message_type="reply",
-                requires_human_approval=not auto_send,
-                approval_reason=None if auto_send else "Review answer accuracy",
-                content_hints={
-                    "questions": intent.questions_asked,
-                    "provide_direct_answers": True
-                },
-                confidence=intent.confidence,
-                reasoning=f"Direct questions: {', '.join(intent.questions_asked[:2])}"
-            )
-        else:
-            # Complex or low-confidence questions need review
-            return NextBestAction(
-                action=ActionType.DRAFT_REPLY,
-                message_type="reply",
-                requires_human_approval=True,
-                approval_reason="Complex/ambiguous questions",
-                content_hints={
-                    "questions": intent.questions_asked
-                },
-                confidence=intent.confidence,
-                reasoning="Multiple or complex questions require careful response"
-            )
+    except (LLMUnavailableError, LLMOutputError) as e:
+        logger.warning("Planner LLM call failed, escalating: %s", e)
+        return _FALLBACK_PROPOSAL

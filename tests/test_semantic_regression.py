@@ -20,12 +20,18 @@ for real and asserts the classifier correctly:
   - propagates explicit provider failures as failures, never silently
     as a "neutral" semantic result (see test_provider_failure_is_not_neutral)
 
-Two scenarios below (unsubscribe, out-of-office) never reach the LLM at
-all: they're caught by classify_prospect_reply's rule-based safety net
-(_check_critical_keywords) before any provider call, so no fixture is
-queued for them -- if the classifier ever changes to send these to the
-LLM instead, the tests still catch a regression because the fake would
-raise AssertionError for a missing fixture.
+Two categories of scenario below never reach the LLM at all, and are
+proven to do so by NOT queuing a fixture (the fake would raise
+AssertionError for a missing fixture if either path ever changed to
+route through the LLM instead):
+  - unsubscribe: caught by classify_prospect_reply's rule-based safety
+    net (_check_unsubscribe_keywords) before any provider call.
+  - out-of-office WHEN a structured Auto-Submitted signal is available:
+    caught by _check_auto_submitted_metadata, a deterministic
+    protocol-level check, not a body-text guess. When that signal is
+    NOT available (the common case for most inbound-parse providers),
+    out-of-office is a normal semantic classification like any other --
+    there is deliberately no hardcoded OOO phrase list.
 
 Live-LLM behavioral quality (does a real model actually understand these
 scenarios well) belongs in a separate, explicitly-marked
@@ -69,12 +75,13 @@ def test_contact():
     )
 
 
-def _classify(campaign, contact, body, context="(no prior messages)"):
+def _classify(campaign, contact, body, context="(no prior messages)", auto_submitted=False):
     return classify_prospect_reply(
         campaign=campaign,
         contact=contact,
         inbound_body=body,
         conversation_context=context,
+        auto_submitted=auto_submitted,
     )
 
 
@@ -93,7 +100,7 @@ def test_meeting_and_pricing_multi_intent_is_parsed_correctly(fake_llm, test_cam
         "sentiment": "positive",
         "buying_stage": "evaluating",
         "urgency": "near_term",
-        "requested_timing": "next week",
+        "timing": {"expression": "next week", "kind": "relative_period", "certainty": "explicit", "requires_clarification": False},
         "has_pricing_question": True,
         "has_budget_signal": True,
         "has_decision_maker_signal": False,
@@ -126,7 +133,9 @@ def test_meeting_and_pricing_multi_intent_is_parsed_correctly(fake_llm, test_cam
     assert intent.sentiment == SentimentType.POSITIVE
     assert intent.buying_stage == BuyingStage.EVALUATING
     assert intent.urgency == UrgencyLevel.NEAR_TERM
-    assert intent.requested_timing == "next week"
+    assert intent.timing is not None
+    assert intent.timing.expression == "next week"
+    assert intent.requested_timing == "next week"  # backward-compat accessor
     assert intent.has_pricing_question is True
     assert intent.has_budget_signal is True
     assert intent.requested_information == ["pricing for 50-person team"]
@@ -142,7 +151,7 @@ def test_timing_objection_is_parsed_correctly(fake_llm, test_campaign, test_cont
         "sentiment": "mixed",
         "buying_stage": "nurture",
         "urgency": "long_term",
-        "requested_timing": "18 months",
+        "timing": {"expression": "18 months", "kind": "relative_period", "certainty": "explicit", "requires_clarification": False},
         "has_pricing_question": False,
         "has_budget_signal": False,
         "objections_raised": ["locked into current vendor for 18 months"],
@@ -165,7 +174,8 @@ def test_timing_objection_is_parsed_correctly(fake_llm, test_campaign, test_cont
     assert intent.sentiment == SentimentType.MIXED
     assert intent.buying_stage == BuyingStage.NURTURE
     assert intent.urgency == UrgencyLevel.LONG_TERM
-    assert intent.requested_timing == "18 months"
+    assert intent.timing is not None
+    assert intent.timing.expression == "18 months"
     assert intent.objections_raised == ["locked into current vendor for 18 months"]
 
 
@@ -284,7 +294,7 @@ def test_budget_and_timeline_is_parsed_correctly(fake_llm, test_campaign, test_c
         "sentiment": "positive",
         "buying_stage": "deciding",
         "urgency": "immediate",
-        "requested_timing": "end of July (Q3)",
+        "timing": {"expression": "end of July (Q3)", "kind": "quarter", "certainty": "explicit", "requires_clarification": False},
         "has_budget_signal": True,
         "has_decision_maker_signal": True,
         "questions_asked": ["Can you work with that timeline?"],
@@ -400,20 +410,61 @@ def test_unsubscribe_keyword_never_calls_llm(fake_llm, test_campaign, test_conta
     assert intent.confidence >= 0.9
 
 
-def test_out_of_office_never_calls_llm(fake_llm, test_campaign, test_contact):
+def test_out_of_office_with_metadata_never_calls_llm(fake_llm, test_campaign, test_contact):
+    """
+    Structured Auto-Submitted metadata (see mail/imap_reader.py) is a
+    deterministic protocol-level signal, checked before any LLM call --
+    NOT a body-text keyword list (there used to be one; removed). This
+    is the "metadata available" path.
+    """
     result = _classify(
         test_campaign, test_contact,
         "Thank you for your email. I am out of the office until Monday, "
         "March 15th with limited access to email.",
+        auto_submitted=True,
     )
 
     assert result.success
-    assert result.source == "rule_based"
-    assert fake_llm.call_count == 0, "OOO auto-replies should never reach the LLM provider"
+    assert result.source == "metadata"
+    assert fake_llm.call_count == 0, "OOO with known metadata should never reach the LLM provider"
     intent = result.semantic_intent
     assert IntentType.OUT_OF_OFFICE in intent.intents
     assert intent.sentiment == SentimentType.NEUTRAL
     assert not intent.requires_human_review
+
+
+def test_out_of_office_without_metadata_is_classified_semantically(fake_llm, test_campaign, test_contact):
+    """
+    When no Auto-Submitted signal is available (auto_submitted=False,
+    the common case for many inbound-parse providers), out-of-office is
+    NOT guessed from a hardcoded phrase list -- it goes through genuine
+    LLM semantic classification like any other reply. This test proves
+    that path is reachable and correctly wired, by queuing a fixture and
+    confirming the fake WAS called.
+    """
+    fake_llm.queue_response({
+        "intents": ["out_of_office"],
+        "speech_act": "statement",
+        "sentiment": "neutral",
+        "buying_stage": "unaware",
+        "urgency": "no_timeline",
+        "confidence": 0.9,
+        "reasoning": "Automated absence notice, no human review needed.",
+        "requires_human_review": False,
+    })
+
+    result = _classify(
+        test_campaign, test_contact,
+        "Thank you for your email. I am out of the office until Monday, "
+        "March 15th with limited access to email.",
+        auto_submitted=False,
+    )
+
+    assert result.success
+    assert result.source == "llm"
+    assert fake_llm.call_count == 1, "Without metadata, OOO must go through real semantic classification"
+    intent = result.semantic_intent
+    assert IntentType.OUT_OF_OFFICE in intent.intents
 
 
 # ---------------------------------------------------------------------------

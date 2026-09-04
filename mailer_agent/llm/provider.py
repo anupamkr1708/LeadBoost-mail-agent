@@ -24,6 +24,7 @@ from typing import Any
 
 from mailer_agent.llm import provider_v2
 from mailer_agent.llm.provider_v2 import (
+    AuthenticationError,
     LLMProviderError,
     MalformedOutputError,
     ProviderUnavailableError,
@@ -67,7 +68,7 @@ def call_llm_text(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-    except ProviderUnavailableError as e:
+    except (ProviderUnavailableError, AuthenticationError) as e:
         raise LLMUnavailableError(str(e)) from e
     except MalformedOutputError as e:
         raise LLMOutputError(str(e)) from e
@@ -96,7 +97,7 @@ def call_llm_json(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-    except ProviderUnavailableError as e:
+    except (ProviderUnavailableError, AuthenticationError) as e:
         raise LLMUnavailableError(str(e)) from e
     except MalformedOutputError as e:
         raise LLMOutputError(str(e)) from e

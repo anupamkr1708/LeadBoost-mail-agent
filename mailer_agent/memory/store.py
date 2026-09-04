@@ -52,6 +52,65 @@ def build_conversation_context(db: Session, contact: Contact) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def build_known_facts_context(contact: Contact) -> str:
+    """
+    Accumulated "working memory" of provenance-tracked facts across the
+    WHOLE conversation, not just the latest message -- pulled from each
+    inbound Message's stored semantic_analysis (see
+    semantic_models.serialize_semantic_intent / mail/reply_handler_v2.py,
+    which persists it as a native JSON dict on every classified inbound
+    message).
+
+    This is the layer between "recent messages verbatim"
+    (build_conversation_context, above) and "durable structured facts" --
+    it's what lets the planner (policy/next_action.py) know that a fact
+    established three messages ago is still current, rather than only
+    seeing whatever the very latest message happened to restate.
+
+    Later facts about the same thing supersede earlier ones (a fact
+    marked contradicted, or a current_solution mentioned again with a
+    different value) -- this performs simple last-write-wins by fact
+    text, not fuzzy deduplication, since anything cleverer would drift
+    toward guessing semantic equivalence outside the LLM, which is
+    exactly what this architecture avoids doing in deterministic code.
+    """
+    inbound = [m for m in contact.messages if m.direction == "inbound" and m.semantic_analysis]
+    if not inbound:
+        return ""
+
+    current_solution = None
+    facts_seen: dict[str, str] = {}  # value -> certainty, insertion order = recency
+    unresolved: list[str] = []
+    contradicted: list[str] = []
+
+    for m in inbound:
+        analysis = m.semantic_analysis
+        if not isinstance(analysis, dict):
+            continue
+        cs = analysis.get("current_solution")
+        if cs and cs.get("value"):
+            current_solution = cs  # later messages win
+        for fact in analysis.get("new_facts") or []:
+            if fact and fact.get("value"):
+                facts_seen[fact["value"]] = fact.get("certainty", "unknown")
+        if analysis.get("unresolved_items"):
+            unresolved = analysis["unresolved_items"]  # only the latest turn's still-open items matter
+        if analysis.get("contradicted_facts"):
+            contradicted.extend(analysis["contradicted_facts"])
+
+    lines = []
+    if current_solution:
+        lines.append(f"current_solution: {current_solution['value']} (certainty={current_solution.get('certainty', 'unknown')})")
+    for value, certainty in facts_seen.items():
+        lines.append(f"fact: {value} (certainty={certainty})")
+    if contradicted:
+        lines.append(f"contradictions noted during conversation: {contradicted}")
+    if unresolved:
+        lines.append(f"still unresolved as of latest message: {unresolved}")
+
+    return "\n".join(lines)
+
+
 def maybe_summarize_older_messages(db: Session, contact: Contact) -> None:
     """
     Called after logging a new message. If the thread has grown past the

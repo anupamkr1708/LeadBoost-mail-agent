@@ -182,73 +182,58 @@ class FollowUpScheduler:
         semantic_intent: SemanticIntent
     ) -> Optional[datetime]:
         """
-        Extract specific datetime from requested_timing string.
-        
-        Examples:
-        - "next month" → 30 days from now
-        - "Q3" → July 1
-        - "18 months" → 540 days from now
-        - "next week" → 7 days from now
+        Read the LLM's structured timing interpretation
+        (SemanticIntent.timing), rather than regex-parsing a free-text
+        string here.
+
+        This used to receive a bare string ("next month", "18 months",
+        "sometime next quarter maybe") and regex-match it against a
+        hardcoded phrase list, falling back to a hardcoded 30-day
+        default whenever nothing matched -- exactly the kind of semantic
+        heuristic (and silently-invented business date) this
+        architecture is supposed to avoid. The LLM now does the
+        temporal interpretation directly (see semantic/classifier.py's
+        prompt) and reports a normalized_target ONLY when it can
+        genuinely determine one; deterministic Python here only
+        ever *consumes* that decision.
+
+        Returns None whenever there's no specific date to act on --
+        including when the LLM explicitly flagged the timing as vague/
+        conditional/ambiguous (requires_clarification=True). Callers
+        treat None as "no override, use the campaign's normal cadence" --
+        this deliberately does NOT invent a fallback date for the
+        unclear case; it just declines to override, which is the safe
+        behavior for "we don't actually know when they want to be
+        contacted".
         """
-        
-        if not semantic_intent.requested_timing:
+        timing = semantic_intent.timing
+        if not timing:
             return None
-        
-        timing_str = semantic_intent.requested_timing.lower()
-        now = utcnow()
-        
-        # Explicit month references
-        if "next month" in timing_str or "in a month" in timing_str:
-            return now + timedelta(days=30)
-        
-        # Week references
-        if "next week" in timing_str or "in a week" in timing_str:
-            return now + timedelta(days=7)
-        
-        # Quarter references (approximate)
-        quarters = {
-            "q1": (1, 1),  # Jan 1
-            "q2": (4, 1),  # Apr 1
-            "q3": (7, 1),  # Jul 1
-            "q4": (10, 1), # Oct 1
-        }
-        for quarter, (month, day) in quarters.items():
-            if quarter in timing_str:
-                year = now.year
-                if month < now.month:  # Quarter already passed this year
-                    year += 1
-                from mailer_agent.utils.datetime_utils import UTC
-                return datetime(year, month, day, tzinfo=UTC)
-        
-        # Month count (e.g., "18 months", "6 months")
-        import re
-        month_match = re.search(r'(\d+)\s*months?', timing_str)
-        if month_match:
-            months = int(month_match.group(1))
-            return now + timedelta(days=months * 30)
-        
-        # Week count (e.g., "2 weeks", "3 weeks")
-        week_match = re.search(r'(\d+)\s*weeks?', timing_str)
-        if week_match:
-            weeks = int(week_match.group(1))
-            return now + timedelta(weeks=weeks)
-        
-        # Day count (e.g., "5 days", "10 days")
-        day_match = re.search(r'(\d+)\s*days?', timing_str)
-        if day_match:
-            days = int(day_match.group(1))
-            return now + timedelta(days=days)
-        
-        # Year references
-        if "next year" in timing_str:
+
+        if timing.requires_clarification or not timing.normalized_target:
+            logger.info(
+                "Timing signal present but not resolvable to a specific "
+                "date (expression=%r, requires_clarification=%s) -- no "
+                "override; falling back to campaign cadence.",
+                timing.expression, timing.requires_clarification,
+            )
+            return None
+
+        try:
+            parsed = datetime.fromisoformat(timing.normalized_target)
+        except (ValueError, TypeError):
+            logger.warning(
+                "LLM provided an unparseable normalized_target %r for "
+                "expression %r -- treating as no override.",
+                timing.normalized_target, timing.expression,
+            )
+            return None
+
+        if parsed.tzinfo is None:
             from mailer_agent.utils.datetime_utils import UTC
-            return datetime(now.year + 1, 1, 1, tzinfo=UTC)
-        
-        # Default: if we can't parse, schedule for 1 month
-        logger.warning(
-            f"Could not parse timing '{timing_str}', defaulting to 30 days"
-        )
-        return now + timedelta(days=30)
+            parsed = parsed.replace(tzinfo=UTC)
+
+        return parsed
     
     def get_followup_message_hint(self, contact: Contact) -> dict:
         """
