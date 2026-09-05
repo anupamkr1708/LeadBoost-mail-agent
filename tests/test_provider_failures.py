@@ -157,6 +157,39 @@ def test_persistent_5xx_is_bounded(monkeypatch):
     assert fake_client.call_count == 3
 
 
+def test_504_gateway_timeout_classified_as_provider_unavailable_not_timeout(monkeypatch):
+    """
+    Regression test for a real classification-precedence bug: "504
+    Gateway Timeout" contains the word "timeout" in its standard HTTP
+    reason phrase, and _classify_error used to check the generic
+    "timeout" text match before checking for explicit 5xx status codes
+    -- misclassifying a server-side error as a client-side timeout.
+    Both are retryable (so the retry behavior itself was never wrong),
+    but the classification -- and therefore the failure_reason recorded
+    for observability/monitoring -- was.
+    """
+    from mailer_agent.llm.provider_v2 import _classify_error
+
+    classified = _classify_error(Exception("504 Gateway Timeout"))
+    assert isinstance(classified, ProviderUnavailableError), (
+        f"'504 Gateway Timeout' must classify as ProviderUnavailableError "
+        f"(explicit HTTP status wins), not {type(classified).__name__} "
+        f"(generic text match on the word 'timeout' in the reason phrase)."
+    )
+
+
+def test_generic_timeout_without_http_status_still_classified_as_timeout(monkeypatch):
+    """The generic textual timeout classification must still work for
+    errors that carry no HTTP status code at all (e.g. a raw socket/
+    connection timeout) -- only explicit status codes should take
+    precedence over it, not disable it entirely."""
+    from mailer_agent.llm.provider_v2 import TimeoutError as ProviderTimeoutError
+    from mailer_agent.llm.provider_v2 import _classify_error
+
+    classified = _classify_error(Exception("Connection timed out after 30s"))
+    assert isinstance(classified, ProviderTimeoutError)
+
+
 def test_timeout_is_retried_and_recovers(monkeypatch):
     fake_client = _install_fake_client(monkeypatch, [
         Exception("Request timed out"),

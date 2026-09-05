@@ -7,6 +7,22 @@ a bounded, LLM-ready context: recent messages verbatim, anything older
 collapsed into a short rolling summary so a 15-message thread doesn't
 blow the prompt budget or make the model lose track of what actually
 matters (the last couple of exchanges).
+
+Conversational evidence vs. every row in the table
+-----------------------------------------------------
+Not every Message row is something that actually happened in the
+conversation. A DRAFT is a message the system considered sending but
+hasn't (or was blocked from sending); a FAILED or UNKNOWN-outcome
+outbound message may never have reached the prospect at all. None of
+those are conversational EVENTS -- they're internal drafting/send-state
+artifacts -- and including them in the context fed back into prompting
+or grounding is not a neutral inclusion, it's actively dangerous: a
+draft containing an unsupported claim would then appear as its own
+"supporting evidence" the next time grounding checks that same draft
+(or a similar one) against "the conversation so far", making the check
+circular. `_conversational_evidence()` is the one place this filter is
+defined, used by both functions below, so a future evidence source
+doesn't have to remember to reapply it.
 """
 
 from __future__ import annotations
@@ -16,7 +32,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from mailer_agent.llm.provider import LLMOutputError, LLMUnavailableError, call_llm_text
-from mailer_agent.models import Contact, Message
+from mailer_agent.models import Contact, Message, MessageDirection, MessageStatus
 
 logger = logging.getLogger("mailer_agent.memory")
 
@@ -26,13 +42,49 @@ RECENT_MESSAGES_VERBATIM = 6
 SUMMARIZE_THRESHOLD = 8
 
 
+def _conversational_evidence(messages: list[Message]) -> list[Message]:
+    """
+    Filter every Message row down to only what actually happened in the
+    conversation, preserving chronological order.
+
+    - Inbound messages are always valid evidence (an inbound row only
+      ever gets created for a message that was genuinely received --
+      see mail/reply_handler_v2.py -- so there's no separate "inbound
+      status" to check here, unlike outbound).
+    - Outbound messages count only when status is exactly SENT. DRAFT
+      (never sent), FAILED (definitely didn't reach the prospect), and
+      UNKNOWN (ambiguous -- see mail/sender.py's SendOutcome docstring;
+      may or may not have sent, and treating "might have sent" as
+      "definitely sent history" is exactly the kind of unsafe optimism
+      that outcome exists to prevent elsewhere in this codebase) are all
+      excluded. APPROVED/PENDING/SENDING are reserved, currently-unset
+      statuses (see MessageStatus's own docstring) -- not treated as
+      evidence either, on the same "don't assume sent" principle, should
+      they ever start being used.
+    - No semantic/keyword logic here -- this is a status-field check
+      against the actual MessageStatus/MessageDirection enums already
+      defined in models.py, nothing more.
+    """
+    evidence = []
+    for m in messages:
+        if m.direction == MessageDirection.INBOUND.value:
+            evidence.append(m)
+        elif m.direction == MessageDirection.OUTBOUND.value and m.status == MessageStatus.SENT.value:
+            evidence.append(m)
+    return evidence
+
+
 def build_conversation_context(db: Session, contact: Contact) -> str:
     """
     Returns a human-readable transcript string for prompting: an optional
     leading summary line for older history, then the recent messages
     verbatim in chronological order, each labeled by who sent it and when.
+
+    Only actual conversational evidence is included (see
+    _conversational_evidence) -- a DRAFT or FAILED/UNKNOWN-outcome
+    outbound message never appears here, regardless of how recent it is.
     """
-    messages: list[Message] = list(contact.messages)
+    messages: list[Message] = _conversational_evidence(list(contact.messages))
 
     if not messages:
         return "(no messages sent yet -- this is the first contact)"
@@ -44,6 +96,10 @@ def build_conversation_context(db: Session, contact: Contact) -> str:
 
     recent = messages[-RECENT_MESSAGES_VERBATIM:]
     for m in recent:
+        # Every m here is either inbound or a confirmed-SENT outbound
+        # (see _conversational_evidence), so this label is now always
+        # accurate -- it used to read "US (sent)" for ANY outbound
+        # message regardless of whether it actually was.
         who = "US (sent)" if m.direction == "outbound" else "THEM (received)"
         ts = m.created_at.strftime("%Y-%m-%d") if m.created_at else "?"
         subject = f" | Subject: {m.subject}" if m.subject else ""
@@ -118,8 +174,17 @@ def maybe_summarize_older_messages(db: Session, contact: Contact) -> None:
     `contact.memory_summary` via a cheap LLM call. Best-effort: if the
     LLM is unavailable, the transcript just stays longer (still correct,
     just not compacted) rather than failing the send.
+
+    Same provenance filter as build_conversation_context (see
+    _conversational_evidence) -- applied here too, and for the same
+    reason: without it, a DRAFT that later gets excluded from the recent
+    verbatim window (once enough newer messages push it out) would still
+    have been eligible to enter the rolling summary itself, poisoning
+    grounding indirectly through the summary rather than the recent
+    window. Both entry points need the same filter; this file has
+    exactly one place that defines it now.
     """
-    messages: list[Message] = list(contact.messages)
+    messages: list[Message] = _conversational_evidence(list(contact.messages))
     if len(messages) <= SUMMARIZE_THRESHOLD:
         return
 

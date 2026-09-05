@@ -40,6 +40,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from mailer_agent.api.deps import get_current_org_id, require_api_key
 from mailer_agent.api.main import app
@@ -52,7 +53,28 @@ from mailer_agent.models import Base, Contact
 
 @pytest.fixture
 def e2e_session():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    # StaticPool is load-bearing here, not just a nice-to-have: without
+    # it, sqlite:///:memory: hands out a SEPARATE, empty in-memory
+    # database to each new connection the pool opens (SQLite's
+    # :memory: databases are connection-local by nature). This session's
+    # own direct use of `engine` (Base.metadata.create_all, and this
+    # fixture's own session) might get one connection/database, while
+    # TestClient's request handling -- which can dispatch through a
+    # different thread/connection depending on the ASGI transport --
+    # could get handed a DIFFERENT, table-less one, surfacing as
+    # `sqlite3.OperationalError: no such table: campaigns` despite
+    # create_all() having genuinely run moments earlier. StaticPool
+    # forces the whole engine to share exactly one underlying
+    # connection, so every consumer -- this fixture, the FastAPI
+    # dependency override, and any cross-thread access from TestClient --
+    # sees the same actual database. check_same_thread=False is required
+    # alongside it, since StaticPool means that one connection genuinely
+    # can be used from more than one thread.
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(bind=engine)
     Session = sessionmaker(bind=engine)
     session = Session()

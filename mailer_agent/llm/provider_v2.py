@@ -110,28 +110,39 @@ def _classify_error(error: Exception) -> LLMProviderError:
 
     error_str = str(error).lower()
 
-    # Order matters: check authentication before the generic 4xx/5xx
-    # checks below, since "401"/"403" would otherwise also incidentally
-    # not match any other branch and fall through to UNKNOWN_ERROR --
-    # but auth failures need their own non-retryable classification,
-    # not the generic unknown-error path.
+    # Order matters throughout this function: explicit HTTP status-code
+    # semantics must win over generic substring/textual matching,
+    # because a status reason phrase can contain a word that would
+    # otherwise match a different, wrong branch. The concrete case that
+    # motivated this ordering: "504 Gateway Timeout" contains the word
+    # "timeout", and used to hit the generic timeout check below before
+    # ever reaching the 5xx check -- misclassifying a server-side
+    # condition as a client-side timeout. Every explicit status-code
+    # branch below (401/403, 429, 500/502/503/504, 400) is checked
+    # before the generic text-only branches (timeout, malformed JSON)
+    # that exist to classify errors with no HTTP status code available
+    # at all (e.g. a raw network-level timeout).
+
     if "401" in error_str or "403" in error_str or "authentication" in error_str or "invalid api key" in error_str:
         return AuthenticationError(f"Authentication failed: {error}")
 
     if "429" in error_str or "rate_limit" in error_str or "too many requests" in error_str:
         return RateLimitError(f"Rate limit exceeded: {error}")
-    
+
+    if "500" in error_str or "502" in error_str or "503" in error_str or "504" in error_str:
+        return ProviderUnavailableError(f"Provider server error: {error}")
+
+    if "400" in error_str:
+        return ValidationError(f"Bad request: {error}")
+
+    # Below this point: no explicit HTTP status code was present in the
+    # error text, so fall back to generic textual classification.
+
     if "timeout" in error_str or "timed out" in error_str:
         return TimeoutError(f"Request timeout: {error}")
     
     if "json_validate_failed" in error_str or "invalid json" in error_str:
         return MalformedOutputError(f"Invalid JSON from model: {error}")
-    
-    if "400" in error_str:
-        return ValidationError(f"Bad request: {error}")
-    
-    if "500" in error_str or "502" in error_str or "503" in error_str or "504" in error_str:
-        return ProviderUnavailableError(f"Provider server error: {error}")
     
     # Unknown error - not retryable by default
     return LLMProviderError(str(error), ClassificationFailureReason.UNKNOWN_ERROR, retryable=False)

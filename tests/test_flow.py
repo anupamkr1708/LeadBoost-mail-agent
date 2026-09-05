@@ -4,33 +4,61 @@ send, dynamic follow-up dispatch, inbound reply correlation + intent
 classification + draft-vs-auto-send gating, and suppression enforcement.
 
 Run with: pytest -q
+
+Test isolation
+--------------
+This file used to rely on module-level `os.environ[...]` mutations
+(DATABASE_URL, API_KEY, GROQ_API_KEY) combined with api/deps.py's
+key->org map and mailer_agent.db's engine, both of which are built once
+at first import -- a real fragility, not a hypothetical one: whichever
+test file's imports happen to run first in the collection order decides
+what those singletons end up bound to, and a later file's environment
+mutations have no effect on an already-built map/engine. The observed
+failure mode was exactly this: 401s (the auth override never took
+effect) cascading into KeyError("id") (r.json() on a 401 body has no
+"id" key).
+
+Fixed the same way tests/e2e/test_full_lifecycle.py already handles
+this: FastAPI's dependency_overrides for get_db / require_api_key /
+get_current_org_id, with a fresh StaticPool-backed in-memory SQLite
+engine created PER TEST (not shared across the whole file, and not
+dependent on any other test file's import order).
 """
 
-import os
-
-os.environ["DATABASE_URL"] = "sqlite:///./_test.db"
-os.environ["LIVE_SENDING_ENABLED"] = "false"
-os.environ["AUTO_REPLY_ENABLED"] = "true"
-os.environ["GROQ_API_KEY"] = ""  # exercise the deterministic fallback path
-os.environ["API_KEY"] = ""  # No auth for tests
+from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from mailer_agent.api.deps import get_current_org_id, require_api_key
 from mailer_agent.api.main import app
-from mailer_agent.db import init_db
+from mailer_agent.db import get_db
+from mailer_agent.models import Base
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    db_path = tmp_path / "test.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
-    # Settings is cached via lru_cache and other modules already imported
-    # engine/session bound to the module-level settings -- for this test
-    # file we accept the single shared _test.db created above rather than
-    # per-test isolation, and clean it up at the end of the session.
-    init_db()
-    return TestClient(app)
+def client():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine)()
+
+    app.dependency_overrides[get_db] = lambda: session
+    app.dependency_overrides[require_api_key] = lambda: None
+    app.dependency_overrides[get_current_org_id] = lambda: "test-flow-org"
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+        engine.dispose()
+
 
 
 def test_full_flow(client):
@@ -129,7 +157,16 @@ def test_flexible_lead_ingestion(client):
     assert r.json()["company"] == "ExampleCorp"
 
 
-def test_inbound_webhook_matches_thread(client):
+def test_inbound_webhook_matches_thread(client, monkeypatch):
+    # This test only cares about correlation (does the webhook route to
+    # the right contact), not classification content -- explicitly force
+    # the deterministic fallback path (no LLM call at all) rather than
+    # relying on the autouse fake_llm fixture's queue, which would raise
+    # if nothing were queued for the (multi-call: classify -> plan ->
+    # draft) reply pipeline this now triggers.
+    import mailer_agent.llm.provider_v2 as provider_module
+    monkeypatch.setattr(provider_module, "is_llm_available", lambda: False)
+
     r = client.post(
         "/campaigns",
         json={

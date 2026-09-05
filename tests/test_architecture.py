@@ -208,17 +208,30 @@ def test_guardrails_authorize_action_takes_typed_proposal():
     signature is typed against policy.next_action.NextActionProposal, a
     dataclass -- not `dict`, not `Any`, not an untyped **kwargs blob that
     would let a raw LLM response flow straight into policy logic.
+
+    Uses typing.get_type_hints() rather than inspect.signature()'s raw
+    .annotation, because guardrails.py has `from __future__ import
+    annotations` (PEP 563 postponed evaluation) -- under that, every
+    annotation in the module is stored as an unevaluated string
+    ("NextActionProposal", not the class object), and
+    inspect.signature() does not resolve those strings back into real
+    types on its own. get_type_hints() does the resolution (against the
+    function's own __globals__), which is the correct way to check an
+    annotated type at runtime in a codebase that uses postponed
+    annotations -- checking the raw string would still catch a
+    completely wrong or missing annotation, but would call a correctly
+    annotated parameter's own module style a failure, which is not the
+    architectural property this test is trying to enforce.
     """
-    import inspect
+    import typing
 
     from mailer_agent.policy.guardrails import authorize_action
     from mailer_agent.policy.next_action import NextActionProposal
 
-    sig = inspect.signature(authorize_action)
-    proposal_param = sig.parameters.get("proposal")
-    assert proposal_param is not None, "authorize_action must take a `proposal` parameter"
-    assert proposal_param.annotation is NextActionProposal, (
+    hints = typing.get_type_hints(authorize_action)
+    assert "proposal" in hints, "authorize_action must take an annotated `proposal` parameter"
+    assert hints["proposal"] is NextActionProposal, (
         f"authorize_action's `proposal` parameter must be typed as "
-        f"NextActionProposal, got {proposal_param.annotation!r} -- guardrails "
+        f"NextActionProposal, got {hints['proposal']!r} -- guardrails "
         f"must consume a typed contract, not raw LLM output."
     )

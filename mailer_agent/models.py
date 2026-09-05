@@ -190,6 +190,27 @@ class Contact(Base):
 
     # Rolling LLM-generated summary of older messages, used to keep
     # long threads' prompts bounded. See memory/store.py.
+    #
+    # Data-lineage note: memory/store.py's summarization used to include
+    # every Message regardless of status (DRAFT/FAILED/UNKNOWN outbound
+    # rows, not just genuinely-sent/received ones) when folding older
+    # messages into this field -- fixed to use only confirmed
+    # conversational evidence (see _conversational_evidence in that
+    # module). That fix is forward-looking only: a memory_summary value
+    # persisted before the fix may have been generated from a window
+    # that included a draft/failed message's content, and this text
+    # column has no per-fact provenance to selectively correct. No
+    # migration was written for this deliberately -- there's no schema
+    # change involved (the column is unchanged), and automatically
+    # re-summarizing every existing contact would mean an unreviewed LLM
+    # call per contact with its own risk of introducing new errors,
+    # which isn't obviously safer than a stale field. If a specific
+    # contact's summary is suspected of being contaminated (e.g. it
+    # mentions a figure that doesn't appear in any SENT/RECEIVED message
+    # for that contact), the safe fix is to clear that one
+    # memory_summary value -- it will regenerate correctly (now
+    # provenance-filtered) once the thread crosses SUMMARIZE_THRESHOLD
+    # again.
     memory_summary = Column(Text, nullable=True)
 
     # Distributed work claiming (Phase 8 — safe work claiming).
