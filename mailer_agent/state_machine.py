@@ -45,6 +45,9 @@ STATE_TRANSITIONS: dict[str, dict[StateTransitionEvent, str]] = {
     ContactStatus.NEW.value: {
         StateTransitionEvent.INITIAL_SENT: ContactStatus.ACTIVE.value,
         StateTransitionEvent.MANUAL_PAUSE: ContactStatus.PAUSED.value,
+        # Outbound draft held for human review before anything was sent
+        # (grounding hold, or ambiguous initial send outcome).
+        StateTransitionEvent.NEEDS_HUMAN: ContactStatus.NEEDS_REVIEW.value,
     },
     
     ContactStatus.ACTIVE.value: {
@@ -54,6 +57,9 @@ STATE_TRANSITIONS: dict[str, dict[StateTransitionEvent, str]] = {
         StateTransitionEvent.MANUAL_PAUSE: ContactStatus.PAUSED.value,
         StateTransitionEvent.MANUAL_WON: ContactStatus.CLOSED_WON.value,
         StateTransitionEvent.MANUAL_LOST: ContactStatus.CLOSED_LOST.value,
+        # Follow-up draft held for human review (grounding hold, or
+        # ambiguous follow-up send outcome).
+        StateTransitionEvent.NEEDS_HUMAN: ContactStatus.NEEDS_REVIEW.value,
     },
     
     ContactStatus.REPLIED.value: {
