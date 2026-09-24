@@ -77,6 +77,29 @@ def test_planner_unknown_action_type_escalates(fake_llm):
     assert proposal.source == "fallback"
 
 
+def test_planner_response_missing_action_type_key_entirely_escalates(fake_llm):
+    """
+    Compatibility-mode validation (spec: 'do not treat merely
+    syntactically valid JSON as equivalent to schema-valid output'):
+    if the router falls back from strict_schema to json_object/lenient
+    mode, the result is only guaranteed to be *parseable* JSON, not
+    necessarily the expected shape. A response missing action_type
+    entirely (not just an unrecognized value, but the key absent) must
+    still degrade safely via the same ActionType(None) -> ValueError ->
+    fallback path -- no separate validation framework needed, the
+    existing per-field handling already covers this.
+    """
+    fake_llm.queue_response({
+        "unrelated_key": "a completely different shape",
+        "confidence": 0.9,
+    })
+
+    proposal = plan_next_action(intent=_intent(), context_transcript="(none)")
+
+    assert proposal.action_type == ActionType.ESCALATE
+    assert proposal.source == "fallback"
+
+
 def test_planner_empty_objective_escalates(fake_llm):
     fake_llm.queue_response({
         "action_type": "answer",
@@ -112,6 +135,79 @@ def test_planner_provider_failure_escalates(fake_llm):
 
     assert proposal.action_type == ActionType.ESCALATE
     assert proposal.source == "fallback"
+
+
+# ---------------------------------------------------------------------------
+# Planner context completeness (spec sections 19, 49, 50): the planner can
+# only weigh constraints, pain points, and commercial signals it actually
+# SEES. SemanticIntent already carries all of these -- this proves they
+# reach the planner's own prompt, not just that they exist on the dataclass.
+# ---------------------------------------------------------------------------
+
+def test_planner_prompt_includes_constraints(fake_llm):
+    """The literal spec section 49 scenario: 'prospect interested but
+    contract locked for 12 months' must actually be visible to the
+    planner LLM, not silently dropped before the prompt is built."""
+    fake_llm.queue_response({
+        "action_type": "nurture", "objective": "test", "reason": "test",
+        "confidence": 0.8, "requires_human_review": False,
+    })
+
+    plan_next_action(
+        intent=_intent(
+            intents=[IntentType.POSITIVE_INTEREST, IntentType.TIMING_CONSTRAINT],
+            constraints=["locked into current vendor contract for 12 months"],
+        ),
+        context_transcript="(conversation so far)",
+    )
+
+    _, human_prompt = fake_llm.last_prompts[-1]
+    assert "locked into current vendor contract for 12 months" in human_prompt
+
+
+def test_planner_prompt_includes_pain_points_and_commitments(fake_llm):
+    fake_llm.queue_response({
+        "action_type": "answer", "objective": "test", "reason": "test",
+        "confidence": 0.8, "requires_human_review": False,
+    })
+
+    plan_next_action(
+        intent=_intent(
+            pain_points=["manual data entry across three tools"],
+            commitments_made=["I'll loop in our IT lead"],
+        ),
+        context_transcript="(conversation so far)",
+    )
+
+    _, human_prompt = fake_llm.last_prompts[-1]
+    assert "manual data entry across three tools" in human_prompt
+    assert "I'll loop in our IT lead" in human_prompt
+
+
+def test_planner_prompt_includes_commercial_signals(fake_llm):
+    """has_pricing_question was already surfaced; budget/decision-maker/
+    commitment/procurement signals were not -- all five are 'commercial
+    signals' per spec section 19 and must be equally visible."""
+    fake_llm.queue_response({
+        "action_type": "answer", "objective": "test", "reason": "test",
+        "confidence": 0.8, "requires_human_review": False,
+    })
+
+    plan_next_action(
+        intent=_intent(
+            has_budget_signal=True,
+            has_decision_maker_signal=True,
+            has_commitment_signal=True,
+            procurement_signal=True,
+        ),
+        context_transcript="(conversation so far)",
+    )
+
+    _, human_prompt = fake_llm.last_prompts[-1]
+    assert "has_budget_signal" in human_prompt
+    assert "has_decision_maker_signal" in human_prompt
+    assert "has_commitment_signal" in human_prompt
+    assert "procurement_signal" in human_prompt
 
 
 # ---------------------------------------------------------------------------

@@ -20,13 +20,15 @@ to be set in the environment.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from mailer_agent.llm import provider_v2
 from mailer_agent.llm.provider_v2 import (
     AuthenticationError,
+    LLMJsonResult,
     LLMProviderError,
+    LLMTextResult,
     MalformedOutputError,
+    ModelUnavailableError,
     ProviderUnavailableError,
 )
 
@@ -54,10 +56,12 @@ def call_llm_text(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
-) -> str:
+    operation: str = "unknown",
+) -> LLMTextResult:
     """
-    Free-text completion (delegates to provider_v2).
-    
+    Free-text completion (delegates to provider_v2, including its
+    model-fallback routing).
+
     Raises LLMUnavailableError/LLMOutputError on failure --
     callers are expected to fall back to a deterministic path (see agent.py).
     """
@@ -67,8 +71,9 @@ def call_llm_text(
             human_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
+            operation=operation,
         )
-    except (ProviderUnavailableError, AuthenticationError) as e:
+    except (ProviderUnavailableError, AuthenticationError, ModelUnavailableError) as e:
         raise LLMUnavailableError(str(e)) from e
     except MalformedOutputError as e:
         raise LLMOutputError(str(e)) from e
@@ -84,10 +89,13 @@ def call_llm_json(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
-) -> dict[str, Any]:
+    json_schema: dict | None = None,
+    operation: str = "unknown",
+) -> LLMJsonResult:
     """
-    JSON completion (delegates to provider_v2).
-    
+    JSON completion (delegates to provider_v2, including its
+    strict-schema/json_object/lenient and model-fallback routing).
+
     Raises LLMUnavailableError/LLMOutputError on failure.
     """
     try:
@@ -96,8 +104,10 @@ def call_llm_json(
             human_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
+            json_schema=json_schema,
+            operation=operation,
         )
-    except (ProviderUnavailableError, AuthenticationError) as e:
+    except (ProviderUnavailableError, AuthenticationError, ModelUnavailableError) as e:
         raise LLMUnavailableError(str(e)) from e
     except MalformedOutputError as e:
         raise LLMOutputError(str(e)) from e

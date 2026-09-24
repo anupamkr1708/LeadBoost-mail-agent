@@ -89,6 +89,21 @@ def _no_real_sleep(monkeypatch):
     monkeypatch.setattr(provider_v2._chat_with_retry.retry, "sleep", lambda seconds: None)
 
 
+@pytest.fixture(autouse=True)
+def _single_model_only(monkeypatch):
+    """
+    This file's whole stated purpose (see module docstring) is testing
+    the retry/classification policy for ONE model in isolation --
+    model-to-model fallback is a separate concern with its own coverage
+    in tests/test_provider_routing.py. Pin llm_fallback_models to empty
+    so call_llm_json/call_llm_text here only ever try settings.llm_model,
+    exactly matching every fixed call-count assertion below (these were
+    all written and reasoned about in terms of a single model's retry
+    budget, before model routing existed).
+    """
+    monkeypatch.setattr(provider_v2.settings, "llm_fallback_models", "")
+
+
 def _install_fake_client(monkeypatch, queue: list) -> FakeGroqClient:
     fake_client = FakeGroqClient(queue)
     # Same instance returned on every call, so a shared queue is
@@ -112,7 +127,7 @@ def test_rate_limit_is_retried_and_recovers(monkeypatch):
 
     result = call_llm_json("system", "human")
 
-    assert result == {"ok": True}
+    assert result.data == {"ok": True}
     assert fake_client.call_count == 3
 
 
@@ -140,7 +155,7 @@ def test_transient_5xx_is_retried_and_recovers(monkeypatch):
 
     result = call_llm_json("system", "human")
 
-    assert result == {"ok": True}
+    assert result.data == {"ok": True}
     assert fake_client.call_count == 2
 
 
@@ -198,7 +213,7 @@ def test_timeout_is_retried_and_recovers(monkeypatch):
 
     result = call_llm_json("system", "human")
 
-    assert result == {"ok": True}
+    assert result.data == {"ok": True}
     assert fake_client.call_count == 2
 
 
@@ -282,7 +297,7 @@ def test_malformed_json_falls_back_from_strict_to_lenient_and_recovers(monkeypat
 
     result = call_llm_json("system", "human")
 
-    assert result == {"ok": True}
+    assert result.data == {"ok": True}
     assert fake_client.call_count == 2
 
 

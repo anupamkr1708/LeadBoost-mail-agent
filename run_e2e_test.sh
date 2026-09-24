@@ -41,12 +41,18 @@ export CONTACT_1_COMPANY="${CONTACT_1_COMPANY:-Test Company}"
 export LEADBOOST_LEAD_EMAIL="${LEADBOOST_LEAD_EMAIL:-${SMTP_USERNAME}}"
 
 echo "=========================================="
-echo "Test will send emails to:"
+echo "Test will target these addresses:"
 echo "  - ${CONTACT_1_EMAIL}"
 echo "  - ${LEADBOOST_LEAD_EMAIL}"
 echo ""
-echo "IMPORTANT: These emails will be REALLY SENT"
-echo "since LIVE_SENDING_ENABLED=${LIVE_SENDING_ENABLED}"
+if [ "${LIVE_SENDING_ENABLED}" = "true" ]; then
+    echo "IMPORTANT: LIVE_SENDING_ENABLED=true -- these emails WILL be"
+    echo "REALLY SENT over SMTP to the addresses above."
+else
+    echo "DRY RUN: LIVE_SENDING_ENABLED=${LIVE_SENDING_ENABLED} (not \"true\")"
+    echo "-- no email will actually be sent. The server logs each"
+    echo "generated message as '[DRY RUN] Would send to ...' instead."
+fi
 echo ""
 echo "Press CTRL+C to cancel, or wait 5 seconds to continue..."
 echo "=========================================="

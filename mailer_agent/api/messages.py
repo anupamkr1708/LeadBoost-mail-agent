@@ -6,6 +6,8 @@ Multi-tenancy: message access is validated through contact → campaign ownershi
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -17,6 +19,8 @@ from mailer_agent.mail.sender import send_email
 from mailer_agent.memory.store import build_conversation_context
 from mailer_agent.models import Campaign, Contact, Message, MessageStatus, SuppressionEntry
 from mailer_agent.schemas import MessageOut, SuppressRequest
+
+logger = logging.getLogger("mailer_agent.api.messages")
 
 router = APIRouter(tags=["messages"], dependencies=[Depends(require_api_key)])
 
@@ -84,9 +88,21 @@ def approve_and_send_draft(
     the conversation itself may have changed since then (a human edited
     the campaign, the contact replied again, etc). This endpoint always
     re-runs grounding validation against the *current* state right
-    before sending, and blocks the send if the draft is no longer
-    supported. This is the one path every approval must go through --
-    there is no way to mark a message SENT without passing this check.
+    before sending, and blocks the send if the draft contains a claim
+    that is genuinely untraceable to any approved source (hard_block).
+    This is the one path every approval must go through -- there is no
+    way to mark a message SENT without passing this check.
+
+    This endpoint gates on `grounding.hard_block`, not
+    `grounding.is_safe_to_send`. The two differ exactly for content that
+    is `review_required` but not fabricated (e.g. "I'll get pricing
+    details together for you" -- mentions pricing, invents no figure):
+    such content is never eligible for *silent* auto-send
+    (is_safe_to_send=False), but calling this endpoint at all IS the
+    human review step, so it must be authorizable here. A hard_block
+    claim (a specific invented price/percentage/guarantee not present in
+    any approved source) can never be authorized by approval, regardless
+    of review_required -- see semantic_models.GroundingValidation.
     """
     msg = _get_message_or_404(db, message_id, org_id)
 
@@ -116,15 +132,21 @@ def approve_and_send_draft(
         conversation_transcript=conversation_transcript,
         value_prop=campaign.value_prop,
     )
-    if not grounding.is_safe_to_send:
+    if grounding.hard_block:
         raise HTTPException(
             status_code=409,
             detail=(
                 "Draft failed final grounding recheck and cannot be sent: "
-                f"{grounding.validation_notes}. Unsupported claims: "
+                f"{grounding.validation_notes}. Unsupported/fabricated claims: "
                 f"{grounding.unsupported_claims}. Edit the draft or the "
                 "campaign/contact data, then try approval again."
             ),
+        )
+    if grounding.review_required:
+        logger.info(
+            "Message %s approved with review_required content (%s) -- "
+            "human authorization via this endpoint is the review step.",
+            msg.id, grounding.review_reasons,
         )
 
     prior = msg.in_reply_to_header

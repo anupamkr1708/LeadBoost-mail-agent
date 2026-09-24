@@ -23,6 +23,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from mailer_agent.llm.grounding import validate_grounding
+from mailer_agent.llm.provider_v2 import LLMTextResult
 from mailer_agent.memory.store import build_conversation_context, maybe_summarize_older_messages
 from mailer_agent.models import (
     Base,
@@ -169,7 +170,11 @@ def test_stale_draft_never_enters_rolling_summary(db_session, monkeypatch):
 
     def fake_call_llm_text(system_prompt, human_prompt, **kwargs):
         captured_prompts.append(human_prompt)
-        return "Summary: prospect asked about pricing and features."
+        return LLMTextResult(
+            text="Summary: prospect asked about pricing and features.",
+            model_used="fake-model", requested_model="fake-model",
+            attempts=1, used_fallback=False,
+        )
 
     import mailer_agent.memory.store as store_module
     monkeypatch.setattr(store_module, "call_llm_text", fake_call_llm_text)

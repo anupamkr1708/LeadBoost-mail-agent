@@ -28,6 +28,8 @@ doesn't have to remember to reapply it.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -110,32 +112,131 @@ def build_conversation_context(db: Session, contact: Contact) -> str:
 
 def build_known_facts_context(contact: Contact) -> str:
     """
-    Accumulated "working memory" of provenance-tracked facts across the
-    WHOLE conversation, not just the latest message -- pulled from each
-    inbound Message's stored semantic_analysis (see
-    semantic_models.serialize_semantic_intent / mail/reply_handler_v2.py,
-    which persists it as a native JSON dict on every classified inbound
-    message).
+    Facts for the planner prompt, formatted from reconcile_known_facts()
+    (below) -- the actual State Reconciliation stage. See that function's
+    docstring for the reconciliation rules; this just renders its output
+    as text, clearly separating what's CURRENT from what's HISTORY
+    (spec section 15: "history != current truth"), instead of silently
+    dropping or conflating superseded values.
+    """
+    knowledge = reconcile_known_facts(contact)
 
-    This is the layer between "recent messages verbatim"
-    (build_conversation_context, above) and "durable structured facts" --
-    it's what lets the planner (policy/next_action.py) know that a fact
-    established three messages ago is still current, rather than only
-    seeing whatever the very latest message happened to restate.
+    lines: list[str] = []
+    if knowledge.current_solution:
+        lines.append(
+            f"current_solution: {knowledge.current_solution.value} "
+            f"(certainty={knowledge.current_solution.certainty})"
+        )
+    for h in knowledge.current_solution_history:
+        lines.append(f"current_solution (superseded, no longer current): {h.value}")
 
-    Later facts about the same thing supersede earlier ones (a fact
-    marked contradicted, or a current_solution mentioned again with a
-    different value) -- this performs simple last-write-wins by fact
-    text, not fuzzy deduplication, since anything cleverer would drift
-    toward guessing semantic equivalence outside the LLM, which is
-    exactly what this architecture avoids doing in deterministic code.
+    current_facts = [f for f in knowledge.facts if f.status == "current"]
+    superseded_facts = [f for f in knowledge.facts if f.status == "superseded"]
+    for f in current_facts:
+        lines.append(f"fact: {f.value} (certainty={f.certainty})")
+    if superseded_facts:
+        lines.append(
+            "superseded facts (history, no longer current): "
+            + ", ".join(f.value for f in superseded_facts)
+        )
+
+    if knowledge.contradicted_notes:
+        lines.append(f"contradictions noted during conversation: {knowledge.contradicted_notes}")
+    if knowledge.unresolved_items:
+        lines.append(f"still unresolved as of latest message: {knowledge.unresolved_items}")
+
+    return "\n".join(lines)
+
+
+@dataclass
+class ReconciledFact:
+    """One fact as it stands after reconciliation -- see reconcile_known_facts."""
+    value: str
+    certainty: str = "unknown"
+    status: str = "current"  # "current" | "superseded" -- see reconcile_known_facts
+    evidence: Optional[str] = None
+    source_message_id: Optional[int] = None
+    observed_at: Optional[str] = None
+
+
+@dataclass
+class ReconciledKnowledge:
+    """
+    The canonical reconciled conversation state (spec section 12, "Stage
+    D -- State Reconciliation" / section 15, "ConversationState"): the
+    system's current understanding, with full history retained
+    separately rather than overwritten. See reconcile_known_facts.
+    """
+    current_solution: Optional[ReconciledFact] = None
+    # Prior current_solution values, oldest first, kept for auditability
+    # even though only the newest is "current" -- current_solution is
+    # inherently single-valued, so any new statement of it always
+    # supersedes the previous one (spec section 13's exact example).
+    current_solution_history: list[ReconciledFact] = field(default_factory=list)
+    # ALL generic facts ever extracted, chronological, each tagged
+    # current/superseded in place -- never deleted, matching section 13:
+    # "the old evidence should not be erased from history."
+    facts: list[ReconciledFact] = field(default_factory=list)
+    unresolved_items: list[str] = field(default_factory=list)
+    contradicted_notes: list[str] = field(default_factory=list)
+
+
+def reconcile_known_facts(contact: Contact) -> ReconciledKnowledge:
+    """
+    Stage D -- State Reconciliation. Walks every classified inbound
+    message's stored semantic_analysis, in chronological order, and
+    produces one canonical ReconciledKnowledge: not "every extraction is
+    a new permanent fact" (the bug spec section 12 describes), but a
+    reconciled view where a later statement can supersede an earlier one
+    while the earlier one is kept, marked superseded, rather than
+    deleted.
+
+    How supersession is decided (deliberately narrow, matching this
+    codebase's existing anti-heuristic principle -- see the module
+    docstring and the removed dict-based predecessor of this function):
+    - current_solution is single-valued by definition. Any new
+      current_solution statement always supersedes whatever
+      current_solution was current before it -- no guessing required,
+      the shape of the data settles it.
+    - Generic facts (new_facts) are NOT assumed to supersede each other
+      just because they arrived later -- two different facts can both be
+      true at once (e.g. "team is 50 people" and "they use Salesforce"
+      are unrelated). A fact only marks an earlier one superseded when
+      the LLM explicitly said so via `supersedes` (see
+      semantic/classifier.py's SUPERSESSION rule), naming the prior
+      fact's exact value. This is an exact string match against a value
+      the LLM was instructed to copy verbatim from conversation history,
+      not a fuzzy/semantic match computed here in deterministic code --
+      recognizing that two differently-worded statements mean the same
+      thing is exactly the kind of judgment this architecture reserves
+      for the LLM (see llm/grounding.py and memory/store.py's own
+      pre-existing "anything cleverer would drift toward guessing
+      semantic equivalence outside the LLM" principle).
+    - An exact-duplicate restatement of an already-current fact (same
+      value, no supersedes) does not add a second line -- it's the same
+      fact being reaffirmed, not new information.
+
+    Provenance (source_message_id/observed_at) rides along on every
+    ReconciledFact -- see semantic_models.attach_fact_provenance for
+    where it's stamped, and semantic_models.SemanticFact's docstring for
+    why it's never LLM-provided.
     """
     inbound = [m for m in contact.messages if m.direction == "inbound" and m.semantic_analysis]
-    if not inbound:
-        return ""
+    inbound = sorted(inbound, key=lambda m: (m.created_at is None, m.created_at, m.id or 0))
 
-    current_solution = None
-    facts_seen: dict[str, str] = {}  # value -> certainty, insertion order = recency
+    def _mk(raw: dict) -> ReconciledFact:
+        return ReconciledFact(
+            value=raw.get("value", ""),
+            certainty=raw.get("certainty") or "unknown",
+            status="current",
+            evidence=raw.get("evidence"),
+            source_message_id=raw.get("source_message_id"),
+            observed_at=raw.get("observed_at"),
+        )
+
+    current_solution: Optional[ReconciledFact] = None
+    current_solution_history: list[ReconciledFact] = []
+    facts: list[ReconciledFact] = []
     unresolved: list[str] = []
     contradicted: list[str] = []
 
@@ -143,28 +244,41 @@ def build_known_facts_context(contact: Contact) -> str:
         analysis = m.semantic_analysis
         if not isinstance(analysis, dict):
             continue
+
         cs = analysis.get("current_solution")
         if cs and cs.get("value"):
-            current_solution = cs  # later messages win
-        for fact in analysis.get("new_facts") or []:
-            if fact and fact.get("value"):
-                facts_seen[fact["value"]] = fact.get("certainty", "unknown")
+            if current_solution is not None:
+                current_solution.status = "superseded"
+                current_solution_history.append(current_solution)
+            current_solution = _mk(cs)
+
+        for raw_fact in analysis.get("new_facts") or []:
+            if not raw_fact or not raw_fact.get("value"):
+                continue
+            value = raw_fact["value"]
+            supersedes = raw_fact.get("supersedes")
+            if supersedes:
+                for existing in facts:
+                    if existing.status == "current" and existing.value == supersedes:
+                        existing.status = "superseded"
+            already_current = any(
+                existing.status == "current" and existing.value == value for existing in facts
+            )
+            if not already_current:
+                facts.append(_mk(raw_fact))
+
         if analysis.get("unresolved_items"):
             unresolved = analysis["unresolved_items"]  # only the latest turn's still-open items matter
         if analysis.get("contradicted_facts"):
             contradicted.extend(analysis["contradicted_facts"])
 
-    lines = []
-    if current_solution:
-        lines.append(f"current_solution: {current_solution['value']} (certainty={current_solution.get('certainty', 'unknown')})")
-    for value, certainty in facts_seen.items():
-        lines.append(f"fact: {value} (certainty={certainty})")
-    if contradicted:
-        lines.append(f"contradictions noted during conversation: {contradicted}")
-    if unresolved:
-        lines.append(f"still unresolved as of latest message: {unresolved}")
-
-    return "\n".join(lines)
+    return ReconciledKnowledge(
+        current_solution=current_solution,
+        current_solution_history=current_solution_history,
+        facts=facts,
+        unresolved_items=unresolved,
+        contradicted_notes=contradicted,
+    )
 
 
 def maybe_summarize_older_messages(db: Session, contact: Contact) -> None:
@@ -206,8 +320,8 @@ def maybe_summarize_older_messages(db: Session, contact: Contact) -> None:
     human_prompt = f"{prior_summary}New messages to fold in:\n\n{transcript}"
 
     try:
-        summary = call_llm_text(system_prompt, human_prompt, temperature=0.1, max_tokens=220)
-        contact.memory_summary = summary
+        result = call_llm_text(system_prompt, human_prompt, temperature=0.1, max_tokens=220, operation="memory_summary")
+        contact.memory_summary = result.text
         db.add(contact)
         db.flush()
     except (LLMUnavailableError, LLMOutputError) as e:

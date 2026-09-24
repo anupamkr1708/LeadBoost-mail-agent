@@ -44,6 +44,7 @@ from typing import Optional
 
 from mailer_agent.llm.prompts import PLANNER_SYSTEM_PROMPT, build_planner_prompt
 from mailer_agent.llm.provider import LLMOutputError, LLMUnavailableError, call_llm_json, is_llm_available
+from mailer_agent.llm.schemas import PLANNER_JSON_SCHEMA
 from mailer_agent.semantic_models import SemanticIntent
 
 logger = logging.getLogger("mailer_agent.policy.next_action")
@@ -96,6 +97,9 @@ class NextActionProposal:
     requires_human_review: bool = False
     review_reason: Optional[str] = None
     source: str = "llm"  # "llm" or "fallback"
+    model_used: Optional[str] = None
+    used_fallback: Optional[bool] = None
+    response_mode: Optional[str] = None
 
 
 # Fallback proposal used when the LLM is unavailable. Deliberately the
@@ -125,14 +129,37 @@ def _semantic_summary(intent: SemanticIntent) -> str:
     ]
     if intent.user_goal:
         lines.append(f"prospect's stated/inferred goal: {intent.user_goal}")
+    if intent.pain_points:
+        lines.append(f"pain points: {intent.pain_points}")
     if intent.objections_raised:
         lines.append(f"objections: {intent.objections_raised}")
+    # Constraints (e.g. "locked into current vendor contract for 12
+    # months") directly determine whether an action like BOOK_MEETING is
+    # even appropriate right now vs. FOLLOW_UP_LATER -- this was
+    # previously extracted by the classifier and then silently dropped
+    # before reaching the planner prompt (spec sections 19/49's exact
+    # worked example).
+    if intent.constraints:
+        lines.append(f"constraints: {intent.constraints}")
     if intent.questions_asked:
         lines.append(f"questions asked: {intent.questions_asked}")
     if intent.requested_information:
         lines.append(f"information requested: {intent.requested_information}")
+    if intent.commitments_made:
+        lines.append(f"commitments the prospect already made: {intent.commitments_made}")
+    # Commercial signals: has_pricing_question was already surfaced
+    # (below, folded into the block); the other four were computed by
+    # the classifier and then never shown to the planner at all.
     if intent.has_pricing_question:
         lines.append("has_pricing_question: true")
+    if intent.has_budget_signal:
+        lines.append("has_budget_signal: true")
+    if intent.has_decision_maker_signal:
+        lines.append("has_decision_maker_signal: true")
+    if intent.has_commitment_signal:
+        lines.append("has_commitment_signal: true")
+    if intent.procurement_signal:
+        lines.append("procurement_signal: true")
     if intent.timing:
         lines.append(
             f"timing: expression={intent.timing.expression!r} "
@@ -179,7 +206,11 @@ def plan_next_action(
             unresolved_items="\n".join(intent.unresolved_items) if intent.unresolved_items else "",
             context_transcript=context_transcript,
         )
-        payload = call_llm_json(PLANNER_SYSTEM_PROMPT, human_prompt, max_tokens=400, temperature=0.3)
+        payload_result = call_llm_json(
+            PLANNER_SYSTEM_PROMPT, human_prompt, max_tokens=400, temperature=0.3,
+            json_schema=PLANNER_JSON_SCHEMA, operation="planner",
+        )
+        payload = payload_result.data
 
         try:
             action_type = ActionType(payload.get("action_type"))
@@ -201,6 +232,9 @@ def plan_next_action(
             requires_human_review=bool(payload.get("requires_human_review", False)),
             review_reason=payload.get("review_reason"),
             source="llm",
+            model_used=payload_result.model_used,
+            used_fallback=payload_result.used_fallback,
+            response_mode=payload_result.response_mode,
         )
     except (LLMUnavailableError, LLMOutputError) as e:
         logger.warning("Planner LLM call failed, escalating: %s", e)

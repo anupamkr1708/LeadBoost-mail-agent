@@ -157,6 +157,43 @@ def test_dimension_inferred_fact_is_not_marked_explicit(fake_llm, test_campaign,
 
 
 # ---------------------------------------------------------------------------
+# 4b. Commitments (spec section 46's own separate checklist entry, distinct
+# from fact extraction above): a promise the prospect makes ("I'll loop in
+# our IT lead") must survive from classification through to the planner's
+# actual prompt -- not just exist as a field on SemanticIntent that nothing
+# downstream reads.
+# ---------------------------------------------------------------------------
+
+def test_dimension_prospect_commitment_reaches_the_planner(fake_llm, test_campaign, test_contact):
+    fake_llm.queue_response({
+        "intents": ["positive_interest"],
+        "sentiment": "positive",
+        "buying_stage": "considering",
+        "urgency": "no_timeline",
+        "commitments_made": ["will loop in their IT lead by Friday"],
+        "confidence": 0.85,
+        "reasoning": "test",
+        "requires_human_review": False,
+    })
+    result = _classify(test_campaign, test_contact, "Sounds good -- I'll loop in our IT lead by Friday.")
+    assert result.semantic_intent.commitments_made == ["will loop in their IT lead by Friday"]
+
+    fake_llm.queue_response({
+        "action_type": "acknowledge", "objective": "test", "reason": "test",
+        "confidence": 0.8, "requires_human_review": False,
+    })
+    plan_next_action(intent=result.semantic_intent, context_transcript="(conversation so far)")
+
+    _, planner_prompt = fake_llm.last_prompts[-1]
+    assert "will loop in their IT lead by Friday" in planner_prompt, (
+        "A commitment the prospect made must be visible to the planner, "
+        "not silently dropped between classification and planning -- "
+        "otherwise a later action could contradict something they already "
+        "promised to do."
+    )
+
+
+# ---------------------------------------------------------------------------
 # 5. Timing interpretation: structured, not regex-parsed; unknown stays unknown
 # ---------------------------------------------------------------------------
 

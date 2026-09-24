@@ -52,8 +52,10 @@ from mailer_agent.llm.prompts import (
     AGENT_SYSTEM_PROMPT,
     build_action_instruction,
     build_context_block,
+    wrap_untrusted_content,
 )
 from mailer_agent.llm.provider import LLMOutputError, LLMUnavailableError, call_llm_json, is_llm_available
+from mailer_agent.llm.schemas import RESPONDER_JSON_SCHEMA
 from mailer_agent.models import Campaign, Contact
 from mailer_agent.semantic_models import GroundingValidation
 
@@ -91,6 +93,9 @@ class AgentDraft:
     body: str
     reasoning: str
     source: str  # "llm" or "fallback"
+    model_used: str | None = None
+    used_fallback: bool | None = None
+    response_mode: str | None = None
     # Grounding validation result — always set, never None after draft_message()
     grounding: Optional[GroundingValidation] = field(default=None)
 
@@ -213,9 +218,13 @@ def _draft_with_llm(
     human_prompt = (
         f"{build_context_block(campaign, contact)}\n\n"
         f"Task: {instruction}\n\n"
-        f"Conversation history:\n{context_transcript}"
+        f"Conversation history:\n{wrap_untrusted_content('CONVERSATION_HISTORY', context_transcript)}"
     )
-    payload = call_llm_json(AGENT_SYSTEM_PROMPT, human_prompt, max_tokens=650)
+    payload_result = call_llm_json(
+        AGENT_SYSTEM_PROMPT, human_prompt, max_tokens=650,
+        json_schema=RESPONDER_JSON_SCHEMA, operation="responder",
+    )
+    payload = payload_result.data
 
     body = (payload.get("body") or "").strip()
     if not body:
@@ -233,6 +242,9 @@ def _draft_with_llm(
         body=body,
         reasoning=payload.get("reasoning", ""),
         source="llm",
+        model_used=payload_result.model_used,
+        used_fallback=payload_result.used_fallback,
+        response_mode=payload_result.response_mode,
     )
 
 

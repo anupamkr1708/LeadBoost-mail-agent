@@ -36,7 +36,7 @@ from mailer_agent.models import (
     SuppressionEntry,
 )
 from mailer_agent.semantic.classifier import classify_prospect_reply
-from mailer_agent.semantic_models import IntentType, serialize_semantic_intent
+from mailer_agent.semantic_models import IntentType, attach_fact_provenance, serialize_semantic_intent
 from mailer_agent.state_machine import (
     StateTransitionEvent,
     infer_event_from_semantic_intent,
@@ -201,6 +201,19 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
     if classification_result.success and classification_result.semantic_intent:
         intent = classification_result.semantic_intent
 
+        # Deterministic provenance stamp (spec section 14) -- must happen
+        # here, not in the classifier: this is the one place that
+        # actually knows the inbound Message's real database id and
+        # observation time. The LLM only ever fills `supersedes` (see
+        # semantic/classifier.py's SUPERSESSION rule) -- it has no
+        # visibility into row ids or wall-clock time and must never be
+        # asked to invent them.
+        attach_fact_provenance(
+            intent,
+            source_message_id=inbound_msg.id,
+            observed_at=utcnow().isoformat(),
+        )
+
         # Native dict into the JSON column -- semantic_analysis is
         # Column(JSON), and SQLAlchemy's JSON type handles
         # serialization itself. Passing json.dumps(...) here used to
@@ -290,6 +303,9 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
             _draft_and_maybe_send_reply(
                 db, contact, campaign, email_in, intent, result,
                 classification_source=classification_result.source,
+                classification_model_used=classification_result.model_used,
+                classification_used_fallback=classification_result.used_fallback,
+                classification_response_mode=classification_result.response_mode,
                 inbound_message_id=inbound_msg.id,
             )
     
@@ -445,6 +461,9 @@ def _draft_and_maybe_send_reply(
     result: dict,
     *,
     classification_source: str = "unknown",
+    classification_model_used: str | None = None,
+    classification_used_fallback: bool | None = None,
+    classification_response_mode: str | None = None,
     inbound_message_id: int | None = None,
 ):
     """
@@ -630,15 +649,24 @@ def _draft_and_maybe_send_reply(
         classification_source=classification_source,
         classification_success=True,
         semantic_intent_dict=serialize_semantic_intent(intent),
+        classifier_model_used=classification_model_used,
+        classifier_used_fallback=classification_used_fallback,
+        classifier_response_mode=classification_response_mode,
         prompt_version_planner=PLANNER_PROMPT_VERSION,
         planner_action_type=proposal.action_type.value,
         planner_objective=proposal.objective,
         planner_confidence=proposal.confidence,
         planner_source=proposal.source,
+        planner_model_used=proposal.model_used,
+        planner_used_fallback=proposal.used_fallback,
+        planner_response_mode=proposal.response_mode,
         guardrail_can_auto_send=authorized.can_auto_send,
         guardrail_review_reason=authorized.review_reason,
         draft_source=draft.source,
         grounding_safe=draft.grounding.is_safe_to_send if draft.grounding else None,
         grounding_notes=draft.grounding.validation_notes if draft.grounding else None,
+        draft_model_used=draft.model_used,
+        draft_used_fallback=draft.used_fallback,
+        draft_response_mode=draft.response_mode,
         final_action=result.get("action"),
     )

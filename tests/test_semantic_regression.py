@@ -548,6 +548,61 @@ def test_malformed_provider_output_is_not_neutral(fake_llm, test_campaign, test_
     assert result.failure_reason is not None
 
 
+def test_structurally_empty_response_is_a_validation_failure_not_neutral(fake_llm, test_campaign, test_contact):
+    """
+    Spec sections 35-36: a response that IS valid JSON but carries none
+    of the required classification structure (e.g. truncated to `{}`, or
+    JSON for a completely different task) must be a distinct, observable
+    LLM_OUTPUT_SCHEMA_INVALID-style failure -- not silently degrade every
+    missing field to its default and come out the other side looking
+    like a genuine, confident 'the prospect said nothing interesting'
+    reading. That would be exactly the false-confidence failure mode
+    section 10 warns about, just moved from a timing/fact field to the
+    whole classification.
+    """
+    fake_llm.queue_response({})
+
+    result = _classify(test_campaign, test_contact, "Some reply text.")
+
+    assert result.success is False, (
+        "An empty/structurally invalid LLM response must not silently "
+        "become a successful neutral classification."
+    )
+    assert result.failure_reason is not None
+    assert result.semantic_intent is None
+
+
+def test_response_missing_all_required_keys_is_a_validation_failure(fake_llm, test_campaign, test_contact):
+    """Same failure mode, but with irrelevant content present -- proves
+    the check is about the required structural keys, not just literal
+    emptiness."""
+    fake_llm.queue_response({"unrelated_key": "the model answered a different question entirely"})
+
+    result = _classify(test_campaign, test_contact, "Some reply text.")
+
+    assert result.success is False
+    assert result.semantic_intent is None
+
+
+def test_minimal_but_structurally_valid_response_still_succeeds(fake_llm, test_campaign, test_contact):
+    """Guards against overcorrecting: a real, minimal, legitimately terse
+    classification (most fields empty/null, as the 'not interested'
+    example in the classifier's own prompt shows is normal) must still
+    succeed -- the validation gate checks for the required top-level
+    keys being present, not for every field being populated."""
+    fake_llm.queue_response({
+        "intents": ["not_interested"],
+        "sentiment": "negative",
+        "buying_stage": "rejected",
+        "confidence": 1.0,
+    })
+
+    result = _classify(test_campaign, test_contact, "Not interested.")
+
+    assert result.success is True
+    assert result.semantic_intent.intents == [IntentType.NOT_INTERESTED]
+
+
 def test_llm_unavailable_returns_low_confidence_fallback_requiring_review(test_campaign, test_contact, monkeypatch):
     """
     When the provider is not configured at all (no API key), the

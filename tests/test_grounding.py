@@ -354,6 +354,81 @@ class TestValidateGrounding:
 
 
 # ---------------------------------------------------------------------------
+# Review-required vs. hard-block (spec sections 24-26): a mention of
+# pricing/availability with NO fabricated numeric/guarantee claim must be
+# reviewable-and-approvable by a human, not permanently unsendable. A
+# fabricated factual claim (a specific number/price/guarantee that never
+# appeared in any approved source) must remain hard-blocked regardless of
+# approval. These two failure modes were previously conflated: both landed
+# in `unsupported_claims`, so `is_safe_to_send` (and, via it, the approval
+# endpoint) could never distinguish "needs a human's eyes" from "fabricated
+# and therefore always unsendable."
+# ---------------------------------------------------------------------------
+
+class TestReviewRequiredVsHardBlock:
+    def test_pricing_mention_without_fabricated_number_is_review_not_hard_block(self):
+        body = "I'll get pricing details together for you and follow up shortly."
+        result = validate_grounding(
+            body,
+            proof_points=None,
+            context_notes=None,
+            conversation_transcript=None,
+        )
+        assert result.review_required
+        assert not result.hard_block, (
+            f"A pricing mention with no fabricated figure must not hard-block. "
+            f"unsupported_claims={result.unsupported_claims}"
+        )
+        assert result.unsupported_claims == []
+        # Still not eligible for silent auto-send -- a human must look at it.
+        assert not result.is_safe_to_send
+
+    def test_availability_mention_without_fabrication_is_review_not_hard_block(self):
+        body = "We're available now and can start this week."
+        result = validate_grounding(
+            body,
+            proof_points=None,
+            context_notes=None,
+            conversation_transcript=None,
+        )
+        assert result.review_required
+        assert not result.hard_block
+        assert result.unsupported_claims == []
+
+    def test_fabricated_price_is_hard_blocked(self):
+        """The literal spec section 25 example: a specific invented price
+        must hard-block even though a human could approve a vaguer pricing
+        mention."""
+        body = "Our Enterprise plan is $499/month."
+        result = validate_grounding(
+            body,
+            proof_points="We help teams move faster.",
+            context_notes=None,
+            conversation_transcript=None,
+        )
+        assert result.hard_block, (
+            f"A fabricated dollar figure not present in any approved source "
+            f"must hard-block. unsupported_claims={result.unsupported_claims}"
+        )
+        assert any("499" in c for c in result.unsupported_claims)
+
+    def test_fabricated_price_hard_block_survives_even_with_review_flag(self):
+        # Sanity: fabricated price also happens to mention no pricing *term*
+        # here ("$499/month" alone doesn't match the pricing-term wordlist),
+        # so this specifically proves the dollar-claim path hard-blocks
+        # independently of the review_required pricing-term path.
+        body = "Our Enterprise plan is $499/month."
+        result = validate_grounding(
+            body,
+            proof_points=None,
+            context_notes=None,
+            conversation_transcript=None,
+        )
+        assert result.hard_block
+        assert not result.is_safe_to_send
+
+
+# ---------------------------------------------------------------------------
 # Integration: draft_message() attaches grounding
 # ---------------------------------------------------------------------------
 

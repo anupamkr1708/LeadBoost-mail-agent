@@ -115,6 +115,41 @@ def test_never_grounded_claim_is_blocked_at_approval(db_session):
     assert msg.message_id_header is None, "Blocked draft must not have been sent to SMTP at all"
 
 
+def test_review_required_pricing_mention_can_be_approved_and_sent(db_session):
+    """
+    Spec sections 24-26: a draft that mentions pricing but invents no
+    specific figure is 'review_required', not 'hard_block'. Approval IS
+    the human review step, so this must be sendable through the normal
+    approve endpoint -- unlike a genuinely fabricated numeric claim.
+    """
+    campaign = _make_campaign(db_session, proof_points="We help teams move faster.")
+    contact = _make_contact(db_session, campaign)
+    msg = _make_draft(
+        db_session, contact,
+        body="Thanks for your interest! I'll get pricing details together "
+             "for your team and follow up shortly.",
+    )
+
+    result = approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
+
+    assert result.status == MessageStatus.SENT.value
+
+
+def test_fabricated_price_still_hard_blocked_at_approval(db_session):
+    """The literal spec section 25 example: approval must NOT be able to
+    turn a fabricated, never-approved price into a sendable message."""
+    campaign = _make_campaign(db_session, proof_points="We help teams move faster.")
+    contact = _make_contact(db_session, campaign)
+    msg = _make_draft(db_session, contact, body="Our Enterprise plan is $499/month.")
+
+    with pytest.raises(HTTPException) as exc_info:
+        approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
+
+    assert exc_info.value.status_code == 409
+    db_session.refresh(msg)
+    assert msg.status == MessageStatus.DRAFT.value, "Fabricated price must never be sent"
+
+
 def test_context_changed_since_draft_generation_blocks_send(db_session):
     """
     The literal scenario from spec section 11:

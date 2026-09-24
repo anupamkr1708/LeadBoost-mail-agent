@@ -91,6 +91,21 @@ def fetch_unseen_replies() -> list[InboundEmail]:
     them parsed. UNSEEN (rather than tracking a last-checked timestamp)
     is used deliberately: it's IMAP-server-authoritative and survives
     this process restarting without losing or double-processing mail.
+
+    Fetches with BODY.PEEK[] (not RFC822) and marks \\Seen explicitly,
+    per-message, only *after* that message was successfully parsed and
+    added to `results` -- not as an automatic side effect of the fetch
+    itself. A plain "(RFC822)" fetch marks a message \\Seen the instant
+    it's fetched, before anything has actually been parsed; if parsing
+    then failed for that one message, it would already be \\Seen on the
+    server and therefore never offered by UNSEEN again on a later poll
+    -- a real, silent, permanent loss of exactly the malformed message
+    that most needed a retry. PEEK + explicit STORE-on-success means a
+    parse failure leaves that message Unseen, so it's naturally retried
+    next poll instead of vanishing (spec section 41, idempotency/no
+    data loss). Each UID is also processed in its own try/except so one
+    malformed message can't abort the rest of the batch or skip the
+    connection cleanup below.
     """
     if not settings.imap_username or not settings.imap_password:
         logger.debug("IMAP not configured, skipping reply poll")
@@ -109,32 +124,41 @@ def fetch_unseen_replies() -> list[InboundEmail]:
 
         uids = data[0].split()
         for uid in uids:
-            status, msg_data = conn.fetch(uid, "(RFC822)")
-            if status != "OK" or not msg_data or not msg_data[0]:
-                continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
+            try:
+                status, msg_data = conn.fetch(uid, "(BODY.PEEK[])")
+                if status != "OK" or not msg_data or not msg_data[0]:
+                    continue
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
 
-            _, from_addr = parseaddr(msg.get("From", ""))
-            references_raw = msg.get("References", "")
-            references = references_raw.split() if references_raw else []
-            # RFC 3834: a compliant autoresponder sets this to
-            # "auto-replied" (or "auto-generated" / "auto-notified").
-            # Anything other than absent/"no" is treated as auto-submitted
-            # -- a real deterministic signal, not a body-text guess.
-            auto_submitted_header = (msg.get("Auto-Submitted") or "no").strip().lower()
+                _, from_addr = parseaddr(msg.get("From", ""))
+                references_raw = msg.get("References", "")
+                references = references_raw.split() if references_raw else []
+                # RFC 3834: a compliant autoresponder sets this to
+                # "auto-replied" (or "auto-generated" / "auto-notified").
+                # Anything other than absent/"no" is treated as auto-submitted
+                # -- a real deterministic signal, not a body-text guess.
+                auto_submitted_header = (msg.get("Auto-Submitted") or "no").strip().lower()
 
-            results.append(
-                InboundEmail(
-                    from_email=from_addr.lower(),
-                    subject=_decode(msg.get("Subject")),
-                    body_text=_extract_plain_text(msg).strip(),
-                    message_id=msg.get("Message-ID"),
-                    in_reply_to=msg.get("In-Reply-To"),
-                    references=references,
-                    auto_submitted=auto_submitted_header != "no",
+                results.append(
+                    InboundEmail(
+                        from_email=from_addr.lower(),
+                        subject=_decode(msg.get("Subject")),
+                        body_text=_extract_plain_text(msg).strip(),
+                        message_id=msg.get("Message-ID"),
+                        in_reply_to=msg.get("In-Reply-To"),
+                        references=references,
+                        auto_submitted=auto_submitted_header != "no",
+                    )
                 )
-            )
+                # Only mark \Seen now that this specific message was
+                # successfully parsed and is safely in `results`.
+                conn.store(uid, "+FLAGS", "\\Seen")
+            except Exception as e:
+                # Left Unseen (BODY.PEEK[] never marked it) -- will be
+                # retried on the next poll instead of being lost.
+                logger.error("Failed to parse IMAP message uid=%s -- left unseen, will retry next poll: %s", uid, e)
+                continue
 
         conn.close()
         conn.logout()
