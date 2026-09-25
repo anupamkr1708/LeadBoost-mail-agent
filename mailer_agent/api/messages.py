@@ -164,6 +164,14 @@ def approve_and_send_draft(
         body_text=msg.body,
         reply_to=campaign.reply_to_email,
         in_reply_to_header=prior,
+        # references_header was computed and persisted deterministically
+        # at draft time (see mail/reply_handler_v2.py's
+        # _build_references_header -- the parent's References chain plus
+        # its own Message-ID). Without passing it through here,
+        # send_email()'s own fallback would collapse References down to
+        # just the immediate parent, silently dropping the rest of the
+        # thread's ancestor chain on this hop.
+        references_header=msg.references_header,
     )
     # Status mirrors the outcome directly (sent/failed/unknown) -- see
     # mail/sender.py: an ambiguous SMTP outcome is never recorded as a

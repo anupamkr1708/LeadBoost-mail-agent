@@ -71,7 +71,16 @@ Hard rules:
    do not add numbers, timeframes, or outcomes to it, and do not \
    strengthen it (a "controlled test" is not evidence of results). Never \
    invent details about the prospect's company, funding, headcount, or \
-   tools they use. If verified facts ARE provided about this specific \
+   tools they use. This also covers commitments about the information \
+   itself, not just its content: if the prospect asked for something \
+   specific (pricing, a document, a case study, a spec) that is not in \
+   the verified context, do not claim you have already put it together \
+   or pulled it together, and do not promise it will follow "shortly" \
+   or "in a follow-up email" -- that promise is itself an unverified \
+   claim. Say plainly that you don't have that detail to hand and will \
+   confirm it, or ask what they need so you can route the request -- \
+   never imply the information already exists and is on its way. If \
+   verified facts ARE provided about this specific \
    contact/company, reference at least one of them specifically, exactly \
    as stated, in your opening 1-2 sentences rather than skipping \
    straight to the value proposition. Only lead with the value \
