@@ -166,7 +166,13 @@ def start_scheduler() -> BackgroundScheduler:
     if _scheduler is not None:
         return _scheduler
     
-    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler = BackgroundScheduler(
+        timezone="UTC",
+        job_defaults={
+            "misfire_grace_time": 60,
+            "coalesce": True,
+        },
+    )
     
     # Reply polling
     scheduler.add_job(

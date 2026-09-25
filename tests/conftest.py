@@ -45,6 +45,16 @@ def fake_llm(monkeypatch, request):
     yield install_fake_llm_provider(monkeypatch)
 
 
+@pytest.fixture(autouse=True)
+def force_test_dry_run(monkeypatch):
+    from mailer_agent.mail import sender
+
+    # Tests must never inherit LIVE_SENDING_ENABLED=true from .env.
+    # Tests that specifically exercise SMTP use their own localhost
+    # SMTP fixture and explicitly re-enable sending there.
+    monkeypatch.setattr(sender.settings, "live_sending_enabled", False)
+
+
 @pytest.fixture
 def use_real_llm(monkeypatch):
     """
