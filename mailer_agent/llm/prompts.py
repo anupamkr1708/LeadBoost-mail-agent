@@ -207,15 +207,17 @@ def build_action_instruction(
             return (
                 f"The prospect has shown clear interest. Your specific objective for "
                 f"this message: {planner_objective}{reason_clause}\n"
-                f"Propose a specific, concrete next step -- offer specific times for "
-                f"a call, ask directly about timeline/budget/decision process, or "
-                f"propose sending a proposal/contract, as appropriate to the objective above."
+                f"Propose a specific, concrete next step -- ask which times work for "
+                f"a call rather than inventing or claiming the sender's availability, "
+                f"ask directly about timeline/budget/decision process, or propose "
+                f"sending a proposal/contract, as appropriate to the objective above."
             )
         return (
             "The prospect has shown clear interest. Write a message that proposes "
             "a specific, concrete next step to move toward closing the deal -- "
-            "offer specific times for a call, ask directly about timeline/budget/"
-            "decision process, or propose sending a proposal/contract."
+            "ask which times work for a call rather than inventing the sender's "
+            "availability, ask directly about timeline/budget/decision process, or "
+            "propose sending a proposal/contract."
         )
     return "Write the next appropriate message in this conversation."
 

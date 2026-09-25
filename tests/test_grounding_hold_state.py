@@ -28,6 +28,7 @@ from sqlalchemy.orm import sessionmaker
 from mailer_agent.followup.engine_v2 import IntegratedFollowUpEngine
 from mailer_agent.followup.work_claiming import claim_due_contacts
 from mailer_agent.llm.agent import draft_message
+from mailer_agent.llm.prompts import build_action_instruction
 from mailer_agent.models import (
     Base,
     Campaign,
@@ -235,7 +236,25 @@ def test_grounding_held_contact_is_not_reclaimed(db_session, fake_llm, status, r
 
 
 # ---------------------------------------------------------------------------
-# 5. Approval-time grounding revalidation is intact for a held draft
+# 5. The "closing" task instruction doesn't contradict the system-prompt
+#    rule against inventing availability (planner and non-planner paths).
+# ---------------------------------------------------------------------------
+
+def test_closing_instruction_does_not_invent_availability():
+    with_objective = build_action_instruction(
+        "closing", follow_up_index=1, days_waited=None,
+        planner_objective="confirm budget", planner_reason="prospect asked about cost",
+    )
+    without_objective = build_action_instruction(
+        "closing", follow_up_index=1, days_waited=None,
+    )
+    for instruction in (with_objective, without_objective):
+        assert "offer specific times" not in instruction.lower()
+        assert "which times work" in instruction.lower()
+
+
+# ---------------------------------------------------------------------------
+# 6. Approval-time grounding revalidation is intact for a held draft
 # ---------------------------------------------------------------------------
 
 def test_held_draft_still_hard_blocked_at_approval(db_session, fake_llm):
