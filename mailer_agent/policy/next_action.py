@@ -49,7 +49,7 @@ from mailer_agent.semantic_models import SemanticIntent
 
 logger = logging.getLogger("mailer_agent.policy.next_action")
 
-PLANNER_PROMPT_VERSION = "planner-v1"
+PLANNER_PROMPT_VERSION = "planner-v2"
 
 # The universal objective for this kind of B2B outreach agent. Not a
 # per-campaign DB field (yet) -- campaigns don't currently express a

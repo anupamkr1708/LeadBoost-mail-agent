@@ -43,7 +43,7 @@ from mailer_agent.mail.reply_handler_v2 import (
     _build_references_header,
     _draft_and_maybe_send_reply,
 )
-from mailer_agent.models import Base, Campaign, Contact, Message, MessageStatus
+from mailer_agent.models import Base, Campaign, Contact, Message, MessageDirection, MessageStatus, MessageType
 from mailer_agent.semantic_models import BuyingStage, IntentType, SemanticIntent, SentimentType
 
 INBOUND_SUBJECT = "Re: Can AI-driven follow-ups free up your sales team?"
@@ -204,20 +204,72 @@ def test_contextual_reply_keeps_thread_subject_when_auto_sent(db_session, fake_l
 # ---------------------------------------------------------------------------
 
 def test_build_references_header_chains_and_dedupes():
+    # References + In-Reply-To + own Message-ID, in order.
     assert (
-        _build_references_header(["<root@x>", "<mid1@x>"], "<mid2@x>")
+        _build_references_header(["<root@x>", "<mid1@x>"], "<mid1@x>", "<mid2@x>")
         == "<root@x> <mid1@x> <mid2@x>"
+    )
+    # Real-world gap this fixes: a client (Gmail, on a thread's first
+    # reply) sets In-Reply-To but leaves References empty -- the
+    # immediate ancestor must still end up in the chain, not just the
+    # bare parent id.
+    assert (
+        _build_references_header([], "<parent@x>", "<child@x>")
+        == "<parent@x> <child@x>"
     )
     # Parent's own id already present in its References (some clients do
     # this) must not be duplicated.
     assert (
-        _build_references_header(["<root@x>", "<mid2@x>"], "<mid2@x>")
+        _build_references_header(["<root@x>", "<mid2@x>"], "<mid2@x>", "<mid2@x>")
         == "<root@x> <mid2@x>"
     )
-    # No ancestor chain at all -- just the immediate parent.
-    assert _build_references_header([], "<mid2@x>") == "<mid2@x>"
-    # No parent id and no chain at all.
-    assert _build_references_header([], None) is None
+    # No ancestor chain, no in-reply-to -- just the immediate parent.
+    assert _build_references_header([], None, "<mid2@x>") == "<mid2@x>"
+    # Nothing at all.
+    assert _build_references_header([], None, None) is None
+
+
+def test_contextual_reply_recovers_in_reply_to_when_references_is_empty(db_session, fake_llm):
+    """
+    Reproduces the exact real live-E2E case: Gmail's reply had
+    References EMPTY but In-Reply-To set to the original outreach's
+    Message-ID. Building the outbound chain from References alone would
+    silently drop that ancestor -- In-Reply-To must be folded in too.
+    """
+    campaign = _campaign(db_session)
+    contact = _contact(db_session, campaign)
+    # _email_in() default: references=() (empty, matching the live DB
+    # evidence), in_reply_to=PARENT_MESSAGE_ID.
+    email_in = _email_in()
+    assert email_in.references == []
+    assert email_in.in_reply_to == PARENT_MESSAGE_ID
+
+    fake_llm.queue_response({
+        "action_type": "provide_requested_information",
+        "objective": "Explain what pricing information is available.",
+        "reason": "Prospect asked for pricing details.",
+        "confidence": 0.9,
+        "requires_human_review": False,
+    })
+    fake_llm.queue_response({
+        "subject": "irrelevant",
+        "body": "Hi Sam,\n\nHappy to help -- what usage scenario did you have in mind?\n\nBest,\nDeepak",
+        "reasoning": "test",
+    })
+
+    result: dict = {}
+    intent = _intent(has_pricing_question=True, requested_information=["pricing"])
+    _draft_and_maybe_send_reply(db_session, contact, campaign, email_in, intent, result)
+    db_session.flush()
+
+    reply_msg = db_session.query(Message).filter_by(
+        contact_id=contact.id, in_reply_to_header=email_in.message_id
+    ).one()
+
+    # Without folding in_reply_to in, this would be just
+    # GMAIL_REPLY_MESSAGE_ID -- the original outreach's id would be lost.
+    assert reply_msg.references_header == f"{PARENT_MESSAGE_ID} {GMAIL_REPLY_MESSAGE_ID}"
+    assert reply_msg.in_reply_to_header == GMAIL_REPLY_MESSAGE_ID
 
 
 def test_contextual_reply_persists_full_references_chain(db_session, fake_llm):
@@ -361,3 +413,49 @@ def test_grounding_allows_answer_when_pricing_is_actually_approved(db_session):
     )
 
     assert grounding.hard_block is False
+
+
+# ---------------------------------------------------------------------------
+# 7. Approval propagates the persisted References chain into the actual
+#    send_email() call, not just onto the draft row (api/messages.py).
+# ---------------------------------------------------------------------------
+
+def test_approval_passes_references_header_to_send_email(db_session, monkeypatch):
+    import mailer_agent.api.messages as messages_api
+
+    campaign = _campaign(db_session)
+    contact = _contact(db_session, campaign)
+    references = f"{PARENT_MESSAGE_ID} {GMAIL_REPLY_MESSAGE_ID}"
+    draft = Message(
+        contact_id=contact.id,
+        direction=MessageDirection.OUTBOUND.value,
+        message_type=MessageType.REPLY.value,
+        subject=as_reply_subject(INBOUND_SUBJECT),
+        body="Hi Sam,\n\nHappy to help -- what usage scenario did you have in mind?\n\nBest,\nDeepak",
+        status=MessageStatus.DRAFT.value,
+        in_reply_to_header=GMAIL_REPLY_MESSAGE_ID,
+        references_header=references,
+    )
+    db_session.add(draft)
+    db_session.flush()
+
+    captured = {}
+
+    def fake_send_email(**kwargs):
+        captured.update(kwargs)
+        from mailer_agent.mail.sender import SendOutcome, SendResult
+
+        return SendResult(
+            success=True, message_id="<new-reply@testcorp.example.com>",
+            outcome=SendOutcome.SENT, error=None,
+        )
+
+    monkeypatch.setattr(messages_api, "send_email", fake_send_email)
+
+    messages_api.approve_and_send_draft(draft.id, org_id="default", db=db_session)
+
+    # This is the exact one-line plumbing bug that can silently
+    # reappear: the value is persisted correctly on the draft row (see
+    # the tests above) but never reaches the real SMTP call.
+    assert captured.get("references_header") == references
+    assert captured.get("in_reply_to_header") == GMAIL_REPLY_MESSAGE_ID

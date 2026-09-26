@@ -48,20 +48,30 @@ logger = logging.getLogger("mailer_agent.mail.reply_handler_v2")
 settings = get_settings()
 
 
-def _build_references_header(parent_references: list[str], parent_message_id: str | None) -> str | None:
+def _build_references_header(
+    parent_references: list[str], parent_in_reply_to: str | None, parent_message_id: str | None
+) -> str | None:
     """
     RFC 5322 References for a reply: the parent's own References chain
-    (its ancestors) plus the parent's own Message-ID, in order, with no
-    duplicates. The immediate parent stays the last entry here (and is
-    separately set as In-Reply-To by the caller) -- this just makes sure
-    the rest of the ancestor chain isn't dropped on the next hop.
+    (its ancestors), then the parent's own In-Reply-To, then the
+    parent's own Message-ID -- in order, with no duplicates.
+
+    In-Reply-To is included as well as References because real mail
+    clients don't always populate References even when they do set
+    In-Reply-To (Gmail's first reply in a thread, in particular, sends
+    In-Reply-To with References empty) -- using References alone would
+    silently drop the immediate ancestor from the chain in exactly that
+    case. The immediate parent (parent_message_id) stays the last entry
+    here (and is separately set as In-Reply-To by the caller) -- this
+    just makes sure the rest of the ancestor chain isn't dropped on the
+    next hop.
 
     Deterministic and protocol-level: never derived from anything the
     LLM wrote.
     """
     seen: set[str] = set()
     ordered: list[str] = []
-    for msg_id in (*parent_references, *((parent_message_id,) if parent_message_id else ())):
+    for msg_id in (*parent_references, parent_in_reply_to, parent_message_id):
         if msg_id and msg_id not in seen:
             seen.add(msg_id)
             ordered.append(msg_id)
@@ -622,7 +632,9 @@ def _draft_and_maybe_send_reply(
     # References still point at the right parent (see docs for the
     # observed live-E2E case this fixes). Do not use draft.subject here.
     reply_subject = as_reply_subject(email_in.subject)
-    reply_references = _build_references_header(email_in.references, email_in.message_id)
+    reply_references = _build_references_header(
+        email_in.references, email_in.in_reply_to, email_in.message_id
+    )
 
     # Create reply message
     reply_msg = Message(
