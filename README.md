@@ -1,5 +1,7 @@
 # Mailer Agent
 
+[![CI](https://github.com/anupamkr1708/LeadBoost-mail-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/anupamkr1708/LeadBoost-mail-agent/actions/workflows/ci.yml)
+
 A standalone, intelligent sales-outreach mailer with a REST API in front of it. Give it a sender identity, an offer, and a list of contacts; it writes and sends the first email, waits for replies, drafts and (optionally) sends replies that actually address what the prospect said, and follows up on a schedule *you* configure per campaign — not one baked into the code.
 
 Built to be integrated by URL, not by import: run it as its own service, call its API from LeadBoost (or anything else) to create campaigns and push in leads.
@@ -56,6 +58,36 @@ python run.py           # serves on http://localhost:8000, docs at /docs
 ```
 
 Run the test suite any time: `pytest -q`.
+
+## CI / Testing
+
+GitHub Actions runs on every PR into `main` and on pushes to `main` and
+`grounding-state-fix`.
+
+| Job | What it runs | Command |
+|---|---|---|
+| `quality-and-tests` | compile/import check, lint (report-only), `pip-audit`/`bandit` (report-only), the full deterministic suite with coverage | `python -m pytest -q --cov=mailer_agent` |
+| `postgres-integration` | the PostgreSQL row-locking/concurrency suite, against a real `postgres:16` service container | `python -m pytest -o addopts="" tests/test_postgresql_concurrency.py -v` |
+| `local-smtp` | the local SMTP protocol test, against a real `aiosmtpd` server on localhost (no external network) | `python -m pytest -o addopts="" tests/test_smtp_local_integration.py -v` |
+
+None of these jobs touch a real mailbox, real SMTP provider, or the real
+Groq API — the LLM is faked (`tests/fake_llm_provider.py`, autouse) and
+`LIVE_SENDING_ENABLED`/`AUTO_REPLY_ENABLED` are forced `false` for every job.
+
+**Run the same commands locally:**
+```bash
+python -m pytest -q                                                   # deterministic suite
+POSTGRES_TEST_URL='postgresql+psycopg2://user:pass@localhost:5432/db' \
+  python -m pytest -o addopts="" tests/test_postgresql_concurrency.py -v
+python -m pytest -o addopts="" tests/test_smtp_local_integration.py -v
+```
+
+**Not run in CI — manual only**, because they hit real external providers:
+```bash
+python -m pytest -m integration -v tests/evaluation/test_live_llm_semantic_quality.py  # real Groq
+python -m pytest -m integration -v tests/evaluation/test_live_smoke.py                 # real Groq
+./run_e2e_test.sh                                                                       # real Gmail, needs .env
+```
 
 ### Getting SMTP/IMAP credentials
 If using Gmail: enable 2FA, then create an **App Password** (Google Account → Security → App Passwords) — use that as both `SMTP_PASSWORD` and `IMAP_PASSWORD`, with `SMTP_USERNAME`/`IMAP_USERNAME` as the full Gmail address. For anything beyond light testing, use a dedicated domain/mailbox for outreach rather than a personal inbox — see the deliverability notes at the bottom.

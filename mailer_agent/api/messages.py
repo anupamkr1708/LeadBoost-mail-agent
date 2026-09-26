@@ -6,10 +6,13 @@ Multi-tenancy: message access is validated through contact → campaign ownershi
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from mailer_agent.api.deps import get_current_org_id, require_api_key
+from mailer_agent.config import get_settings
 from mailer_agent.db import get_db
 from mailer_agent.followup.engine import is_suppressed
 from mailer_agent.llm.grounding import validate_grounding
@@ -17,6 +20,9 @@ from mailer_agent.mail.sender import send_email
 from mailer_agent.memory.store import build_conversation_context
 from mailer_agent.models import Campaign, Contact, Message, MessageStatus, SuppressionEntry
 from mailer_agent.schemas import MessageOut, SuppressRequest
+
+logger = logging.getLogger("mailer_agent.api.messages")
+settings = get_settings()
 
 router = APIRouter(tags=["messages"], dependencies=[Depends(require_api_key)])
 
@@ -84,9 +90,21 @@ def approve_and_send_draft(
     the conversation itself may have changed since then (a human edited
     the campaign, the contact replied again, etc). This endpoint always
     re-runs grounding validation against the *current* state right
-    before sending, and blocks the send if the draft is no longer
-    supported. This is the one path every approval must go through --
-    there is no way to mark a message SENT without passing this check.
+    before sending, and blocks the send if the draft contains a claim
+    that is genuinely untraceable to any approved source (hard_block).
+    This is the one path every approval must go through -- there is no
+    way to mark a message SENT without passing this check.
+
+    This endpoint gates on `grounding.hard_block`, not
+    `grounding.is_safe_to_send`. The two differ exactly for content that
+    is `review_required` but not fabricated (e.g. "I'll get pricing
+    details together for you" -- mentions pricing, invents no figure):
+    such content is never eligible for *silent* auto-send
+    (is_safe_to_send=False), but calling this endpoint at all IS the
+    human review step, so it must be authorizable here. A hard_block
+    claim (a specific invented price/percentage/guarantee not present in
+    any approved source) can never be authorized by approval, regardless
+    of review_required -- see semantic_models.GroundingValidation.
     """
     msg = _get_message_or_404(db, message_id, org_id)
 
@@ -116,15 +134,21 @@ def approve_and_send_draft(
         conversation_transcript=conversation_transcript,
         value_prop=campaign.value_prop,
     )
-    if not grounding.is_safe_to_send:
+    if grounding.hard_block:
         raise HTTPException(
             status_code=409,
             detail=(
                 "Draft failed final grounding recheck and cannot be sent: "
-                f"{grounding.validation_notes}. Unsupported claims: "
+                f"{grounding.validation_notes}. Unsupported/fabricated claims: "
                 f"{grounding.unsupported_claims}. Edit the draft or the "
                 "campaign/contact data, then try approval again."
             ),
+        )
+    if grounding.review_required:
+        logger.info(
+            "Message %s approved with review_required content (%s) -- "
+            "human authorization via this endpoint is the review step.",
+            msg.id, grounding.review_reasons,
         )
 
     prior = msg.in_reply_to_header
@@ -134,6 +158,28 @@ def approve_and_send_draft(
         else campaign.sender_org
     )
 
+    # Live-sending boundary: config.py documents live_sending_enabled=False
+    # as "generated sends/replies are written to the DB as status=draft
+    # instead of actually being emailed" -- but this endpoint previously
+    # called send_email() regardless, and send_email()'s own dry-run
+    # branch returns success=True/SendOutcome.SENT (a deliberate
+    # simulation for generation-time drafting and for tests), which this
+    # endpoint then persisted as status=sent even though no SMTP
+    # transmission occurred. Reject explicitly here instead: the draft
+    # stays a draft, and re-approving once live sending is actually
+    # enabled works normally. This is the one boundary that must be
+    # honest about real delivery; send_email()'s own dry-run simulation
+    # is unchanged and still used elsewhere (drafting, tests).
+    if not settings.live_sending_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Live sending is disabled (LIVE_SENDING_ENABLED=false) -- "
+                "draft was not sent. Enable LIVE_SENDING_ENABLED and retry "
+                "approval to actually send."
+            ),
+        )
+
     result = send_email(
         to_email=contact.email,
         from_email=campaign.sender_email,
@@ -142,6 +188,14 @@ def approve_and_send_draft(
         body_text=msg.body,
         reply_to=campaign.reply_to_email,
         in_reply_to_header=prior,
+        # references_header was computed and persisted deterministically
+        # at draft time (see mail/reply_handler_v2.py's
+        # _build_references_header -- the parent's References chain plus
+        # its own Message-ID). Without passing it through here,
+        # send_email()'s own fallback would collapse References down to
+        # just the immediate parent, silently dropping the rest of the
+        # thread's ancestor chain on this hop.
+        references_header=msg.references_header,
     )
     # Status mirrors the outcome directly (sent/failed/unknown) -- see
     # mail/sender.py: an ambiguous SMTP outcome is never recorded as a

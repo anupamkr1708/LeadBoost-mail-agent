@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, grounding-state-fix]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch/PR instead of letting them pile up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Belt-and-braces: these already default to false in mailer_agent/config.py,
+  # and CI never checks out a .env file (it's gitignored), but every job sets
+  # them explicitly anyway so no normal test run can ever send real email or
+  # auto-send a reply, regardless of future defaults.
+  LIVE_SENDING_ENABLED: "false"
+  AUTO_REPLY_ENABLED: "false"
+
+jobs:
+  quality-and-tests:
+    name: Quality & deterministic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install CI-only tooling (lint / security / coverage)
+        run: pip install "pytest-cov>=5.0" "ruff>=0.6" "bandit>=1.7" "pip-audit>=2.7"
+
+      - name: Compile / import sanity check
+        run: python -m compileall -q mailer_agent tests
+
+      - name: Lint (ruff, report-only)
+        # Pre-existing lint debt (mostly unused imports/vars) predates this
+        # workflow; enforcing it now would fail CI on unrelated findings
+        # rather than a real regression. Reported every run, not blocking.
+        # --exit-zero always exits 0; if/when the codebase is cleaned up,
+        # drop that flag to make this a real gate.
+        run: ruff check --exit-zero mailer_agent tests
+
+      - name: Dependency sanity (pip check)
+        run: pip check
+
+      - name: Dependency vulnerability scan (pip-audit, report-only)
+        # Informational: currently flags known CVEs in transitive deps
+        # (pytest, starlette) pulled in by the pinned FastAPI range.
+        # Bumping those is an application dependency decision, not a
+        # CI-infrastructure one, so this reports rather than blocks.
+        run: pip-audit -r requirements.txt || true
+
+      - name: Security scan (bandit, report-only)
+        run: bandit -r mailer_agent -q || true
+
+      - name: Run deterministic test suite
+        run: |
+          python -m pytest -q \
+            --cov=mailer_agent --cov-report=term-missing --cov-report=xml \
+            --junitxml=junit.xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 14
+
+      - name: Upload JUnit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-xml
+          path: junit.xml
+          retention-days: 14
+
+  postgres-integration:
+    name: PostgreSQL concurrency
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Disposable, CI-only credentials for an ephemeral service
+          # container -- never used outside this job's network namespace.
+          POSTGRES_USER: mailer_agent
+          POSTGRES_PASSWORD: mailer_agent_test_pw
+          POSTGRES_DB: mailer_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mailer_agent -d mailer_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run PostgreSQL concurrency suite
+        env:
+          # Explicit +psycopg2 driver is required: the pinned SQLAlchemy
+          # 2.x range resolves a bare postgresql:// URL to the psycopg
+          # (v3) dialect, which isn't installed here (only psycopg2-binary
+          # is, per requirements.txt). Without this, the whole suite
+          # silently SKIPS (reported not-available) instead of running.
+          POSTGRES_TEST_URL: postgresql+psycopg2://mailer_agent:mailer_agent_test_pw@localhost:5432/mailer_agent_test
+        run: |
+          python -m pytest -o addopts="" tests/test_postgresql_concurrency.py -v
+
+  local-smtp:
+    name: Local SMTP protocol integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run local SMTP integration test
+        # No external network access is used or required -- this test
+        # spins up a real aiosmtpd server on localhost only.
+        run: |
+          python -m pytest -o addopts="" tests/test_smtp_local_integration.py -v

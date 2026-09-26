@@ -195,11 +195,59 @@ class SemanticFact:
     entries in new_facts/changed_facts/entities -- anywhere the system
     would otherwise be tempted to store a bare string and quietly treat
     it as verified.
+
+    Provenance fields (spec section 14, "fact provenance"):
+    - `supersedes` is filled BY THE LLM (see semantic/classifier.py's
+      SUPERSESSION rule) when it recognizes this fact replaces a
+      specific earlier-stated value -- e.g. a new current_solution of
+      "none -- evaluating replacement" with supersedes="Salesforce".
+      This is the model's job because only it can recognize supersession
+      from meaning; deterministic code never guesses semantic
+      equivalence between two fact strings (see memory/store.py's
+      reconcile_known_facts for how this is consumed).
+    - `source_message_id` and `observed_at` are NEVER filled by the LLM
+      -- it has no visibility into database row IDs or wall-clock time.
+      They are attached deterministically, once, immediately after
+      classification succeeds -- see attach_fact_provenance() below and
+      its call site in mail/reply_handler_v2.py.
     """
     value: str
     certainty: Certainty = Certainty.UNKNOWN
     explicit: bool = False           # True only for Certainty.EXPLICIT; kept as a fast, obvious check
     evidence: Optional[str] = None   # short quote/paraphrase of what supports this
+    supersedes: Optional[str] = None       # exact prior fact value this replaces, if any (LLM-provided)
+    source_message_id: Optional[int] = None  # Message.id this fact was extracted from (attached deterministically)
+    observed_at: Optional[str] = None        # ISO 8601 timestamp, attached deterministically
+
+
+def attach_fact_provenance(intent: "SemanticIntent", *, source_message_id: int, observed_at: str) -> None:
+    """
+    Deterministically stamp source_message_id/observed_at onto every
+    SemanticFact this SemanticIntent carries (current_solution,
+    competitors_mentioned, new_facts), in place. Idempotent -- only
+    fills fields that are still None, so calling this twice (or on an
+    intent that was somehow pre-stamped) never overwrites an existing
+    value with a different one.
+
+    Must be called exactly once, right after classification succeeds and
+    before the intent is serialized/persisted (see
+    mail/reply_handler_v2.py) -- this is the one place in the pipeline
+    that actually knows the inbound Message's real id and timestamp; the
+    LLM does not and must never be asked to invent them.
+    """
+    def _stamp(f: Optional[SemanticFact]) -> None:
+        if f is None:
+            return
+        if f.source_message_id is None:
+            f.source_message_id = source_message_id
+        if f.observed_at is None:
+            f.observed_at = observed_at
+
+    _stamp(intent.current_solution)
+    for fact in intent.competitors_mentioned:
+        _stamp(fact)
+    for fact in intent.new_facts:
+        _stamp(fact)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +325,15 @@ class SemanticIntent:
         return self.timing.expression if self.timing else None
 
 
-SEMANTIC_SCHEMA_VERSION = "2"
+SEMANTIC_SCHEMA_VERSION = "3"
+# v3 (spec sections 14-16, fact provenance): SemanticFact gained
+# supersedes/source_message_id/observed_at. Purely additive and
+# backward-compatible -- readers of v2 records simply see these three
+# keys as None/absent, never misinterpreted as something else. Bumped
+# anyway so any future reader that branches on semantic_schema_version
+# can tell "this record predates provenance tracking" from "this record
+# has provenance fields that are genuinely all null" if that distinction
+# ever matters.
 
 
 def serialize_semantic_intent(intent: SemanticIntent) -> dict:
@@ -295,7 +351,15 @@ def serialize_semantic_intent(intent: SemanticIntent) -> dict:
     def _fact(f: Optional[SemanticFact]) -> Optional[dict]:
         if f is None:
             return None
-        return {"value": f.value, "certainty": f.certainty.value, "explicit": f.explicit, "evidence": f.evidence}
+        return {
+            "value": f.value,
+            "certainty": f.certainty.value,
+            "explicit": f.explicit,
+            "evidence": f.evidence,
+            "supersedes": f.supersedes,
+            "source_message_id": f.source_message_id,
+            "observed_at": f.observed_at,
+        }
 
     def _timing(t: Optional[TimingSignal]) -> Optional[dict]:
         if t is None:
@@ -368,6 +432,11 @@ class ClassificationResult:
     model_used: Optional[str] = None
     processing_time_ms: Optional[int] = None
     prompt_version: Optional[str] = None
+    # Model-routing observability (spec: never leave model_used wrong/
+    # misleading when a fallback model actually answered the request).
+    used_fallback: Optional[bool] = None
+    response_mode: Optional[str] = None  # "strict_schema" | "json_object" | "lenient"
+    attempts: Optional[int] = None
 
     @property
     def is_actionable(self) -> bool:
@@ -412,6 +481,9 @@ class ClassificationResult:
         source: str = "llm",
         model_used: Optional[str] = None,
         prompt_version: Optional[str] = None,
+        used_fallback: Optional[bool] = None,
+        response_mode: Optional[str] = None,
+        attempts: Optional[int] = None,
     ) -> ClassificationResult:
         """Create a successful classification result."""
         return cls(
@@ -420,6 +492,9 @@ class ClassificationResult:
             source=source,
             model_used=model_used,
             prompt_version=prompt_version,
+            used_fallback=used_fallback,
+            response_mode=response_mode,
+            attempts=attempts,
         )
 
 
@@ -449,8 +524,34 @@ class GroundingValidation:
     supported_claims: list[str] = field(default_factory=list)
     confidence: float = 0.0
     validation_notes: str = ""
-    
+    # Sensitive-but-not-necessarily-false content (pricing/availability
+    # mentions) that a human reviewer can authorize -- distinct from
+    # unsupported_claims, which is reserved for content that is actually
+    # untraceable to any approved source. See hard_block/is_safe_to_send.
+    review_required: bool = False
+    review_reasons: list[str] = field(default_factory=list)
+
     @property
     def is_safe_to_send(self) -> bool:
-        """Should this message be sent or require human review?"""
-        return self.is_grounded and len(self.unsupported_claims) == 0
+        """Eligible for silent auto-send with no human in the loop."""
+        return (
+            self.is_grounded
+            and len(self.unsupported_claims) == 0
+            and not self.review_required
+        )
+
+    @property
+    def hard_block(self) -> bool:
+        """
+        True only when a claim is actually untraceable to any approved
+        source (a fabricated number, price, guarantee, or customer claim).
+
+        This is deliberately independent of review_required: a draft that
+        merely mentions pricing/availability but invents no specific figure
+        is review_required (a human should look at it) but NOT hard_block
+        (a human CAN authorize sending it). Human approval must never be
+        able to turn a hard_block claim into a sendable one -- that
+        distinction is enforced by callers checking hard_block, not
+        is_safe_to_send, at the approval gate.
+        """
+        return not self.is_grounded or len(self.unsupported_claims) > 0

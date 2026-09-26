@@ -28,6 +28,34 @@ from mailer_agent.models import Base, Campaign, Contact, Message, MessageDirecti
 
 
 @pytest.fixture
+def live_sending(monkeypatch):
+    """
+    Opt a test into the approval endpoint's live-sending gate (see
+    api/messages.py's boundary check) while keeping actual dispatch
+    fully fake. With live_sending_enabled=True, send_email() itself
+    would attempt a REAL SMTP connection (mail/sender.py's dry-run
+    branch only applies when the flag is False) -- so send_email is
+    replaced here with the same kind of simulation that branch does: a
+    real, correctly-shaped SendResult, no socket touched. This mirrors
+    what tests/conftest.py's own force_test_dry_run fixture and
+    test_smtp_local_integration.py already do for this one shared flag.
+    """
+    import mailer_agent.api.messages as messages_api
+    from email.utils import make_msgid
+
+    from mailer_agent.mail.sender import SendOutcome, SendResult
+
+    monkeypatch.setattr(messages_api.settings, "live_sending_enabled", True)
+
+    def fake_send_email(*, to_email, from_email, from_name, subject, body_text,
+                         reply_to=None, in_reply_to_header=None, references_header=None):
+        domain = from_email.split("@")[-1] if "@" in from_email else "localhost"
+        return SendResult(success=True, message_id=make_msgid(domain=domain), outcome=SendOutcome.SENT)
+
+    monkeypatch.setattr(messages_api, "send_email", fake_send_email)
+
+
+@pytest.fixture
 def db_session():
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
@@ -82,7 +110,7 @@ def _make_draft(db_session, contact: Contact, body: str, subject: str = "Quick q
     return msg
 
 
-def test_grounded_unchanged_draft_is_approved_and_sent(db_session):
+def test_grounded_unchanged_draft_is_approved_and_sent(db_session, live_sending):
     """Baseline: a draft whose claims are still supported by current
     campaign data sends normally through approval."""
     campaign = _make_campaign(db_session, proof_points="We've worked with 50 companies across the region.")
@@ -113,6 +141,41 @@ def test_never_grounded_claim_is_blocked_at_approval(db_session):
     db_session.refresh(msg)
     assert msg.status == MessageStatus.DRAFT.value, "Blocked draft must not be marked sent"
     assert msg.message_id_header is None, "Blocked draft must not have been sent to SMTP at all"
+
+
+def test_review_required_pricing_mention_can_be_approved_and_sent(db_session, live_sending):
+    """
+    Spec sections 24-26: a draft that mentions pricing but invents no
+    specific figure is 'review_required', not 'hard_block'. Approval IS
+    the human review step, so this must be sendable through the normal
+    approve endpoint -- unlike a genuinely fabricated numeric claim.
+    """
+    campaign = _make_campaign(db_session, proof_points="We help teams move faster.")
+    contact = _make_contact(db_session, campaign)
+    msg = _make_draft(
+        db_session, contact,
+        body="Thanks for your interest! I'll get pricing details together "
+             "for your team and follow up shortly.",
+    )
+
+    result = approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
+
+    assert result.status == MessageStatus.SENT.value
+
+
+def test_fabricated_price_still_hard_blocked_at_approval(db_session):
+    """The literal spec section 25 example: approval must NOT be able to
+    turn a fabricated, never-approved price into a sendable message."""
+    campaign = _make_campaign(db_session, proof_points="We help teams move faster.")
+    contact = _make_contact(db_session, campaign)
+    msg = _make_draft(db_session, contact, body="Our Enterprise plan is $499/month.")
+
+    with pytest.raises(HTTPException) as exc_info:
+        approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
+
+    assert exc_info.value.status_code == 409
+    db_session.refresh(msg)
+    assert msg.status == MessageStatus.DRAFT.value, "Fabricated price must never be sent"
 
 
 def test_context_changed_since_draft_generation_blocks_send(db_session):
@@ -182,7 +245,7 @@ def test_approval_is_org_scoped(db_session):
     assert msg.status == MessageStatus.DRAFT.value
 
 
-def test_already_sent_message_cannot_be_approved_again(db_session):
+def test_already_sent_message_cannot_be_approved_again(db_session, live_sending):
     """Re-approving a non-draft message is rejected -- guards against a
     duplicate send via a repeated/racing approval call."""
     campaign = _make_campaign(db_session, proof_points="We've worked with 50 companies across the region.")
@@ -198,3 +261,76 @@ def test_already_sent_message_cannot_be_approved_again(db_session):
     with pytest.raises(HTTPException) as exc_info:
         approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
     assert exc_info.value.status_code == 400
+
+
+def test_approval_rejected_when_live_sending_disabled(db_session, monkeypatch):
+    """
+    Regression test for a real live-run gap: with LIVE_SENDING_ENABLED
+    unset/false, the server itself logs DRY RUN MODE and send_email()
+    logs "[DRY RUN] Would send to ..." -- but the approval endpoint used
+    to still persist status=sent, because it only ever read
+    send_email()'s (deliberately faked) success=True/SendOutcome.SENT
+    result, never the live-sending flag itself. That produced a
+    database that claimed a real send happened when no SMTP
+    transmission was ever attempted. Approval must now reject outright
+    (draft stays exactly as it was) rather than silently recording a
+    send that didn't happen.
+    """
+    import mailer_agent.api.messages as messages_api
+
+    campaign = _make_campaign(db_session, proof_points="We've worked with 50 companies across the region.")
+    contact = _make_contact(db_session, campaign)
+    msg = _make_draft(db_session, contact, body="We work with 50 companies and see strong results.")
+
+    # If the endpoint reached send_email at all despite live sending
+    # being disabled, this fails the test loudly instead of silently
+    # attempting a real SMTP connection.
+    def _must_not_be_called(**kwargs):
+        raise AssertionError("send_email must not be called when live sending is disabled")
+
+    monkeypatch.setattr(messages_api, "send_email", _must_not_be_called)
+    assert messages_api.settings.live_sending_enabled is False
+
+    with pytest.raises(HTTPException) as exc_info:
+        approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
+
+    assert exc_info.value.status_code == 409
+    assert "live sending" in exc_info.value.detail.lower()
+
+    db_session.refresh(msg)
+    assert msg.status == MessageStatus.DRAFT.value, "Must not be silently marked sent"
+    assert msg.message_id_header is None, "No Message-ID should be minted for a rejected approval"
+
+
+def test_approval_rejected_then_succeeds_once_live_sending_enabled(db_session, monkeypatch):
+    """The rejection above is a hard gate, not a permanently broken
+    state -- the same draft can be approved normally once live sending
+    is actually enabled."""
+    import mailer_agent.api.messages as messages_api
+    from email.utils import make_msgid
+
+    from mailer_agent.mail.sender import SendOutcome, SendResult
+
+    campaign = _make_campaign(db_session, proof_points="We've worked with 50 companies across the region.")
+    contact = _make_contact(db_session, campaign)
+    msg = _make_draft(db_session, contact, body="We work with 50 companies and see strong results.")
+
+    with pytest.raises(HTTPException) as exc_info:
+        approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
+    assert exc_info.value.status_code == 409
+    db_session.refresh(msg)
+    assert msg.status == MessageStatus.DRAFT.value
+
+    def fake_send_email(*, to_email, from_email, from_name, subject, body_text,
+                         reply_to=None, in_reply_to_header=None, references_header=None):
+        domain = from_email.split("@")[-1] if "@" in from_email else "localhost"
+        return SendResult(success=True, message_id=make_msgid(domain=domain), outcome=SendOutcome.SENT)
+
+    monkeypatch.setattr(messages_api.settings, "live_sending_enabled", True)
+    monkeypatch.setattr(messages_api, "send_email", fake_send_email)
+
+    result = approve_and_send_draft(message_id=msg.id, org_id="default", db=db_session)
+    assert result.status == MessageStatus.SENT.value
+    db_session.refresh(msg)
+    assert msg.status == MessageStatus.SENT.value
+    assert msg.message_id_header is not None

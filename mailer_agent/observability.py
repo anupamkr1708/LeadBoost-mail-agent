@@ -50,6 +50,15 @@ class TurnTrace:
     classification_success: Optional[bool] = None
     semantic_intent: Optional[dict] = None  # serialize_semantic_intent() output
     prompt_version_classifier: Optional[str] = None
+    # Model-routing observability -- requested vs. actual model used,
+    # whether a fallback model answered, and which structured-output
+    # mode ultimately succeeded. Populated from ClassificationResult/
+    # NextActionProposal/AgentDraft's own model_used/used_fallback/
+    # response_mode fields (llm/provider_v2.py's LLMJsonResult), not
+    # recomputed here.
+    classifier_model_used: Optional[str] = None
+    classifier_used_fallback: Optional[bool] = None
+    classifier_response_mode: Optional[str] = None
 
     # Planning (policy/next_action.py).
     planner_action_type: Optional[str] = None
@@ -57,6 +66,9 @@ class TurnTrace:
     planner_confidence: Optional[float] = None
     planner_source: Optional[str] = None
     prompt_version_planner: Optional[str] = None
+    planner_model_used: Optional[str] = None
+    planner_used_fallback: Optional[bool] = None
+    planner_response_mode: Optional[str] = None
 
     # Guardrails (policy/guardrails.py).
     guardrail_can_auto_send: Optional[bool] = None
@@ -66,6 +78,9 @@ class TurnTrace:
     draft_source: Optional[str] = None  # "llm" | "fallback"
     grounding_safe: Optional[bool] = None
     grounding_notes: Optional[str] = None
+    draft_model_used: Optional[str] = None
+    draft_used_fallback: Optional[bool] = None
+    draft_response_mode: Optional[str] = None
 
     # Final outcome.
     final_action: Optional[str] = None  # result["action"] from process_inbound_email_v2
@@ -85,16 +100,25 @@ def build_and_log_turn_trace(
     classification_success: Optional[bool] = None,
     semantic_intent_dict: Optional[dict] = None,
     prompt_version_classifier: Optional[str] = None,
+    classifier_model_used: Optional[str] = None,
+    classifier_used_fallback: Optional[bool] = None,
+    classifier_response_mode: Optional[str] = None,
     planner_action_type: Optional[str] = None,
     planner_objective: Optional[str] = None,
     planner_confidence: Optional[float] = None,
     planner_source: Optional[str] = None,
     prompt_version_planner: Optional[str] = None,
+    planner_model_used: Optional[str] = None,
+    planner_used_fallback: Optional[bool] = None,
+    planner_response_mode: Optional[str] = None,
     guardrail_can_auto_send: Optional[bool] = None,
     guardrail_review_reason: Optional[str] = None,
     draft_source: Optional[str] = None,
     grounding_safe: Optional[bool] = None,
     grounding_notes: Optional[str] = None,
+    draft_model_used: Optional[str] = None,
+    draft_used_fallback: Optional[bool] = None,
+    draft_response_mode: Optional[str] = None,
     final_action: Optional[str] = None,
 ) -> TurnTrace:
     """
@@ -117,16 +141,25 @@ def build_and_log_turn_trace(
         classification_success=classification_success,
         semantic_intent=semantic_intent_dict,
         prompt_version_classifier=prompt_version_classifier,
+        classifier_model_used=classifier_model_used,
+        classifier_used_fallback=classifier_used_fallback,
+        classifier_response_mode=classifier_response_mode,
         planner_action_type=planner_action_type,
         planner_objective=planner_objective,
         planner_confidence=planner_confidence,
         planner_source=planner_source,
         prompt_version_planner=prompt_version_planner,
+        planner_model_used=planner_model_used,
+        planner_used_fallback=planner_used_fallback,
+        planner_response_mode=planner_response_mode,
         guardrail_can_auto_send=guardrail_can_auto_send,
         guardrail_review_reason=guardrail_review_reason,
         draft_source=draft_source,
         grounding_safe=grounding_safe,
         grounding_notes=grounding_notes,
+        draft_model_used=draft_model_used,
+        draft_used_fallback=draft_used_fallback,
+        draft_response_mode=draft_response_mode,
         final_action=final_action,
     )
     try:

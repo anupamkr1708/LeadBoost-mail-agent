@@ -25,9 +25,40 @@ class Settings(BaseSettings):
 
     # --- LLM ------------------------------------------------------------
     groq_api_key: str = ""
-    llm_model: str = "llama-3.3-70b-versatile"
+    # llama-3.3-70b-versatile was deprecated by Groq in June 2026 (see
+    # .env.example) -- this default must track whatever .env.example
+    # currently recommends, since anyone who doesn't set LLM_MODEL
+    # explicitly gets THIS value, not the .env.example comment. If you
+    # change the recommendation in .env.example, change it here too.
+    llm_model: str = "openai/gpt-oss-120b"
     llm_temperature: float = 0.4
     llm_max_tokens: int = 500
+    # Comma-separated, tried in order if llm_model fails with an
+    # eligible-for-failover error (rate limit, timeout, provider 5xx,
+    # model-not-found on a fallback, or malformed output after
+    # strict+lenient parsing both failed on the primary -- see
+    # llm/provider_v2.py's _FAILOVER_ELIGIBLE_TRANSIENT / ModelUnavailableError).
+    # NOT tried for authentication failures or genuine request/schema
+    # validation errors -- see the same module's routing logic and its
+    # docstring for why.
+    #
+    # Default is openai/gpt-oss-20b only -- both gpt-oss models are
+    # Groq PRODUCTION-tier (console.groq.com/docs/models). qwen/qwen3.8-27b
+    # is currently a Groq PREVIEW model: Groq's own docs say preview
+    # models are for evaluation and can be discontinued at short notice,
+    # so it is deliberately NOT in the default production fallback chain
+    # even though it has the same JSON Schema Mode + reasoning_effort
+    # capabilities as the gpt-oss models (see MODEL_CAPABILITIES in
+    # llm/provider_v2.py) and remains a fine explicit opt-in:
+    # LLM_FALLBACK_MODELS=openai/gpt-oss-20b,qwen/qwen3.8-27b
+    llm_fallback_models: str = "openai/gpt-oss-20b"
+    # GPT-OSS models reject "none" outright (400) -- their valid values
+    # are low/medium/high, defaulting server-side to "medium" if omitted.
+    # qwen/qwen3.8-27b additionally supports low/medium/high (default
+    # "none"). Only ever sent to a model whose capability entry in
+    # llm/provider_v2.py's MODEL_CAPABILITIES says it supports this
+    # value -- never sent blindly. See /docs/api-reference.
+    llm_reasoning_effort: str = "low"
 
     # --- Outbound mail (SMTP) -------------------------------------------
     smtp_host: str = "smtp.gmail.com"
@@ -79,6 +110,14 @@ class Settings(BaseSettings):
     # prefer ORG_KEY_MAP (JSON) or individual ORG_KEYS_<org_id>=<key> vars
     # -- see mailer_agent/api/deps.py for the full resolution order.
     api_key: str = ""  # if set, required as `X-API-Key` header on all routes
+
+    @property
+    def llm_fallback_models_list(self) -> list[str]:
+        """llm_fallback_models parsed into an ordered list, empty entries
+        and whitespace stripped. A plain property (not a field) so it's
+        always derived fresh from the current llm_fallback_models value
+        rather than parsed once and risking drift."""
+        return [m.strip() for m in self.llm_fallback_models.split(",") if m.strip()]
 
 
 @lru_cache

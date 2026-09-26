@@ -169,9 +169,19 @@ def test_work_claim_lease_recovery_after_expiry(pg_engine):
     session2 = _new_session(pg_engine)
     claimed = claim_due_contacts(session2, worker_id="recovery-worker", limit=10)
     session2.commit()
+    # Extract ids while session2 is still open -- claim_due_contacts returns
+    # ORM Contact instances, and session.commit() defaults to
+    # expire_on_commit=True, so their attributes are expired (not yet
+    # reloaded) at this point. Accessing .id after session2.close() would
+    # trigger a reload against a closed session (DetachedInstanceError) --
+    # exactly the bug this ordering avoids. The sibling test above
+    # (test_two_workers_claiming_same_contact_only_one_wins) already gets
+    # this right by building its id list inside the session's own thread
+    # before closing; this test needs the same discipline.
+    claimed_ids = [c.id for c in claimed]
     session2.close()
 
-    assert contact_id in [c.id for c in claimed], (
+    assert contact_id in claimed_ids, (
         "A contact with an expired claim lease must be claimable again -- "
         "work must not be permanently lost when a worker crashes mid-processing."
     )
@@ -235,12 +245,26 @@ def test_concurrent_duplicate_message_id_insert_only_one_succeeds(pg_engine):
         f"or not working; if both failed, something else is wrong."
     )
 
-    count = (
-        _new_session(pg_engine)
-        .query(Message)
-        .filter(Message.message_id_header == shared_message_id)
-        .count()
-    )
+    # Own explicitly-closed session -- every other session in this file is
+    # closed in a finally block; this one previously wasn't (a bare
+    # `_new_session(pg_engine).query(...).count()` chain with no reference
+    # held to close it). Because a SQLAlchemy Session holds internal
+    # reference cycles (identity map <-> instances), CPython's refcounting
+    # alone does not reclaim it immediately -- it waits for the cyclic
+    # garbage collector, which is not deterministic. The result: the
+    # connection stayed checked out and "idle in transaction" for an
+    # unpredictable stretch, holding a lock that blocked this test's own
+    # pg_engine fixture teardown (TRUNCATE requires ACCESS EXCLUSIVE) --
+    # reproduced directly via pg_stat_activity while the suite hung.
+    count_session = _new_session(pg_engine)
+    try:
+        count = (
+            count_session.query(Message)
+            .filter(Message.message_id_header == shared_message_id)
+            .count()
+        )
+    finally:
+        count_session.close()
     assert count == 1, f"Exactly one message row should exist for this Message-ID, found {count}"
 
 
@@ -266,50 +290,82 @@ def test_concurrent_approval_only_sends_once(pg_engine):
     api/messages.py.
     """
     from mailer_agent.api.messages import approve_and_send_draft
+    from mailer_agent.config import get_settings
     from mailer_agent.models import Message, MessageDirection, MessageStatus, MessageType
 
-    contact_id, campaign_id = _seed_campaign_and_contact(pg_engine)
+    # See tests/test_approval_safety_gate.py's `live_sending` fixture for
+    # why send_email is faked here rather than left real: with
+    # live_sending_enabled=True (needed to pass api/messages.py's
+    # live-sending gate), mail/sender.py's own dry-run branch no longer
+    # applies and it would attempt a real SMTP connection.
+    import mailer_agent.api.messages as messages_api
+    from email.utils import make_msgid
 
-    session = _new_session(pg_engine)
-    msg = Message(
-        contact_id=contact_id, direction=MessageDirection.OUTBOUND.value,
-        message_type=MessageType.INITIAL.value, subject="test",
-        body="Hello, following up on our conversation.",
-        status=MessageStatus.DRAFT.value,
-    )
-    session.add(msg)
-    session.commit()
-    message_id = msg.id
-    session.close()
+    from mailer_agent.mail.sender import SendOutcome, SendResult
 
-    results = {}
-    barrier = threading.Barrier(2)
+    def fake_send_email(*, to_email, from_email, from_name, subject, body_text,
+                         reply_to=None, in_reply_to_header=None, references_header=None):
+        domain = from_email.split("@")[-1] if "@" in from_email else "localhost"
+        return SendResult(success=True, message_id=make_msgid(domain=domain), outcome=SendOutcome.SENT)
 
-    def approve(name):
+    settings = get_settings()
+    original_live_sending = settings.live_sending_enabled
+    original_send_email = messages_api.send_email
+    settings.live_sending_enabled = True
+    messages_api.send_email = fake_send_email
+    try:
+        contact_id, campaign_id = _seed_campaign_and_contact(pg_engine)
+
         session = _new_session(pg_engine)
-        try:
-            barrier.wait(timeout=5)
+        msg = Message(
+            contact_id=contact_id, direction=MessageDirection.OUTBOUND.value,
+            message_type=MessageType.INITIAL.value, subject="test",
+            body="Hello, following up on our conversation.",
+            status=MessageStatus.DRAFT.value,
+        )
+        session.add(msg)
+        session.commit()
+        message_id = msg.id
+        session.close()
+
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def approve(name):
+            session = _new_session(pg_engine)
             try:
-                approve_and_send_draft(message_id=message_id, org_id="org-concurrency", db=session)
-                results[name] = "sent"
-            except Exception as e:
-                results[name] = f"rejected: {type(e).__name__}"
+                barrier.wait(timeout=5)
+                try:
+                    approve_and_send_draft(message_id=message_id, org_id="org-concurrency", db=session)
+                    results[name] = "sent"
+                except Exception as e:
+                    results[name] = f"rejected: {type(e).__name__}"
+            finally:
+                session.close()
+
+        t1 = threading.Thread(target=approve, args=("a",))
+        t2 = threading.Thread(target=approve, args=("b",))
+        t1.start(); t2.start()
+        t1.join(timeout=10); t2.join(timeout=10)
+
+        sent_count = sum(1 for v in results.values() if v == "sent")
+        assert sent_count == 1, (
+            f"Exactly one concurrent approval request should succeed; the other "
+            f"must be rejected (blocked by the row lock until the first commits, "
+            f"then correctly sees status != DRAFT). Got: {results}"
+        )
+
+        # Same explicit-close discipline as the count query above -- see that
+        # comment for why a bare `_new_session(pg_engine).query(...)` chain
+        # leaks an idle-in-transaction connection.
+        status_session = _new_session(pg_engine)
+        try:
+            final_status = (
+                status_session.query(Message).filter(Message.id == message_id).first().status
+            )
         finally:
-            session.close()
-
-    t1 = threading.Thread(target=approve, args=("a",))
-    t2 = threading.Thread(target=approve, args=("b",))
-    t1.start(); t2.start()
-    t1.join(timeout=10); t2.join(timeout=10)
-
-    sent_count = sum(1 for v in results.values() if v == "sent")
-    assert sent_count == 1, (
-        f"Exactly one concurrent approval request should succeed; the other "
-        f"must be rejected (blocked by the row lock until the first commits, "
-        f"then correctly sees status != DRAFT). Got: {results}"
-    )
-
-    final_status = (
-        _new_session(pg_engine).query(Message).filter(Message.id == message_id).first().status
-    )
-    assert final_status == MessageStatus.SENT.value
+            status_session.close()
+        assert final_status == MessageStatus.SENT.value
+    finally:
+        settings.live_sending_enabled = original_live_sending
+        messages_api.send_email = original_send_email

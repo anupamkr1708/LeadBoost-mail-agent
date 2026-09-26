@@ -52,6 +52,8 @@ import json
 import logging
 from typing import Any
 
+from mailer_agent.llm.provider_v2 import LLMJsonResult, LLMTextResult
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,14 @@ class FakeLLMProvider:
         self._default: dict | str | None = None
         self.call_count = 0
         self.last_prompts: list[tuple[str, str]] = []
+        # Model-routing metadata the fake reports on every successful
+        # call -- override via set_model_used() for tests that need to
+        # exercise fallback/observability behavior downstream (e.g.
+        # asserting model_used propagates correctly into
+        # ClassificationResult/NextActionProposal/AgentDraft). Most
+        # tests don't care and can ignore this entirely.
+        self._model_used = "fake-model"
+        self._used_fallback = False
 
     # -- fixture setup ----------------------------------------------------
 
@@ -99,11 +109,20 @@ class FakeLLMProvider:
         """
         self._default = response
 
+    def set_model_used(self, model: str, used_fallback: bool = False) -> None:
+        """Override the model/fallback metadata reported on subsequent
+        successful calls -- for tests asserting observability fields
+        (model_used, used_fallback) propagate correctly downstream."""
+        self._model_used = model
+        self._used_fallback = used_fallback
+
     def reset(self) -> None:
         self._queue = []
         self._default = None
         self.call_count = 0
         self.last_prompts = []
+        self._model_used = "fake-model"
+        self._used_fallback = False
 
     # -- provider interface -----------------------------------------------
 
@@ -114,15 +133,23 @@ class FakeLLMProvider:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
-    ) -> dict[str, Any]:
+        json_schema: dict | None = None,
+        operation: str = "unknown",
+    ) -> LLMJsonResult:
         self.call_count += 1
         self.last_prompts.append((system_prompt, human_prompt))
         response = self._next_response()
         if isinstance(response, BaseException):
             raise response
-        if isinstance(response, str):
-            return json.loads(response)
-        return response
+        data = json.loads(response) if isinstance(response, str) else response
+        return LLMJsonResult(
+            data=data,
+            model_used=self._model_used,
+            requested_model=self._model_used,
+            attempts=1,
+            used_fallback=self._used_fallback,
+            response_mode="strict_schema" if json_schema else "json_object",
+        )
 
     def call_llm_text(
         self,
@@ -131,15 +158,21 @@ class FakeLLMProvider:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
-    ) -> str:
+        operation: str = "unknown",
+    ) -> LLMTextResult:
         self.call_count += 1
         self.last_prompts.append((system_prompt, human_prompt))
         response = self._next_response()
         if isinstance(response, BaseException):
             raise response
-        if isinstance(response, dict):
-            return json.dumps(response)
-        return response
+        text = json.dumps(response) if isinstance(response, dict) else response
+        return LLMTextResult(
+            text=text,
+            model_used=self._model_used,
+            requested_model=self._model_used,
+            attempts=1,
+            used_fallback=self._used_fallback,
+        )
 
     def _next_response(self) -> dict | str | BaseException:
         if self._queue:

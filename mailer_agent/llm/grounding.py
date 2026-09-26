@@ -228,22 +228,29 @@ def validate_grounding(
     unsupported: list[str] = []
     supported: list[str] = []
     notes: list[str] = []
+    review_reasons: list[str] = []
     pricing_flagged = False
 
     # ----------------------------------------------------------------
-    # 1. Pricing / availability special class — always flag for review
+    # 1. Pricing / availability special class — always flag for human
+    #    review. This is a REVIEW signal, not proof of fabrication: the
+    #    mention itself may be entirely truthful (e.g. "I'll get pricing
+    #    details together for you"), so it goes to review_reasons, never
+    #    to `unsupported`. A specific invented figure (a dollar amount,
+    #    percentage, etc. not traceable to an approved source) is caught
+    #    separately below in claim extraction and DOES land in
+    #    `unsupported` — that is the actual hard-block condition.
     # ----------------------------------------------------------------
     if _PRICING_TERMS.search(draft_body):
         pricing_flagged = True
         notes.append("Draft contains pricing/cost/availability language — requires human review.")
-        # Extract which terms were found
         found_pricing = list({m.group(0).lower() for m in _PRICING_TERMS.finditer(draft_body)})
-        unsupported.append(f"pricing-terms: {', '.join(sorted(found_pricing)[:5])}")
+        review_reasons.append(f"pricing-terms: {', '.join(sorted(found_pricing)[:5])}")
 
     if _AVAILABILITY_PATTERN.search(draft_body):
         pricing_flagged = True
         notes.append("Draft contains availability/launch timeline claim — requires human review.")
-        unsupported.append("availability-claim detected")
+        review_reasons.append("availability-claim detected")
 
     # ----------------------------------------------------------------
     # 2. Check each extracted claim against approved corpus
@@ -279,7 +286,12 @@ def validate_grounding(
     # ----------------------------------------------------------------
     # 3. Determine overall grounding status
     # ----------------------------------------------------------------
-    is_grounded = (len(unsupported) == 0) and (not pricing_flagged)
+    # is_grounded now tracks fabrication only (unsupported claims), not
+    # the review flag -- a pricing mention with no invented figure is
+    # fully "grounded" (nothing fabricated) while still review_required
+    # (a human should read it before it goes out). See GroundingValidation
+    # .hard_block / .is_safe_to_send for how these two dimensions combine.
+    is_grounded = len(unsupported) == 0
 
     if notes:
         validation_notes = "; ".join(notes)
@@ -312,4 +324,6 @@ def validate_grounding(
         supported_claims=supported,
         confidence=confidence,
         validation_notes=validation_notes,
+        review_required=pricing_flagged,
+        review_reasons=review_reasons,
     )

@@ -46,7 +46,33 @@ class IntegratedFollowUpEngine:
     
     def __init__(self):
         self.scheduler = FollowUpScheduler()
-    
+
+    @staticmethod
+    def _park_for_grounding_review(contact: Contact, kind: str, notes: str) -> None:
+        """
+        Take a contact out of every automatic scheduler path after an
+        outbound draft was held for grounding review.
+
+        The held draft stays a DRAFT for a human to approve (approval
+        re-runs grounding, see api/messages.py). Without this, the
+        contact would keep its scheduler-eligible status (NEW/ACTIVE)
+        and a due ``next_action_at``, so the next cycle would claim it
+        again and generate another draft, repeating until a human
+        happened to intervene.
+
+        Uses only the existing NEEDS_HUMAN -> NEEDS_REVIEW transition;
+        ``next_action_at = None`` and cleared claim fields are the same
+        "do not auto-retry" markers the UNKNOWN-send branches already use.
+        """
+        transition_contact_state(
+            contact,
+            StateTransitionEvent.NEEDS_HUMAN,
+            reason=f"{kind} held for grounding review: {notes}",
+        )
+        contact.next_action_at = None
+        contact.claimed_by = None
+        contact.claimed_at = None
+
     def send_initial_outreach(self, db: Session, contact: Contact) -> dict:
         """
         Send initial outreach with integrated tracking.
@@ -87,6 +113,9 @@ class IntegratedFollowUpEngine:
                 status=MessageStatus.DRAFT.value,
             )
             db.add(msg)
+            self._park_for_grounding_review(
+                contact, "Initial outreach", draft.grounding.validation_notes
+            )
             db.add(contact)
             db.flush()
             return {
@@ -234,6 +263,9 @@ class IntegratedFollowUpEngine:
                 in_reply_to_header=prior_msg_id_g,
             )
             db.add(msg)
+            self._park_for_grounding_review(
+                contact, "Follow-up", draft.grounding.validation_notes
+            )
             db.add(contact)
             db.flush()
             return {

@@ -36,7 +36,7 @@ from mailer_agent.models import (
     SuppressionEntry,
 )
 from mailer_agent.semantic.classifier import classify_prospect_reply
-from mailer_agent.semantic_models import IntentType, serialize_semantic_intent
+from mailer_agent.semantic_models import IntentType, attach_fact_provenance, serialize_semantic_intent
 from mailer_agent.state_machine import (
     StateTransitionEvent,
     infer_event_from_semantic_intent,
@@ -46,6 +46,36 @@ from mailer_agent.utils.datetime_utils import utcnow
 
 logger = logging.getLogger("mailer_agent.mail.reply_handler_v2")
 settings = get_settings()
+
+
+def _build_references_header(
+    parent_references: list[str], parent_in_reply_to: str | None, parent_message_id: str | None
+) -> str | None:
+    """
+    RFC 5322 References for a reply: the parent's own References chain
+    (its ancestors), then the parent's own In-Reply-To, then the
+    parent's own Message-ID -- in order, with no duplicates.
+
+    In-Reply-To is included as well as References because real mail
+    clients don't always populate References even when they do set
+    In-Reply-To (Gmail's first reply in a thread, in particular, sends
+    In-Reply-To with References empty) -- using References alone would
+    silently drop the immediate ancestor from the chain in exactly that
+    case. The immediate parent (parent_message_id) stays the last entry
+    here (and is separately set as In-Reply-To by the caller) -- this
+    just makes sure the rest of the ancestor chain isn't dropped on the
+    next hop.
+
+    Deterministic and protocol-level: never derived from anything the
+    LLM wrote.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for msg_id in (*parent_references, parent_in_reply_to, parent_message_id):
+        if msg_id and msg_id not in seen:
+            seen.add(msg_id)
+            ordered.append(msg_id)
+    return " ".join(ordered) if ordered else None
 
 
 def _normalize_message_id(value: str | None) -> str | None:
@@ -147,6 +177,7 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
         status=MessageStatus.RECEIVED.value,
         message_id_header=email_in.message_id,
         in_reply_to_header=email_in.in_reply_to,
+        references_header=" ".join(email_in.references) if email_in.references else None,
     )
     db.add(inbound_msg)
     try:
@@ -200,6 +231,19 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
     
     if classification_result.success and classification_result.semantic_intent:
         intent = classification_result.semantic_intent
+
+        # Deterministic provenance stamp (spec section 14) -- must happen
+        # here, not in the classifier: this is the one place that
+        # actually knows the inbound Message's real database id and
+        # observation time. The LLM only ever fills `supersedes` (see
+        # semantic/classifier.py's SUPERSESSION rule) -- it has no
+        # visibility into row ids or wall-clock time and must never be
+        # asked to invent them.
+        attach_fact_provenance(
+            intent,
+            source_message_id=inbound_msg.id,
+            observed_at=utcnow().isoformat(),
+        )
 
         # Native dict into the JSON column -- semantic_analysis is
         # Column(JSON), and SQLAlchemy's JSON type handles
@@ -290,6 +334,9 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
             _draft_and_maybe_send_reply(
                 db, contact, campaign, email_in, intent, result,
                 classification_source=classification_result.source,
+                classification_model_used=classification_result.model_used,
+                classification_used_fallback=classification_result.used_fallback,
+                classification_response_mode=classification_result.response_mode,
                 inbound_message_id=inbound_msg.id,
             )
     
@@ -408,17 +455,42 @@ def _handle_unsubscribe(db: Session, contact: Contact, result: dict):
     result["action"] = "suppressed"
 
 
-def _build_known_facts_summary(intent, contact: Contact) -> str:
+def _build_known_facts_summary(intent, contact: Contact, campaign) -> str:
     """
-    Facts for the planner prompt: accumulated conversation-wide facts
-    (memory.store.build_known_facts_context, pulled from every prior
-    classified inbound message's stored semantic_analysis) plus anything
-    new from THIS turn's intent that hasn't been persisted yet at the
-    point this runs. Deduplicated by simple text match -- this-turn
-    facts are appended after the accumulated ones so the planner sees
-    the most current information last.
+    Facts for the planner prompt: what's actually APPROVED to draw from
+    (the campaign's value_prop/proof_points and the contact's
+    context_notes -- the same sources llm/agent.py's Responder and
+    grounding.py's validator treat as authoritative) plus accumulated
+    conversation-wide facts (memory.store.build_known_facts_context,
+    pulled from every prior classified inbound message's stored
+    semantic_analysis) plus anything new from THIS turn's intent that
+    hasn't been persisted yet at the point this runs.
+
+    The approved-content block matters specifically for
+    PLANNER_SYSTEM_PROMPT's rule 2 ("only propose
+    provide_requested_information if it's the kind of thing that could
+    plausibly be answered from approved campaign materials") -- without
+    it, the planner was being asked to judge plausibility with no view
+    of what's actually approved, so it could only guess. It now sees the
+    same approved facts the Responder and grounding gate already use, so
+    its own instruction has something to check itself against instead
+    of assuming.
+
+    Deduplicated by simple text match -- this-turn facts are appended
+    after the accumulated ones so the planner sees the most current
+    information last.
     """
     from mailer_agent.memory.store import build_known_facts_context
+
+    approved_lines = [
+        f"value proposition: {campaign.value_prop}",
+        "proof points: "
+        + (campaign.proof_points or "(none approved -- nothing beyond the value proposition above is available)"),
+        "approved facts about this contact: " + (contact.context_notes or "(none recorded)"),
+    ]
+    approved = "Approved campaign/contact content (the only source of business facts a reply may draw from):\n" + "\n".join(
+        approved_lines
+    )
 
     accumulated = build_known_facts_context(contact)
     this_turn_lines = []
@@ -432,7 +504,7 @@ def _build_known_facts_summary(intent, contact: Contact) -> str:
     if intent.contradicted_facts:
         this_turn_lines.append(f"contradicts earlier (this message): {intent.contradicted_facts}")
 
-    parts = [p for p in (accumulated, "\n".join(this_turn_lines)) if p]
+    parts = [p for p in (approved, accumulated, "\n".join(this_turn_lines)) if p]
     return "\n".join(parts)
 
 
@@ -445,6 +517,9 @@ def _draft_and_maybe_send_reply(
     result: dict,
     *,
     classification_source: str = "unknown",
+    classification_model_used: str | None = None,
+    classification_used_fallback: bool | None = None,
+    classification_response_mode: str | None = None,
     inbound_message_id: int | None = None,
 ):
     """
@@ -471,7 +546,7 @@ def _draft_and_maybe_send_reply(
     proposal = plan_next_action(
         intent=intent,
         context_transcript=context_transcript,
-        known_facts=_build_known_facts_summary(intent, contact),
+        known_facts=_build_known_facts_summary(intent, contact, campaign),
     )
 
     # --- Guardrails: is that proposal eligible for auto-send? ---
@@ -548,20 +623,33 @@ def _draft_and_maybe_send_reply(
 
     can_auto_send = authorized.can_auto_send and not grounding_blocked and not suppressed
 
+    # Subject and threading are transport/application-layer facts, not
+    # wording -- the responder proposes draft.subject for content it
+    # originates (initial outreach, follow-ups), but a contextual reply
+    # stays in the prospect's existing thread deterministically. Letting
+    # an LLM-generated subject replace it would silently start a new
+    # thread in the recipient's mail client even though In-Reply-To/
+    # References still point at the right parent (see docs for the
+    # observed live-E2E case this fixes). Do not use draft.subject here.
+    reply_subject = as_reply_subject(email_in.subject)
+    reply_references = _build_references_header(
+        email_in.references, email_in.in_reply_to, email_in.message_id
+    )
+
     # Create reply message
     reply_msg = Message(
         contact_id=contact.id,
         direction=MessageDirection.OUTBOUND.value,
         message_type=MessageType.REPLY.value if action_type == "reply" else MessageType.CLOSING.value,
-        subject=draft.subject or as_reply_subject(email_in.subject),
+        subject=reply_subject,
         body=draft.body,
         status=MessageStatus.DRAFT.value,
         in_reply_to_header=email_in.message_id,
+        references_header=reply_references,
     )
 
     if can_auto_send:
         # Auto-send
-        reply_subject = draft.subject or as_reply_subject(email_in.subject)
         send_result = send_email(
             to_email=contact.email,
             from_email=campaign.sender_email,
@@ -570,6 +658,7 @@ def _draft_and_maybe_send_reply(
             body_text=draft.body,
             reply_to=campaign.reply_to_email,
             in_reply_to_header=email_in.message_id,
+            references_header=reply_references,
         )
 
         # Status mirrors send_result.outcome directly (sent/failed/unknown)
@@ -578,7 +667,6 @@ def _draft_and_maybe_send_reply(
         reply_msg.status = send_result.outcome.value
         reply_msg.message_id_header = send_result.message_id
         reply_msg.error_message = send_result.error
-        reply_msg.subject = reply_subject
 
         if send_result.success:
             contact.last_outbound_at = utcnow()
@@ -630,15 +718,24 @@ def _draft_and_maybe_send_reply(
         classification_source=classification_source,
         classification_success=True,
         semantic_intent_dict=serialize_semantic_intent(intent),
+        classifier_model_used=classification_model_used,
+        classifier_used_fallback=classification_used_fallback,
+        classifier_response_mode=classification_response_mode,
         prompt_version_planner=PLANNER_PROMPT_VERSION,
         planner_action_type=proposal.action_type.value,
         planner_objective=proposal.objective,
         planner_confidence=proposal.confidence,
         planner_source=proposal.source,
+        planner_model_used=proposal.model_used,
+        planner_used_fallback=proposal.used_fallback,
+        planner_response_mode=proposal.response_mode,
         guardrail_can_auto_send=authorized.can_auto_send,
         guardrail_review_reason=authorized.review_reason,
         draft_source=draft.source,
         grounding_safe=draft.grounding.is_safe_to_send if draft.grounding else None,
         grounding_notes=draft.grounding.validation_notes if draft.grounding else None,
+        draft_model_used=draft.model_used,
+        draft_used_fallback=draft.used_fallback,
+        draft_response_mode=draft.response_mode,
         final_action=result.get("action"),
     )
