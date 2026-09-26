@@ -290,57 +290,82 @@ def test_concurrent_approval_only_sends_once(pg_engine):
     api/messages.py.
     """
     from mailer_agent.api.messages import approve_and_send_draft
+    from mailer_agent.config import get_settings
     from mailer_agent.models import Message, MessageDirection, MessageStatus, MessageType
 
-    contact_id, campaign_id = _seed_campaign_and_contact(pg_engine)
+    # See tests/test_approval_safety_gate.py's `live_sending` fixture for
+    # why send_email is faked here rather than left real: with
+    # live_sending_enabled=True (needed to pass api/messages.py's
+    # live-sending gate), mail/sender.py's own dry-run branch no longer
+    # applies and it would attempt a real SMTP connection.
+    import mailer_agent.api.messages as messages_api
+    from email.utils import make_msgid
 
-    session = _new_session(pg_engine)
-    msg = Message(
-        contact_id=contact_id, direction=MessageDirection.OUTBOUND.value,
-        message_type=MessageType.INITIAL.value, subject="test",
-        body="Hello, following up on our conversation.",
-        status=MessageStatus.DRAFT.value,
-    )
-    session.add(msg)
-    session.commit()
-    message_id = msg.id
-    session.close()
+    from mailer_agent.mail.sender import SendOutcome, SendResult
 
-    results = {}
-    barrier = threading.Barrier(2)
+    def fake_send_email(*, to_email, from_email, from_name, subject, body_text,
+                         reply_to=None, in_reply_to_header=None, references_header=None):
+        domain = from_email.split("@")[-1] if "@" in from_email else "localhost"
+        return SendResult(success=True, message_id=make_msgid(domain=domain), outcome=SendOutcome.SENT)
 
-    def approve(name):
-        session = _new_session(pg_engine)
-        try:
-            barrier.wait(timeout=5)
-            try:
-                approve_and_send_draft(message_id=message_id, org_id="org-concurrency", db=session)
-                results[name] = "sent"
-            except Exception as e:
-                results[name] = f"rejected: {type(e).__name__}"
-        finally:
-            session.close()
-
-    t1 = threading.Thread(target=approve, args=("a",))
-    t2 = threading.Thread(target=approve, args=("b",))
-    t1.start(); t2.start()
-    t1.join(timeout=10); t2.join(timeout=10)
-
-    sent_count = sum(1 for v in results.values() if v == "sent")
-    assert sent_count == 1, (
-        f"Exactly one concurrent approval request should succeed; the other "
-        f"must be rejected (blocked by the row lock until the first commits, "
-        f"then correctly sees status != DRAFT). Got: {results}"
-    )
-
-    # Same explicit-close discipline as the count query above -- see that
-    # comment for why a bare `_new_session(pg_engine).query(...)` chain
-    # leaks an idle-in-transaction connection.
-    status_session = _new_session(pg_engine)
+    settings = get_settings()
+    original_live_sending = settings.live_sending_enabled
+    original_send_email = messages_api.send_email
+    settings.live_sending_enabled = True
+    messages_api.send_email = fake_send_email
     try:
-        final_status = (
-            status_session.query(Message).filter(Message.id == message_id).first().status
+        contact_id, campaign_id = _seed_campaign_and_contact(pg_engine)
+
+        session = _new_session(pg_engine)
+        msg = Message(
+            contact_id=contact_id, direction=MessageDirection.OUTBOUND.value,
+            message_type=MessageType.INITIAL.value, subject="test",
+            body="Hello, following up on our conversation.",
+            status=MessageStatus.DRAFT.value,
         )
+        session.add(msg)
+        session.commit()
+        message_id = msg.id
+        session.close()
+
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def approve(name):
+            session = _new_session(pg_engine)
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    approve_and_send_draft(message_id=message_id, org_id="org-concurrency", db=session)
+                    results[name] = "sent"
+                except Exception as e:
+                    results[name] = f"rejected: {type(e).__name__}"
+            finally:
+                session.close()
+
+        t1 = threading.Thread(target=approve, args=("a",))
+        t2 = threading.Thread(target=approve, args=("b",))
+        t1.start(); t2.start()
+        t1.join(timeout=10); t2.join(timeout=10)
+
+        sent_count = sum(1 for v in results.values() if v == "sent")
+        assert sent_count == 1, (
+            f"Exactly one concurrent approval request should succeed; the other "
+            f"must be rejected (blocked by the row lock until the first commits, "
+            f"then correctly sees status != DRAFT). Got: {results}"
+        )
+
+        # Same explicit-close discipline as the count query above -- see that
+        # comment for why a bare `_new_session(pg_engine).query(...)` chain
+        # leaks an idle-in-transaction connection.
+        status_session = _new_session(pg_engine)
+        try:
+            final_status = (
+                status_session.query(Message).filter(Message.id == message_id).first().status
+            )
+        finally:
+            status_session.close()
+        assert final_status == MessageStatus.SENT.value
     finally:
-        status_session.close()
-    assert final_status == MessageStatus.SENT.value
+        settings.live_sending_enabled = original_live_sending
+        messages_api.send_email = original_send_email

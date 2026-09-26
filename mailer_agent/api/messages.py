@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from mailer_agent.api.deps import get_current_org_id, require_api_key
+from mailer_agent.config import get_settings
 from mailer_agent.db import get_db
 from mailer_agent.followup.engine import is_suppressed
 from mailer_agent.llm.grounding import validate_grounding
@@ -21,6 +22,7 @@ from mailer_agent.models import Campaign, Contact, Message, MessageStatus, Suppr
 from mailer_agent.schemas import MessageOut, SuppressRequest
 
 logger = logging.getLogger("mailer_agent.api.messages")
+settings = get_settings()
 
 router = APIRouter(tags=["messages"], dependencies=[Depends(require_api_key)])
 
@@ -155,6 +157,28 @@ def approve_and_send_draft(
         if contact.messages and contact.messages[0].subject
         else campaign.sender_org
     )
+
+    # Live-sending boundary: config.py documents live_sending_enabled=False
+    # as "generated sends/replies are written to the DB as status=draft
+    # instead of actually being emailed" -- but this endpoint previously
+    # called send_email() regardless, and send_email()'s own dry-run
+    # branch returns success=True/SendOutcome.SENT (a deliberate
+    # simulation for generation-time drafting and for tests), which this
+    # endpoint then persisted as status=sent even though no SMTP
+    # transmission occurred. Reject explicitly here instead: the draft
+    # stays a draft, and re-approving once live sending is actually
+    # enabled works normally. This is the one boundary that must be
+    # honest about real delivery; send_email()'s own dry-run simulation
+    # is unchanged and still used elsewhere (drafting, tests).
+    if not settings.live_sending_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Live sending is disabled (LIVE_SENDING_ENABLED=false) -- "
+                "draft was not sent. Enable LIVE_SENDING_ENABLED and retry "
+                "approval to actually send."
+            ),
+        )
 
     result = send_email(
         to_email=contact.email,

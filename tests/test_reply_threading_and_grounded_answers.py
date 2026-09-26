@@ -422,6 +422,12 @@ def test_grounding_allows_answer_when_pricing_is_actually_approved(db_session):
 
 def test_approval_passes_references_header_to_send_email(db_session, monkeypatch):
     import mailer_agent.api.messages as messages_api
+    from mailer_agent.mail import sender
+
+    # This test's own point is the references_header plumbing, not the
+    # live-sending gate -- opt into live sending so approval reaches
+    # send_email() at all (see api/messages.py's boundary check).
+    monkeypatch.setattr(sender.settings, "live_sending_enabled", True)
 
     campaign = _campaign(db_session)
     contact = _contact(db_session, campaign)

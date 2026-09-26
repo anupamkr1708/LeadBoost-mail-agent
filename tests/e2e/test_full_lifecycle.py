@@ -250,8 +250,37 @@ class TestFullCampaignLifecycle:
         draft_id = draft_msgs[0]["id"]
 
         # 8. Approve the draft -- exercises the full outbound safety gate
-        #    (suppression + grounding recheck) via the real HTTP layer.
-        approve_resp = client.post(f"/messages/{draft_id}/approve")
+        #    (suppression + grounding recheck + live-sending gate) via
+        #    the real HTTP layer. live_sending_enabled is True only for
+        #    this call so approval passes the new gate in api/messages.py;
+        #    send_email is faked (not left real) because with the flag
+        #    True, mail/sender.py's own dry-run branch no longer applies
+        #    and it would attempt a real SMTP connection this sandbox
+        #    can't reach -- this fake mirrors that same dry-run
+        #    simulation instead (a real, correctly-shaped SendResult, no
+        #    socket touched), consistent with this file's stated design
+        #    of never touching a real socket.
+        import mailer_agent.api.messages as messages_api
+        from email.utils import make_msgid
+
+        from mailer_agent.config import get_settings
+        from mailer_agent.mail.sender import SendOutcome, SendResult
+
+        def fake_send_email(*, to_email, from_email, from_name, subject, body_text,
+                             reply_to=None, in_reply_to_header=None, references_header=None):
+            domain = from_email.split("@")[-1] if "@" in from_email else "localhost"
+            return SendResult(success=True, message_id=make_msgid(domain=domain), outcome=SendOutcome.SENT)
+
+        settings = get_settings()
+        original_live_sending = settings.live_sending_enabled
+        original_send_email = messages_api.send_email
+        settings.live_sending_enabled = True
+        messages_api.send_email = fake_send_email
+        try:
+            approve_resp = client.post(f"/messages/{draft_id}/approve")
+        finally:
+            settings.live_sending_enabled = original_live_sending
+            messages_api.send_email = original_send_email
         assert approve_resp.status_code == 200, approve_resp.text
         assert approve_resp.json()["status"] == "sent"
 
