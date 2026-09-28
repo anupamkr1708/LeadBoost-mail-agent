@@ -344,7 +344,10 @@ class ExternalDispatchState(str, enum.Enum):
       wire -- see api/integrations.py's response contract.
     SENDING -- claimed by a worker, about to/currently calling
       send_email(). Short-lived. Introduced in a later phase (worker
-      claiming); not set anywhere in this batch.
+      claiming); not set anywhere in this batch. See
+      resolve_expired_sending_lease() below for the one, corrected rule
+      governing what an *expired* SENDING lease recovers to -- read that
+      docstring before implementing any lease-recovery code (C6+).
     SENT / FAILED / UNKNOWN -- terminal-ish outcomes mirroring
       mail/sender.py's SendOutcome exactly. Introduced in a later phase;
       not set anywhere in this batch.
@@ -358,6 +361,61 @@ class ExternalDispatchState(str, enum.Enum):
     SENT = "sent"
     FAILED = "failed"
     UNKNOWN = "unknown"
+
+
+def resolve_expired_sending_lease() -> "ExternalDispatchState":
+    """
+    DESIGN CORRECTION, made explicit before any worker/lease-recovery
+    code exists (C6+ -- this function is not called by anything in
+    Batch 1; it exists to pin the rule down before that code is written).
+
+    An earlier design draft (the Phase B.2 reconciliation report's
+    crash/failure matrix) treated two situations differently:
+
+      (a) worker crashes after Transaction B commits but BEFORE
+          send_email() is ever called -- described there as safe to
+          requeue and retry, since "SMTP never happened";
+      (b) worker crashes DURING or AFTER the SMTP call -- correctly
+          described there (and in the governing project brief) as
+          UNKNOWN, never auto-resent.
+
+    That distinction is real in principle but is NOT SAFE to act on,
+    because this schema records no signal that distinguishes them.
+    ExternalDispatch.claimed_at records only when a worker claimed the
+    row, not whether that worker had reached send_email() yet. A
+    lease-expiry recovery sweep sees the identical row shape --
+    state=SENDING, claimed_at older than CLAIM_LEASE_SECONDS -- whether
+    the crash happened in case (a), mid-SMTP, or just after SMTP
+    accepted but before Transaction C committed. Since the recovery code
+    cannot tell these apart after the fact, it must not act as if it
+    could -- and must not default to the most optimistic of the
+    indistinguishable possibilities.
+
+    CORRECTED RULE, and the only one any future worker/lease-recovery
+    implementation may follow: an expired SENDING lease ALWAYS resolves
+    to UNKNOWN. It is never automatically moved back to QUEUED and never
+    automatically resent. This makes case (a) and case (b) above resolve
+    identically, which is the only choice consistent with not being able
+    to tell them apart.
+
+    The only way an expired SENDING row could safely become QUEUED again
+    is via a *separate*, positively persisted signal that specifically
+    proves send_email() was never invoked for that claim -- e.g. a
+    durably-recorded "SMTP call started" marker, written in its own
+    small transaction distinct from the claim itself, checked before
+    SMTP is attempted. No such signal exists in this schema today. This
+    function takes no arguments and has no conditional branch because
+    that signal does not exist yet; if a later phase deliberately adds
+    one, this function's contract -- and this file's tests -- are the
+    place to update, not a new ad hoc check inside the worker loop.
+
+    This mirrors mail/sender.py's own AmbiguousSendError philosophy
+    (never silently retried) and the "never blind auto-resend" language
+    the project brief already applies to the mid-SMTP and
+    post-SMTP-pre-Transaction-C cases -- this function removes the one
+    case that had drifted from that principle, so all three now agree.
+    """
+    return ExternalDispatchState.UNKNOWN
 
 
 class ExternalDispatch(Base):
