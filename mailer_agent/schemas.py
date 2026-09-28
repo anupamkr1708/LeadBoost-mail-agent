@@ -120,3 +120,47 @@ class ApproveDraftRequest(BaseModel):
 class SuppressRequest(BaseModel):
     email: EmailStr
     reason: str | None = "manual"
+
+
+# ---- LeadBoost integration (Phase C) --------------------------------------
+# See mailer_agent/api/integrations.py. Deliberately absent vs. any
+# older/other integration shape: no organization_id (tenant comes only
+# from the authenticated X-API-Key), no sender.* block, no SMTP
+# credential -- recipient/message only.
+
+class LeadBoostRecipientIn(BaseModel):
+    email: EmailStr
+    name: str | None = None
+
+
+class LeadBoostMessageIn(BaseModel):
+    # subject may legitimately be omitted (some transactional-style
+    # sends are body-only / reply-in-thread), but body is always
+    # required -- there is no draft_message() fallback on this path to
+    # fill it in. See mailer_agent/mail/exact_message.py (a later phase)
+    # for where this exact string is eventually handed to send_email()
+    # unmodified.
+    subject: str | None = None
+    body: str = Field(..., min_length=1)
+
+
+class LeadBoostOutreachActionIn(BaseModel):
+    # Correlation only -- see ExternalDispatch.external_action_id's
+    # docstring in models.py. Never used to resolve tenant, campaign, or
+    # contact.
+    external_action_id: str | None = None
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+    correlation_id: str | None = None
+    recipient: LeadBoostRecipientIn
+    message: LeadBoostMessageIn
+
+
+class LeadBoostOutreachActionAccepted(BaseModel):
+    """
+    accepted=true means "durably accepted by the Mailer Agent for
+    asynchronous dispatch" -- it does NOT mean sent, delivered, or even
+    SMTP-attempted. See ExternalDispatchState in models.py and
+    api/integrations.py's module docstring for the full outcome chain.
+    """
+    accepted: bool
+    mailing_agent_reference: str | None = None

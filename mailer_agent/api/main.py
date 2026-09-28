@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from mailer_agent.api import campaigns, contacts, messages, system, webhooks
+from mailer_agent.api import campaigns, contacts, integrations, messages, system, webhooks
 from mailer_agent.config import get_settings
 from mailer_agent.db import init_db
 from mailer_agent.followup.scheduler import start_scheduler, stop_scheduler
@@ -57,6 +57,7 @@ app.include_router(contacts.router)
 app.include_router(messages.router)
 app.include_router(webhooks.router)
 app.include_router(system.router)
+app.include_router(integrations.router)
 
 
 @app.get("/health")

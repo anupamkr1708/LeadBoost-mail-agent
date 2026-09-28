@@ -1,0 +1,426 @@
+"""
+External-integration API boundary (Phase C).
+
+This module is the *only* place an external, already-authorized caller
+(currently: LeadBoost) hands off an outreach action to the Mailer Agent.
+It is deliberately NOT built on top of any existing endpoint:
+
+  - NOT POST /campaigns/{id}/start -- that's for starting an entire
+    human-created campaign's worth of contacts, not accepting one
+    already-authorized action.
+  - NOT POST /messages/{id}/approve -- that's a second human-approval
+    gate. LeadBoost's own OutreachAction.APPROVED state *is* the
+    approval; routing this through /messages/{id}/approve a second time
+    would recreate the "two competing approval systems" problem this
+    design explicitly avoids.
+
+Outcome chain (see ExternalDispatchState in models.py for the full
+state machine -- this batch only ever produces QUEUED):
+
+    LeadBoost approved
+        != Mailer accepted        <- this endpoint, this batch
+        != Mailer worker claimed  <- later phase
+        != SMTP attempted         <- later phase
+        != SMTP sent               <- later phase
+        != recipient received
+
+`accepted=true` in this endpoint's response means only the second of
+those six things. Never collapse them.
+
+THIS BATCH (C2-C4) explicitly does NOT:
+  - call send_email() (mail/sender.py)
+  - call draft_message() or anything under llm/
+  - generate a Message-ID
+  - claim/dispatch work
+A later phase (C5+) adds all of that; this endpoint only durably records
+the request.
+
+Tenancy
+-------
+organization_id is resolved *exclusively* from the authenticated
+X-API-Key (get_current_org_id, see api/deps.py) and is never read from
+the request body. external_action_id, campaign_id, contact_id -- none of
+these select a tenant; they are either pure correlation data or are
+themselves scoped by a query that already filters on the authenticated
+org_id. See ExternalDispatch's docstring in models.py for why this
+matters (the inbound webhook's to_email-based tenant resolution in
+api/webhooks.py is the cautionary example of getting this wrong -- a
+pre-existing, separately tracked gap this module does not repeat).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from mailer_agent.api.deps import get_current_org_id, require_api_key
+from mailer_agent.config import get_settings
+from mailer_agent.db import get_db
+from mailer_agent.models import (
+    Campaign,
+    Contact,
+    ContactStatus,
+    ExternalDispatch,
+    ExternalDispatchState,
+    Message,
+    MessageDirection,
+    MessageStatus,
+    MessageType,
+)
+from mailer_agent.schemas import LeadBoostOutreachActionAccepted, LeadBoostOutreachActionIn
+
+logger = logging.getLogger("mailer_agent.api.integrations")
+
+router = APIRouter(
+    prefix="/integrations/leadboost",
+    tags=["integrations"],
+    dependencies=[Depends(require_api_key)],
+)
+
+# Fixed value identifying the one, deterministic, get-or-create Campaign
+# each organization's LeadBoost-originated sends live under. Not
+# user/caller-supplied -- a constant of this integration.
+LEADBOOST_INTEGRATION_SOURCE = "leadboost"
+
+
+# ---------------------------------------------------------------------------
+# Idempotency: request fingerprint
+# ---------------------------------------------------------------------------
+
+def _compute_request_fingerprint(
+    *,
+    external_action_id: str | None,
+    recipient_email: str,
+    recipient_name: str | None,
+    subject: str | None,
+    body: str,
+) -> str:
+    """
+    SHA-256 hex digest over a canonical (sorted-key, separator-fixed)
+    JSON serialization of the fields that define "what this request is
+    asking to send". Used to distinguish a safe replay of a known
+    idempotency_key (same fingerprint -> return existing operation) from
+    caller misuse (different fingerprint -> 409, no mutation).
+
+    Deliberately NOT dependent on correlation_id or idempotency_key
+    themselves -- those identify the *operation*, not its content.
+    """
+    payload = {
+        "external_action_id": external_action_id,
+        "recipient_email": recipient_email,
+        "recipient_name": recipient_name,
+        "subject": subject,
+        "body": body,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Campaign get-or-create (C4)
+# ---------------------------------------------------------------------------
+
+def _get_or_create_integration_campaign(db: Session, org_id: str) -> Campaign:
+    """
+    Exactly one Campaign per organization carries
+    integration_source="leadboost" -- this is the fixed, deterministic
+    home for every LeadBoost-originated Contact/Message, never one
+    campaign per action. See uq_campaigns_org_integration_source in
+    models.py for the DB constraint this relies on as the actual race
+    backstop.
+
+    Race-safe by construction, not by timing: query first; if absent,
+    attempt an insert and commit it as its own short transaction; if
+    that insert loses a race (another concurrent first-use request won),
+    the unique index raises IntegrityError, we roll back just that
+    attempt, and re-read the winner's row. Exactly one integration
+    campaign per org, guaranteed by the database.
+
+    Committing this as its own transaction (rather than folding it into
+    the same transaction as the Message/ExternalDispatch write later)
+    is deliberate: it keeps this idempotent, reusable get-or-create step
+    fully independent of whatever happens afterward in the caller, so a
+    later failure elsewhere in the request never needs to roll back a
+    Campaign row that's perfectly fine to have created and that the next
+    request would just recreate anyway.
+    """
+    campaign = (
+        db.query(Campaign)
+        .filter(
+            Campaign.organization_id == org_id,
+            Campaign.integration_source == LEADBOOST_INTEGRATION_SOURCE,
+        )
+        .first()
+    )
+    if campaign is not None:
+        return campaign
+
+    # See config.py's leadboost_integration_sender_* docstring for why
+    # this fallback exists and why it is deployment-level, not per-org --
+    # a known, explicitly-recorded open item, not a silent guess.
+    settings = get_settings()
+    if not settings.leadboost_integration_sender_email:
+        logger.error(
+            "LeadBoost integration campaign creation blocked for org=%s: "
+            "LEADBOOST_INTEGRATION_SENDER_EMAIL is not configured on this deployment.",
+            org_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "LeadBoost integration is not configured on this Mailer Agent "
+                "deployment (missing sender identity). Contact the operator."
+            ),
+        )
+
+    campaign = Campaign(
+        name="LeadBoost Integration",
+        organization_id=org_id,
+        integration_source=LEADBOOST_INTEGRATION_SOURCE,
+        sender_name=settings.leadboost_integration_sender_name,
+        sender_org=settings.leadboost_integration_sender_org,
+        sender_email=settings.leadboost_integration_sender_email,
+        value_prop=(
+            "LeadBoost-authorized outreach -- every message sent under this "
+            "campaign is supplied verbatim per action by LeadBoost; this "
+            "campaign's own value_prop is never used to draft or alter any "
+            "message."
+        ),
+        follow_up_days=[],
+        max_follow_ups=0,
+    )
+    db.add(campaign)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        campaign = (
+            db.query(Campaign)
+            .filter(
+                Campaign.organization_id == org_id,
+                Campaign.integration_source == LEADBOOST_INTEGRATION_SOURCE,
+            )
+            .first()
+        )
+        if campaign is None:
+            # Genuinely unexpected -- the IntegrityError wasn't the
+            # uniqueness race we expected, or the winner's row somehow
+            # isn't visible. Don't silently swallow this.
+            raise
+        return campaign
+
+    db.refresh(campaign)
+    return campaign
+
+
+# ---------------------------------------------------------------------------
+# Contact get-or-create (C4)
+# ---------------------------------------------------------------------------
+
+def _get_or_create_integration_contact(
+    db: Session, campaign_id: int, email: str, name: str | None
+) -> Contact:
+    """
+    Same uq_contacts_campaign_email backstop ingest_leads already relies
+    on (models.py, api/campaigns.py) -- reused as-is, not reimplemented.
+
+    CONTACT SAFETY (C4): next_action_at is explicitly left NULL, on both
+    the create and the reuse path. claim_due_contacts (the normal
+    follow-up scheduler's query, followup/work_claiming.py) only ever
+    picks up rows where next_action_at IS NOT NULL AND next_action_at <=
+    now -- so as long as this stays NULL, this contact can never be
+    picked up by dispatch_new_contacts_job/dispatch_followups_job and
+    sent a second, LLM-drafted message. Nothing in this function sets
+    next_action_at to anything else; nothing elsewhere in this batch
+    touches this contact's next_action_at either. See
+    tests/test_leadboost_integration.py for the regression test.
+    """
+    contact = (
+        db.query(Contact)
+        .filter(Contact.campaign_id == campaign_id, Contact.email == email)
+        .first()
+    )
+    if contact is not None:
+        return contact
+
+    contact = Contact(
+        campaign_id=campaign_id,
+        name=name,
+        email=email,
+        status=ContactStatus.NEW.value,
+        next_action_at=None,  # explicit, not just relying on the column default -- see docstring
+    )
+    db.add(contact)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        contact = (
+            db.query(Contact)
+            .filter(Contact.campaign_id == campaign_id, Contact.email == email)
+            .first()
+        )
+        if contact is None:
+            raise
+        return contact
+
+    db.refresh(contact)
+    return contact
+
+
+# ---------------------------------------------------------------------------
+# Response helper
+# ---------------------------------------------------------------------------
+
+def _accepted_response(dispatch: ExternalDispatch) -> LeadBoostOutreachActionAccepted:
+    return LeadBoostOutreachActionAccepted(
+        accepted=True,
+        mailing_agent_reference=dispatch.public_reference,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /integrations/leadboost/outreach-actions
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/outreach-actions",
+    response_model=LeadBoostOutreachActionAccepted,
+    status_code=202,
+)
+def create_leadboost_outreach_action(
+    payload: LeadBoostOutreachActionIn,
+    org_id: str = Depends(get_current_org_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Transaction A (see project brief). Durably records an
+    already-authorized LeadBoost outreach action for later, asynchronous
+    dispatch. Does not send anything.
+
+    1. org_id resolved from X-API-Key (dependency, above).
+    2. payload validated by LeadBoostOutreachActionIn.
+    3. idempotency lookup, scoped to org_id in the query predicate itself.
+    4. same fingerprint -> return the existing operation, no mutation.
+       different fingerprint -> 409, no mutation.
+    5. otherwise: get-or-create integration Campaign, get-or-create
+       Contact (next_action_at forced NULL), create Message (DRAFT,
+       exact caller-supplied subject/body), create
+       ExternalDispatch(state=queued).
+    6. commit, return 202 {"accepted": true, "mailing_agent_reference": ...}
+    """
+    fingerprint = _compute_request_fingerprint(
+        external_action_id=payload.external_action_id,
+        recipient_email=payload.recipient.email,
+        recipient_name=payload.recipient.name,
+        subject=payload.message.subject,
+        body=payload.message.body,
+    )
+
+    existing = (
+        db.query(ExternalDispatch)
+        .filter(
+            ExternalDispatch.organization_id == org_id,
+            ExternalDispatch.idempotency_key == payload.idempotency_key,
+        )
+        .first()
+    )
+    if existing is not None:
+        if existing.request_fingerprint == fingerprint:
+            logger.info(
+                "Idempotent replay: org=%s idempotency_key=%s -> existing dispatch %s (no mutation)",
+                org_id, payload.idempotency_key, existing.public_reference,
+            )
+            return _accepted_response(existing)
+        logger.warning(
+            "Idempotency key reused with a different payload: org=%s idempotency_key=%s",
+            org_id, payload.idempotency_key,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "idempotency_key has already been used with a different request "
+                "payload. Use a new idempotency_key for a genuinely new action."
+            ),
+        )
+
+    campaign = _get_or_create_integration_campaign(db, org_id)
+    contact = _get_or_create_integration_contact(
+        db, campaign.id, payload.recipient.email, payload.recipient.name
+    )
+
+    message = Message(
+        contact_id=contact.id,
+        direction=MessageDirection.OUTBOUND.value,
+        message_type=MessageType.INITIAL.value,
+        subject=payload.message.subject,
+        body=payload.message.body,
+        status=MessageStatus.DRAFT.value,
+    )
+    db.add(message)
+    db.flush()  # assign message.id without committing yet
+
+    dispatch = ExternalDispatch(
+        organization_id=org_id,
+        idempotency_key=payload.idempotency_key,
+        external_action_id=payload.external_action_id,
+        correlation_id=payload.correlation_id,
+        campaign_id=campaign.id,
+        contact_id=contact.id,
+        message_id=message.id,
+        request_fingerprint=fingerprint,
+        public_reference=uuid.uuid4().hex,
+        state=ExternalDispatchState.QUEUED.value,
+    )
+    db.add(dispatch)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a concurrent race on (organization_id, idempotency_key)
+        # against an identical request -- the Message we just flushed is
+        # rolled back along with everything else in this transaction, and
+        # we re-read the winner's row instead. See ExternalDispatch's
+        # docstring in models.py: this constraint is the actual
+        # idempotency backstop, not the pre-check above.
+        db.rollback()
+        winner = (
+            db.query(ExternalDispatch)
+            .filter(
+                ExternalDispatch.organization_id == org_id,
+                ExternalDispatch.idempotency_key == payload.idempotency_key,
+            )
+            .first()
+        )
+        if winner is None:
+            raise
+        if winner.request_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "idempotency_key has already been used with a different "
+                    "request payload. Use a new idempotency_key for a genuinely "
+                    "new action."
+                ),
+            )
+        logger.info(
+            "Concurrent identical request converged on existing dispatch: "
+            "org=%s idempotency_key=%s -> %s",
+            org_id, payload.idempotency_key, winner.public_reference,
+        )
+        return _accepted_response(winner)
+
+    db.refresh(dispatch)
+    logger.info(
+        "Accepted LeadBoost outreach action: org=%s external_action_id=%s "
+        "correlation_id=%s -> dispatch=%s contact=%s message=%s",
+        org_id, payload.external_action_id, payload.correlation_id,
+        dispatch.public_reference, contact.id, message.id,
+    )
+    return _accepted_response(dispatch)
