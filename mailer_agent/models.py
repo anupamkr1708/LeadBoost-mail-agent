@@ -31,6 +31,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -112,6 +113,30 @@ class MessageStatus(str, enum.Enum):
 
 class Campaign(Base):
     __tablename__ = "campaigns"
+    __table_args__ = (
+        # Phase C (LeadBoost integration): at most one campaign per
+        # organization may carry a given integration_source value.
+        # integration_source is NULL for every ordinary, human-created
+        # campaign, and both PostgreSQL and SQLite treat NULL as
+        # distinct-from-itself in a unique index -- so this constraint is
+        # inert for all existing/ordinary campaigns and only bites once a
+        # second campaign for the same org tries to claim the same
+        # non-NULL integration_source (e.g. two concurrent "first use"
+        # requests both trying to create the one leadboost campaign for
+        # an org -- see api/integrations.py's get-or-create, which relies
+        # on this exact constraint as its race backstop, the same
+        # "app checks, DB enforces" pattern already used by
+        # uq_contacts_campaign_email below). A plain unique INDEX (not a
+        # named UNIQUE CONSTRAINT) so the equivalent migration DDL
+        # (CREATE UNIQUE INDEX ...) works unchanged on both PostgreSQL and
+        # SQLite -- SQLite has no ALTER TABLE ... ADD CONSTRAINT.
+        Index(
+            "uq_campaigns_org_integration_source",
+            "organization_id",
+            "integration_source",
+            unique=True,
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
@@ -119,6 +144,14 @@ class Campaign(Base):
     # Multi-tenancy: Organization ownership
     # Each campaign belongs to exactly one organization (LeadBoost customer)
     organization_id = Column(String, nullable=True, index=True)  # Nullable for migration compatibility
+
+    # Phase C (LeadBoost integration): which external integration this
+    # campaign is the fixed, deterministic home for -- e.g. "leadboost".
+    # NULL for every ordinary, human-created campaign; never set or read
+    # by any pre-existing code path. See uq_campaigns_org_integration_source
+    # above and api/integrations.py's get-or-create for how exactly one
+    # such campaign per organization is guaranteed.
+    integration_source = Column(String, nullable=True, index=True)
 
     # Sender identity -- who this campaign is "from"
     sender_name = Column(String, nullable=False)
@@ -292,6 +325,160 @@ class Message(Base):
         # inbound-message insert, and tests/test_postgresql_concurrency.py.
         UniqueConstraint("message_id_header", name="uq_messages_message_id_header"),
     )
+
+
+class ExternalDispatchState(str, enum.Enum):
+    """
+    Dispatch-operation lifecycle for an externally-authorized outreach
+    action (Phase C / LeadBoost integration).
+
+    Deliberately NOT the same state machine as LeadBoost's own
+    OutreachAction (PENDING_REVIEW -> APPROVED -> DISPATCHING ->
+    SUBMITTED): that lifecycle is LeadBoost's authorization/handoff
+    record; this one tracks what *this* service has done with the
+    dispatch operation after accepting it. See models.py module docstring
+    context and mailer_agent/api/integrations.py.
+
+    QUEUED  -- durably accepted (Transaction A committed), not yet
+      claimed by a worker. This is what accepted=true maps to over the
+      wire -- see api/integrations.py's response contract.
+    SENDING -- claimed by a worker, about to/currently calling
+      send_email(). Short-lived. Introduced in a later phase (worker
+      claiming); not set anywhere in this batch.
+    SENT / FAILED / UNKNOWN -- terminal-ish outcomes mirroring
+      mail/sender.py's SendOutcome exactly. Introduced in a later phase;
+      not set anywhere in this batch.
+
+    This batch (C2-C4) only ever creates rows in QUEUED. The other four
+    values are defined now so the column's full vocabulary is fixed
+    before any code writes to it, but nothing in this batch sets them.
+    """
+    QUEUED = "queued"
+    SENDING = "sending"
+    SENT = "sent"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class ExternalDispatch(Base):
+    """
+    One durable record of a single externally-authorized outreach
+    dispatch operation (Phase C / LeadBoost integration, and designed to
+    be reusable for any future external caller, not LeadBoost-specific
+    at the schema level).
+
+    This is the actual idempotency backstop for the integration endpoint
+    (mailer_agent/api/integrations.py): UNIQUE(organization_id,
+    idempotency_key) is enforced by the database, not only checked in
+    application code, so two concurrent identical requests can only ever
+    produce one row (the loser's IntegrityError is caught, and the
+    winner's row is re-read and returned -- see
+    api/integrations.py::create_leadboost_outreach_action).
+
+    request_fingerprint lets a replay of the same idempotency_key be
+    distinguished from caller misuse: same key + same fingerprint is a
+    safe replay (return the existing operation, no new send); same key +
+    different fingerprint is rejected (409, zero mutation) rather than
+    silently overwriting what the key already refers to.
+
+    organization_id is populated *only* from the authenticated
+    X-API-Key -> org_id resolution (api/deps.py::get_current_org_id),
+    never from the request body -- see api/integrations.py. Every query
+    against this table must filter on organization_id in the query
+    predicate itself (WHERE organization_id = ... AND ...), never
+    fetch-then-check, so a key from one org can never read or mutate
+    another org's dispatch even if it somehow guesses a valid
+    idempotency_key or public_reference.
+
+    external_action_id is the caller's own correlation id (e.g.
+    LeadBoost's OutreachAction.id) -- stored for observability only and
+    NEVER used to resolve a tenant, campaign, or contact. Confusing
+    "correlation data" with "authorization data" is exactly the bug this
+    column's docstring exists to prevent (see the inbound webhook's
+    to_email-based tenant resolution in api/webhooks.py for what that
+    mistake actually looks like in this codebase today -- a separate,
+    already-tracked gap this table's design deliberately does not
+    repeat).
+
+    public_reference is the opaque identifier actually handed back to
+    the caller (as mailing_agent_reference) and used for the
+    reconciliation lookup -- never the internal sequential `id`, so the
+    external API surface doesn't leak enumerable row counts across the
+    tenant boundary.
+
+    claimed_by / claimed_at follow the exact same lease shape as
+    Contact's own work-claiming fields (see followup/work_claiming.py) --
+    introduced now so the column exists, but not written to by anything
+    in this batch; a later phase generalizes work_claiming.py's claim
+    logic to this table.
+    """
+
+    __tablename__ = "external_dispatches"
+    __table_args__ = (
+        # THE idempotency guarantee (see class docstring) -- DB-enforced,
+        # not an in-memory or best-effort application check.
+        UniqueConstraint(
+            "organization_id", "idempotency_key",
+            name="uq_external_dispatches_org_idempotency_key",
+        ),
+        # public_reference is handed out externally as the sole
+        # reconciliation handle -- it must never collide across
+        # organizations either.
+        UniqueConstraint(
+            "public_reference", name="uq_external_dispatches_public_reference",
+        ),
+        # Supports the expired-lease sweep a later phase adds (same
+        # reasoning as idx_contacts_claimed_by in
+        # migrations/002_work_claiming.py).
+        Index("ix_external_dispatches_claimed_by", "claimed_by"),
+        # Covers the work-claim query a later phase adds: something like
+        # WHERE state = 'queued' OR (state = 'sending' AND claimed_at < cutoff).
+        Index("ix_external_dispatches_state_claimed_at", "state", "claimed_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Tenancy -- see class docstring. NOT NULL: every dispatch belongs to
+    # exactly one authenticated organization from the moment it's created.
+    organization_id = Column(String, nullable=False, index=True)
+
+    idempotency_key = Column(String, nullable=False)
+
+    # Correlation only -- see class docstring. Never used for tenant/
+    # campaign/contact resolution.
+    external_action_id = Column(String, nullable=True)
+    correlation_id = Column(String, nullable=True)
+
+    campaign_id = Column(Integer, ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False)
+    contact_id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False)
+    # Set in the same transaction that creates this row (Transaction A) --
+    # never nullable, unlike a "resolved later" design would need.
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)
+
+    # SHA-256 hex digest over a canonical JSON serialization of
+    # {external_action_id, recipient_email, recipient_name, subject,
+    # body} -- see api/integrations.py::_compute_request_fingerprint.
+    request_fingerprint = Column(String, nullable=False)
+
+    # Opaque external handle -- see class docstring. uuid4 hex, generated
+    # at creation time, never the internal sequential `id`.
+    public_reference = Column(String, nullable=False)
+
+    state = Column(String, nullable=False, default=ExternalDispatchState.QUEUED.value, index=True)
+
+    # Not index=True here -- ix_external_dispatches_claimed_by above
+    # already covers this column; index=True would create a duplicate.
+    claimed_by = Column(String, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    campaign = relationship("Campaign")
+    contact = relationship("Contact")
+    message = relationship("Message")
 
 
 class SuppressionEntry(Base):

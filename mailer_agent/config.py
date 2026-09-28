@@ -111,6 +111,53 @@ class Settings(BaseSettings):
     # -- see mailer_agent/api/deps.py for the full resolution order.
     api_key: str = ""  # if set, required as `X-API-Key` header on all routes
 
+    # --- LeadBoost integration (Phase C) ----------------------------------
+    # KNOWN OPEN ITEM, recorded explicitly rather than guessed around (see
+    # Batch 1 report): the LeadBoost integration's request contract
+    # (mailer_agent/api/integrations.py) deliberately carries no `sender.*`
+    # block -- LeadBoost's own OutreachAction already stopped sending SMTP
+    # credentials over the wire, and this integration goes further and
+    # sends no sender identity at all, per request. But Campaign.sender_name
+    # / sender_org / sender_email are NOT NULL columns (see models.py), and
+    # the one, fixed, per-organization "leadboost" integration Campaign
+    # (get-or-created by api/integrations.py) still has to satisfy that
+    # constraint at creation time -- there is no way around this without
+    # either (a) making those columns nullable (a real schema change to an
+    # existing table used by every other campaign, explicitly out of scope
+    # for this batch) or (b) putting a sender.* block back in the request
+    # body (explicitly rejected by the brief this batch was built against).
+    #
+    # The smallest valid solution that adds no new architecture and
+    # changes no existing table's nullability: a fixed, deployment-level
+    # sender identity for the LeadBoost integration specifically,
+    # configured here exactly like every other tunable value in this file
+    # (SMTP_HOST, IMAP_HOST, etc.) -- NOT a per-organization value, and
+    # explicitly flagged as such. This mirrors the SMTP settings' own
+    # pre-existing shape: this codebase already sends every ordinary,
+    # non-integration campaign through one deployment-wide SMTP identity
+    # (smtp_username/smtp_password above) regardless of which
+    # organization's campaign it is, so a single deployment-wide sender
+    # identity for the one LeadBoost-integration campaign per org is not a
+    # new kind of limitation, just the same existing one applied to a new
+    # campaign.
+    #
+    # Fails closed (see api/integrations.py's get-or-create): if
+    # leadboost_integration_sender_email is empty, the *first* LeadBoost
+    # dispatch for any organization returns 503 rather than silently
+    # inserting a placeholder/garbage sender identity into a real Campaign
+    # row. Once any organization's integration Campaign has been created,
+    # subsequent requests for that org reuse the existing row and do not
+    # re-check this setting.
+    #
+    # Real per-organization sender identity (e.g. derived from LeadBoost's
+    # own verified EmailAccount, passed once at credential-provisioning
+    # time rather than per-request) is an explicit open item for a later
+    # phase (see the Batch 1 report's "SENDER IDENTITY DECISION" section),
+    # not solved here.
+    leadboost_integration_sender_email: str = ""
+    leadboost_integration_sender_name: str = "LeadBoost Outreach"
+    leadboost_integration_sender_org: str = "LeadBoost"
+
     @property
     def llm_fallback_models_list(self) -> list[str]:
         """llm_fallback_models parsed into an ordered list, empty entries
