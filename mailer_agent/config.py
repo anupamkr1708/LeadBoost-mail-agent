@@ -171,6 +171,35 @@ class Settings(BaseSettings):
     leadboost_integration_sender_name: str = "LeadBoost Outreach"
     leadboost_integration_sender_org: str = "LeadBoost"
 
+    # --- LeadBoost async dispatch worker (Phase C6-C8) ------------------------
+    # ExternalDispatch rows are processed by a DEDICATED job on its own
+    # cadence. Do not reuse followup_poll_seconds (300 s): that would add up
+    # to five minutes of queue latency to every accepted LeadBoost dispatch.
+    external_dispatch_poll_seconds: int = 15
+    # Separate, independent recovery sweep for expired SENDING leases. It is
+    # its own job so it still fires while the dispatch job is blocked inside
+    # a (slow) SMTP call.
+    external_dispatch_recovery_poll_seconds: int = 60
+    # Upper bound on dispatches processed per poll cycle. Each is claimed
+    # one at a time, immediately before it is processed, so a claim never
+    # sits idle behind other sends and ages towards its lease.
+    external_dispatch_max_per_cycle: int = 5
+    # Lease for a SENDING ExternalDispatch. DELIBERATELY separate from
+    # CLAIM_LEASE_SECONDS (300 s, contact claims -- unchanged). The SMTP
+    # path in mail/sender.py has NO overall deadline: timeout=30 is a
+    # per-socket-operation timeout, up to 3 attempts, and a blackholed
+    # connect to a multi-address host can legitimately exceed 300 s. An
+    # expired SENDING lease resolves to UNKNOWN (never QUEUED, never an
+    # automatic resend -- see models.resolve_expired_sending_lease), so an
+    # undersized lease does not cause a duplicate, but it does discard the
+    # real outcome of a still-running send. 900 s clears the measured
+    # worst realistic case with margin.
+    external_dispatch_lease_seconds: int = 900
+    # On SIGTERM: how long the worker waits for in-flight dispatches to
+    # finish before marking the ones it still owns UNKNOWN. Keep it under
+    # the platform's shutdown grace period.
+    external_dispatch_shutdown_drain_seconds: float = 25.0
+
     @property
     def llm_fallback_models_list(self) -> list[str]:
         """llm_fallback_models parsed into an ordered list, empty entries
