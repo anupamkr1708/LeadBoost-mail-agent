@@ -137,9 +137,9 @@ class LeadBoostMessageIn(BaseModel):
     # subject may legitimately be omitted (some transactional-style
     # sends are body-only / reply-in-thread), but body is always
     # required -- there is no draft_message() fallback on this path to
-    # fill it in. See mailer_agent/mail/exact_message.py (a later phase)
-    # for where this exact string is eventually handed to send_email()
-    # unmodified.
+    # fill it in. See mailer_agent/mail/exact_message.py: it stores this
+    # exact string as the one Message and defines the ExactSendInput a
+    # later phase hands to send_email() unmodified.
     subject: str | None = None
     body: str = Field(..., min_length=1)
 
