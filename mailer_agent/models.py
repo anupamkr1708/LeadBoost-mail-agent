@@ -151,7 +151,19 @@ class Campaign(Base):
     # by any pre-existing code path. See uq_campaigns_org_integration_source
     # above and api/integrations.py's get-or-create for how exactly one
     # such campaign per organization is guaranteed.
-    integration_source = Column(String, nullable=True, index=True)
+    #
+    # No index=True here (Batch 1.1 cleanup): a standalone single-column
+    # index on this column alone would be redundant today --
+    # uq_campaigns_org_integration_source above already covers any query
+    # that filters on (organization_id, integration_source) together,
+    # which is every query that currently exists (grep confirms nothing
+    # in this codebase filters by integration_source without
+    # organization_id also in the predicate). A standalone index here
+    # would only add write overhead with no query-planning benefit for
+    # any access pattern that exists today. If a future admin/reporting
+    # need arises to query across all organizations by integration_source
+    # alone, add it back then, deliberately, for that need.
+    integration_source = Column(String, nullable=True)
 
     # Sender identity -- who this campaign is "from"
     sender_name = Column(String, nullable=False)
@@ -339,9 +351,13 @@ class ExternalDispatchState(str, enum.Enum):
     dispatch operation after accepting it. See models.py module docstring
     context and mailer_agent/api/integrations.py.
 
-    QUEUED  -- durably accepted (Transaction A committed), not yet
-      claimed by a worker. This is what accepted=true maps to over the
-      wire -- see api/integrations.py's response contract.
+    QUEUED  -- durably accepted (the endpoint's final commit -- Message
+      + ExternalDispatch created together, see
+      api/integrations.py::create_leadboost_outreach_action's
+      transaction-boundary docstring for why that's the one commit that
+      matters -- has landed), not yet claimed by a worker. This is what
+      accepted=true maps to over the wire -- see api/integrations.py's
+      response contract.
     SENDING -- claimed by a worker, about to/currently calling
       send_email(). Short-lived. Introduced in a later phase (worker
       claiming); not set anywhere in this batch. See
@@ -555,7 +571,13 @@ class ExternalDispatch(Base):
     # at creation time, never the internal sequential `id`.
     public_reference = Column(String, nullable=False)
 
-    state = Column(String, nullable=False, default=ExternalDispatchState.QUEUED.value, index=True)
+    # Not index=True here -- ix_external_dispatches_state_claimed_at
+    # below already covers this column: state is the LEADING column of
+    # that composite index, so any state-only query is already served by
+    # it via the standard leftmost-prefix rule (Batch 1.1 cleanup --
+    # index=True here was redundant from the start, since the composite
+    # index was always going to exist for the worker claim query).
+    state = Column(String, nullable=False, default=ExternalDispatchState.QUEUED.value)
 
     # Not index=True here -- ix_external_dispatches_claimed_by above
     # already covers this column; index=True would create a duplicate.

@@ -351,20 +351,49 @@ def create_leadboost_outreach_action(
     db: Session = Depends(get_db),
 ):
     """
-    Transaction A (see project brief). Durably records an
-    already-authorized LeadBoost outreach action for later, asynchronous
-    dispatch. Does not send anything.
+    Durably records an already-authorized LeadBoost outreach action for
+    later, asynchronous dispatch. Does not send anything.
+
+    TRANSACTION BOUNDARIES (corrected in Batch 1.1 -- this docstring
+    previously said "Transaction A" as if this were one atomic SQL
+    transaction; it is not, and this is intentional, not an oversight):
 
     1. org_id resolved from X-API-Key (dependency, above).
     2. payload validated by LeadBoostOutreachActionIn.
     3. idempotency lookup, scoped to org_id in the query predicate itself.
-    4. same fingerprint -> return the existing operation, no mutation.
-       different fingerprint -> 409, no mutation.
-    5. otherwise: get-or-create integration Campaign, get-or-create
-       Contact (next_action_at forced NULL), create Message (DRAFT,
-       exact caller-supplied subject/body), create
-       ExternalDispatch(state=queued).
-    6. commit, return 202 {"accepted": true, "mailing_agent_reference": ...}
+       same fingerprint -> return the existing operation, no mutation.
+       different fingerprint -> 409, no mutation. (No commit either way
+       -- this is a read.)
+    4. get-or-create integration Campaign
+       (_get_or_create_integration_campaign) -- its OWN short commit if
+       a new row is inserted, independent of everything below.
+    5. get-or-create Contact (_get_or_create_integration_contact,
+       next_action_at forced NULL on create; rejected with 409 + zero
+       mutation if an existing contact has an active follow-up -- see
+       that function's docstring) -- its OWN short commit if a new row
+       is inserted, independent of everything below.
+    6. create Message (DRAFT, exact caller-supplied subject/body) and
+       create ExternalDispatch(state=queued) together, and commit BOTH
+       in one final, atomic commit -- this is the one commit that
+       actually matters for duplicate-prevention (protected by
+       uq_external_dispatches_org_idempotency_key).
+    7. return 202 {"accepted": true, "mailing_agent_reference": ...}
+
+    Why three separate commits are acceptable, not a bug: Campaign and
+    Contact are idempotent, reusable, get-or-create resources -- if
+    request processing fails or crashes after step 4 or 5 but before
+    step 6 commits, the org is left with a perfectly valid, reusable
+    Campaign/Contact row and nothing else. The NEXT request (a legitimate
+    retry with the same idempotency_key, or even an unrelated dispatch to
+    a different recipient) simply finds and reuses that row via the same
+    get-or-create query -- no cleanup needed, no orphaned state that
+    causes incorrect behavior. What must never happen -- a duplicate
+    Message or a duplicate ExternalDispatch for the same
+    (organization_id, idempotency_key) -- is fully prevented by step 6
+    being one atomic commit guarded by the unique constraint, regardless
+    of how steps 4-5 landed. In short: a failed final commit may leave a
+    reusable Campaign/Contact row behind, but it cannot create a
+    duplicate dispatch or a duplicate send.
     """
     fingerprint = _compute_request_fingerprint(
         external_action_id=payload.external_action_id,

@@ -154,6 +154,19 @@ class Settings(BaseSettings):
     # time rather than per-request) is an explicit open item for a later
     # phase (see the Batch 1 report's "SENDER IDENTITY DECISION" section),
     # not solved here.
+    #
+    # SCOPE OF THIS DECISION (Batch 1.1, stated explicitly per review):
+    # one deployment-wide sender identity is acceptable for a controlled
+    # staging environment, or for the current deployment topology where
+    # one Mailer Agent instance serves a small, known set of LeadBoost
+    # organizations under one operator's control. It is NOT a complete
+    # per-organization sender architecture, and must not be treated as
+    # production-ready for arbitrary multi-customer use: every
+    # organization's LeadBoost-integration mail would go out under the
+    # same From: identity, which is unacceptable once distinct customers
+    # need their own sending domain/reputation. Do not remove this
+    # caveat by quietly expanding scope in a later batch without
+    # actually building the per-org mechanism described above.
     leadboost_integration_sender_email: str = ""
     leadboost_integration_sender_name: str = "LeadBoost Outreach"
     leadboost_integration_sender_org: str = "LeadBoost"
