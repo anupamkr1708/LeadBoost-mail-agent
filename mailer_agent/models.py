@@ -507,11 +507,44 @@ class ExternalDispatch(Base):
     external_action_id = Column(String, nullable=True)
     correlation_id = Column(String, nullable=True)
 
-    campaign_id = Column(Integer, ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False)
-    contact_id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False)
-    # Set in the same transaction that creates this row (Transaction A) --
-    # never nullable, unlike a "resolved later" design would need.
-    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)
+    # RESTRICT, not CASCADE (Batch 1.1 correction -- see
+    # tests/test_external_dispatch_fk_durability.py). Contact.campaign_id
+    # and Message.contact_id above both cascade, and this file does not
+    # touch that pre-existing behavior: no code path anywhere in this
+    # repository currently deletes a Campaign, Contact, or Message (no
+    # DELETE endpoint, no db.delete() call exists today), so changing
+    # those established relationships isn't warranted by anything found
+    # in this review. But ExternalDispatch is different in kind from an
+    # ordinary child row: it is the durable idempotency/reconciliation
+    # record itself (see class docstring), and this codebase's schema
+    # cannot rule out a parent row being deleted by something outside
+    # this application's own request handlers -- a future admin tool, a
+    # GDPR/data-deletion process, or direct operator SQL. If that ever
+    # happens to a Campaign/Contact/Message that still has an
+    # ExternalDispatch pointing at it, CASCADE would silently delete the
+    # dispatch record along with it. That specifically breaks the
+    # UNIQUE(organization_id, idempotency_key) guarantee this whole
+    # design depends on: with the row gone, a retried request bearing
+    # the same idempotency_key would find nothing and create a brand new
+    # dispatch (and could trigger a genuinely duplicate send), silently
+    # violating "no duplicate send for a replayed request" -- and would
+    # separately erase reconciliation history for an operation LeadBoost
+    # may still be asking about. RESTRICT here makes any such deletion
+    # attempt fail loudly (an integrity error) instead of silently
+    # discarding dispatch history, for any of the three FKs below,
+    # whether the deletion is attempted directly against that row or
+    # arrives indirectly via the Contact->Campaign / Message->Contact
+    # cascade chain above (a cascading delete is one atomic operation;
+    # if any RESTRICT anywhere in that chain would be violated, the
+    # whole delete fails, not just the one row this FK is on).
+    campaign_id = Column(Integer, ForeignKey("campaigns.id", ondelete="RESTRICT"), nullable=False)
+    contact_id = Column(Integer, ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=False)
+    # Set in the same final commit that creates this row (together with
+    # the ExternalDispatch row itself -- see
+    # api/integrations.py::create_leadboost_outreach_action's
+    # transaction-boundary docstring) -- never nullable, unlike a
+    # "resolved later" design would need.
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="RESTRICT"), nullable=False)
 
     # SHA-256 hex digest over a canonical JSON serialization of
     # {external_action_id, recipient_email, recipient_name, subject,
