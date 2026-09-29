@@ -755,6 +755,87 @@ def test_integration_contact_next_action_at_remains_null(client, db_session):
     assert contact.next_action_at is None
 
 
+def test_existing_integration_contact_with_active_followup_rejects_new_dispatch(client, db_session):
+    """
+    Batch 1.1 regression test (see
+    _get_or_create_integration_contact / _reject_if_contact_has_active_followup
+    in api/integrations.py).
+
+    Simulates the real scenario that can populate next_action_at on an
+    already-existing integration contact behind this endpoint's back --
+    e.g. mail/reply_handler_v2.py's reschedule_after_reply(), or a manual
+    /contacts/{id}/force-followup call -- neither of which knows or
+    cares that a contact is integration-managed. A second, genuinely new
+    LeadBoost dispatch (a fresh idempotency_key) to that same recipient
+    must be rejected (409), must create no Message/ExternalDispatch, and
+    must NOT silently clear next_action_at to force itself through --
+    doing so would destroy a real, live follow-up schedule as an
+    invisible side effect.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    # First dispatch: creates the contact normally, next_action_at NULL.
+    r1 = client.post(
+        "/integrations/leadboost/outreach-actions",
+        json=_payload(idempotency_key="k1", email="active-thread@example.com"),
+    )
+    assert r1.status_code == 202
+    contact = db_session.query(Contact).filter(Contact.email == "active-thread@example.com").one()
+    assert contact.next_action_at is None
+
+    # Simulate the reply-handling pipeline (or an admin force-followup)
+    # scheduling a real follow-up on this contact, entirely independent
+    # of this integration -- exactly what a live, human-attended
+    # conversation looks like at the DB level.
+    scheduled_at = datetime.now(timezone.utc) + timedelta(days=3)
+    contact.next_action_at = scheduled_at
+    db_session.commit()
+
+    # A second, genuinely new LeadBoost dispatch to the same recipient.
+    r2 = client.post(
+        "/integrations/leadboost/outreach-actions",
+        json=_payload(idempotency_key="k2", email="active-thread@example.com"),
+    )
+    assert r2.status_code == 409
+
+    # Zero mutation: no second Message, no second ExternalDispatch, and
+    # the live follow-up schedule is completely untouched -- not cleared,
+    # not silently overwritten.
+    assert db_session.query(Message).count() == 1
+    assert db_session.query(ExternalDispatch).count() == 1
+    db_session.refresh(contact)
+    assert contact.next_action_at is not None
+    assert contact.next_action_at.replace(tzinfo=timezone.utc) == scheduled_at
+
+
+def test_existing_integration_contact_replay_still_succeeds_despite_active_followup(client, db_session):
+    """
+    The 409-on-active-followup guard must only gate genuinely NEW
+    dispatch attempts, never a replay of an already-accepted
+    idempotency_key -- a replay returns the existing operation before
+    ever reaching contact get-or-create at all.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    r1 = client.post(
+        "/integrations/leadboost/outreach-actions",
+        json=_payload(idempotency_key="k1", email="replay-thread@example.com"),
+    )
+    assert r1.status_code == 202
+
+    contact = db_session.query(Contact).filter(Contact.email == "replay-thread@example.com").one()
+    contact.next_action_at = datetime.now(timezone.utc) + timedelta(days=1)
+    db_session.commit()
+
+    # Replay of the SAME idempotency_key/payload must still succeed.
+    r2 = client.post(
+        "/integrations/leadboost/outreach-actions",
+        json=_payload(idempotency_key="k1", email="replay-thread@example.com"),
+    )
+    assert r2.status_code == 202
+    assert r2.json() == r1.json()
+
+
 def test_scheduler_does_not_pick_up_integration_contact(client, db_session):
     """
     Real regression test against the actual scheduler query

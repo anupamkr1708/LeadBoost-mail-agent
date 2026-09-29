@@ -230,16 +230,43 @@ def _get_or_create_integration_contact(
     Same uq_contacts_campaign_email backstop ingest_leads already relies
     on (models.py, api/campaigns.py) -- reused as-is, not reimplemented.
 
-    CONTACT SAFETY (C4): next_action_at is explicitly left NULL, on both
-    the create and the reuse path. claim_due_contacts (the normal
-    follow-up scheduler's query, followup/work_claiming.py) only ever
-    picks up rows where next_action_at IS NOT NULL AND next_action_at <=
-    now -- so as long as this stays NULL, this contact can never be
-    picked up by dispatch_new_contacts_job/dispatch_followups_job and
-    sent a second, LLM-drafted message. Nothing in this function sets
-    next_action_at to anything else; nothing elsewhere in this batch
-    touches this contact's next_action_at either. See
-    tests/test_leadboost_integration.py for the regression test.
+    CONTACT SAFETY (C4, corrected in Batch 1.1): next_action_at must be
+    NULL for every integration contact. The create path below sets it
+    directly and that's the end of the story for a brand-new contact.
+    The REUSE path cannot simply assume it is still NULL, and an earlier
+    version of this function incorrectly did (its docstring claimed the
+    invariant held "on both the create and the reuse path" without the
+    reuse path actually checking anything). This codebase has real,
+    already-shipped paths that can set next_action_at on ANY contact,
+    including an integration one, with no awareness that the contact is
+    integration-managed:
+      - mail/reply_handler_v2.py's automatic reschedule_after_reply()
+        (fires whenever this contact replies to a sent message -- not
+        reachable yet in this batch since nothing sends real email
+        until C5+, but will be live the moment sending exists);
+      - POST /contacts/{id}/force-followup (api/contacts.py) -- an
+        admin endpoint, callable today, though it requires the contact
+        to already be ACTIVE (can_send_followup), so it needs a prior
+        manual /resume call first; still a real, reachable path.
+
+    If either has populated next_action_at on an integration contact by
+    the time a new LeadBoost dispatch reuses it, that contact is
+    genuinely in an active, human-attended follow-up/conversation state.
+    Two candidate fixes were considered: silently clear next_action_at
+    back to NULL and proceed, or reject the new dispatch. Silently
+    clearing it was rejected as the wrong choice: it would destroy a
+    real, live follow-up schedule that arose from the contact's own
+    reply (or an operator's own manual override) as an invisible side
+    effect of an unrelated LeadBoost API call, with no way for anyone to
+    notice. Instead, this function REJECTS the dispatch (409), with zero
+    mutation -- no Message, no ExternalDispatch, and next_action_at is
+    left completely untouched -- so the conflict is surfaced rather than
+    silently resolved in either direction. A dispatch that is merely a
+    replay of an already-accepted idempotency_key never reaches this
+    function at all (the endpoint returns the existing operation before
+    any campaign/contact lookup), so this only ever gates genuinely NEW
+    dispatch attempts. See tests/test_leadboost_integration.py's
+    regression test.
     """
     contact = (
         db.query(Contact)
@@ -247,6 +274,7 @@ def _get_or_create_integration_contact(
         .first()
     )
     if contact is not None:
+        _reject_if_contact_has_active_followup(contact)
         return contact
 
     contact = Contact(
@@ -268,10 +296,33 @@ def _get_or_create_integration_contact(
         )
         if contact is None:
             raise
+        # Same invariant check applies uniformly to the race-loser path.
+        # Extremely unlikely to trip (the winner's row is only
+        # microseconds old), but "extremely unlikely" is not "provably
+        # impossible", and this must not be a special case.
+        _reject_if_contact_has_active_followup(contact)
         return contact
 
     db.refresh(contact)
     return contact
+
+
+def _reject_if_contact_has_active_followup(contact: Contact) -> None:
+    """See _get_or_create_integration_contact's docstring for the full
+    reasoning. Raises 409 with zero mutation; never called on a
+    freshly-created contact, only on a reused one."""
+    if contact.next_action_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This recipient already has an active, human-attended "
+                "follow-up scheduled on the LeadBoost integration campaign "
+                "(next_action_at is set). A new LeadBoost-authorized "
+                "dispatch cannot be safely applied without risking a "
+                "conflicting message to the same contact. No dispatch was "
+                "created; next_action_at was not modified."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
