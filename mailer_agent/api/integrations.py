@@ -68,11 +68,8 @@ from mailer_agent.models import (
     ContactStatus,
     ExternalDispatch,
     ExternalDispatchState,
-    Message,
-    MessageDirection,
-    MessageStatus,
-    MessageType,
 )
+from mailer_agent.mail.exact_message import create_authorized_message
 from mailer_agent.schemas import LeadBoostOutreachActionAccepted, LeadBoostOutreachActionIn
 
 logger = logging.getLogger("mailer_agent.api.integrations")
@@ -435,13 +432,15 @@ def create_leadboost_outreach_action(
         db, campaign.id, payload.recipient.email, payload.recipient.name
     )
 
-    message = Message(
+    # The ONE Message for this operation, built by the exact-message
+    # boundary (C5): subject/body stored verbatim, never drafted, edited,
+    # or defaulted. It builds only -- adding it to the session here keeps
+    # this endpoint's atomic Message+ExternalDispatch commit the sole
+    # duplicate guard. See mail/exact_message.py.
+    message = create_authorized_message(
         contact_id=contact.id,
-        direction=MessageDirection.OUTBOUND.value,
-        message_type=MessageType.INITIAL.value,
         subject=payload.message.subject,
         body=payload.message.body,
-        status=MessageStatus.DRAFT.value,
     )
     db.add(message)
     db.flush()  # assign message.id without committing yet
