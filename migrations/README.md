@@ -42,6 +42,25 @@ Run once, in this order, against a fresh or partially-migrated database:
    docstring, and `tests/test_postgresql_concurrency.py`). Checks for
    existing duplicate values first and refuses to apply (with a clear
    error) rather than silently failing mid-`ALTER` if any are found.
+6. `004_external_dispatch_and_campaign_integration_source.py` -- Phase C
+   (LeadBoost integration) schema: `campaigns.integration_source` +
+   `uq_campaigns_org_integration_source`, and the new
+   `external_dispatches` table backing
+   `POST /integrations/leadboost/outreach-actions`
+   (`mailer_agent/api/integrations.py`). Purely additive; does not
+   change any existing column's type or nullability, and NULL
+   `integration_source` (every pre-existing campaign) is unaffected by
+   the new unique index. See the migration's own docstring for why the
+   new table is created via `ExternalDispatch.__table__.create(...,
+   checkfirst=True)` rather than hand-written DDL.
+
+**Deployment note (as of this migration):** none of these six scripts are
+run automatically by this repo's `render.yaml` -- its `buildCommand` only
+installs dependencies. Until a pre-deploy migration step is added (tracked
+separately), apply new migrations manually, in the order above, before
+deploying application code that depends on them -- in particular, deploying
+the Phase C integration endpoint without first running `004_...py` against
+that environment will 500 on first use.
 
 ## Known duplicate
 
@@ -68,6 +87,7 @@ python migrations/002_constraints_and_multitenancy.py
 python migrations/002_work_claiming.py
 python migrate_db.py
 python migrations/003_message_id_unique_constraint.py
+python migrations/004_external_dispatch_and_campaign_integration_source.py
 ```
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/
