@@ -149,7 +149,7 @@ class FakeSMTPServer:
 
         self._server = Server(("127.0.0.1", 0), Handler)
         self.port = self._server.server_address[1]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=lambda: self._server.serve_forever(poll_interval=0.02), daemon=True)
 
     def __enter__(self) -> "FakeSMTPServer":
         self._thread.start()

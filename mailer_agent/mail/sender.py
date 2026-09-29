@@ -91,6 +91,33 @@ class SendResult:
         self.outcome = outcome
 
 
+def generate_message_id(from_email: str) -> str:
+    """
+    Mint an RFC 5322 Message-ID exactly the way send_email() always has:
+    ``make_msgid`` on the sender's domain (``localhost`` if from_email has no
+    ``@``). Exposed so a caller that must persist the ID BEFORE the SMTP call
+    (the LeadBoost async dispatch worker) mints it with the same rule and can
+    then hand the very same value back via ``send_email(message_id_header=...)``.
+    """
+    domain = from_email.split("@")[-1] if "@" in from_email else "localhost"
+    return make_msgid(domain=domain)
+
+
+def _validate_message_id_header(value: str) -> str:
+    """A caller-supplied Message-ID goes straight into a MIME header, so it
+    must be a single-line ``<...>`` token. Anything else is a programming
+    error and is rejected BEFORE any network activity."""
+    if (
+        not isinstance(value, str)
+        or len(value) < 3
+        or not (value.startswith("<") and value.endswith(">"))
+        or any(ch in value for ch in ("\r", "\n", "\x00"))
+        or any(ch.isspace() for ch in value)
+    ):
+        raise ValueError(f"invalid message_id_header: {value!r}")
+    return value
+
+
 def send_email(
     *,
     to_email: str,
@@ -101,6 +128,7 @@ def send_email(
     reply_to: str | None = None,
     in_reply_to_header: str | None = None,
     references_header: str | None = None,
+    message_id_header: str | None = None,
 ) -> SendResult:
     """
     Sends a plain-text email (deliberately plain text, not HTML -- plain
@@ -113,9 +141,18 @@ def send_email(
     process crashes mid-send, the stable Message-ID we intended to use
     is already on record and a retry can be recognized as the same
     logical message rather than minted as a new one.
+
+    ``message_id_header`` (optional): use this exact Message-ID instead of
+    minting one. A caller that persists the ID before calling (so the stored
+    value and the transmitted value are the same string) passes it here.
+    Omitted -> the legacy behaviour, unchanged: an ID is minted internally.
+    Note this only closes the stored-ID/sent-ID mismatch; it does not make
+    delivery exactly-once.
     """
-    domain = from_email.split("@")[-1] if "@" in from_email else "localhost"
-    msg_id = make_msgid(domain=domain)
+    if message_id_header is not None:
+        msg_id = _validate_message_id_header(message_id_header)
+    else:
+        msg_id = generate_message_id(from_email)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
