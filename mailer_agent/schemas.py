@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -164,3 +164,30 @@ class LeadBoostOutreachActionAccepted(BaseModel):
     """
     accepted: bool
     mailing_agent_reference: str | None = None
+
+
+class LeadBoostOutreachActionStatus(BaseModel):
+    """
+    Read-only reconciliation view of one accepted LeadBoost dispatch
+    (GET /integrations/leadboost/outreach-actions/{idempotency_key}).
+
+    accepted is always true here: the row exists only because the Mailer
+    Agent durably accepted the operation. It says nothing about delivery.
+
+    state is the durable ExternalDispatchState, passed through verbatim:
+      queued   accepted, not yet completed by a worker
+      sending  a worker owns it; SMTP may be executing
+      sent     the sender reported success and that was recorded
+      failed   the sender reported a definite failure and that was recorded
+      unknown  the final outcome cannot be safely determined. This is NOT
+               "failed" and NOT "not delivered"; it is never retried
+               automatically.
+
+    Deliberately absent: organization/campaign/contact/message/dispatch
+    ids, claim fields, Message-ID, and error text (ExternalDispatch.
+    error_message holds raw internal diagnostics).
+    """
+    accepted: bool = True
+    state: Literal["queued", "sending", "sent", "failed", "unknown"]
+    mailing_agent_reference: str
+    updated_at: datetime | None = None
