@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from mailer_agent.config import get_settings
@@ -624,6 +624,90 @@ def recover_expired_external_dispatches(
             )
         )
     return recovered
+
+
+def finish_external_dispatch(
+    db: Session,
+    claim: ClaimedDispatch,
+    *,
+    new_state: ExternalDispatchState,
+    error_message: Optional[str] = None,
+) -> bool:
+    """
+    OWNERSHIP-FENCED outcome write ("Transaction C", also used for
+    pre-SMTP gate failures and for shutdown's SENDING -> UNKNOWN).
+
+    Moves SENDING -> ``new_state`` and clears claimed_by/claimed_at only if
+    the row is STILL the one this worker claimed: id, organization_id,
+    state=SENDING, claimed_by and the exact claimed_at token must all match.
+    Returns False (and writes nothing) otherwise -- e.g. lease recovery or a
+    shutdown sweep already resolved it to UNKNOWN. A worker that lost its
+    claim therefore can never overwrite a newer state, in either direction.
+
+    On success the linked Message is moved to the matching terminal status
+    (sent/failed/unknown). Never targets QUEUED. Does not commit.
+    """
+    if new_state not in (
+        ExternalDispatchState.SENT,
+        ExternalDispatchState.FAILED,
+        ExternalDispatchState.UNKNOWN,
+    ):
+        raise ValueError(f"finish_external_dispatch cannot move to {new_state!r}")
+
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(
+            ExternalDispatch.id == claim.dispatch_id,
+            ExternalDispatch.organization_id == claim.organization_id,
+            ExternalDispatch.state == ExternalDispatchState.SENDING.value,
+            ExternalDispatch.claimed_by == claim.worker_id,
+            ExternalDispatch.claimed_at == claim.claimed_at,
+        )
+        .values(
+            state=new_state.value,
+            claimed_by=None,
+            claimed_at=None,
+            error_message=error_message,
+            updated_at=_utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return False
+    message_pk = db.execute(
+        select(ExternalDispatch.message_id).where(ExternalDispatch.id == claim.dispatch_id)
+    ).scalar_one()
+    db.execute(
+        update(Message)
+        .where(Message.id == message_pk)
+        .values(status=MessageStatus(new_state.value).value, error_message=error_message)
+        .execution_options(synchronize_session=False)
+    )
+    return True
+
+
+def annotate_unknown_dispatch(
+    db: Session, *, dispatch_id: int, organization_id: str, note: str
+) -> bool:
+    """
+    Append an informational note to an UNKNOWN dispatch's error_message.
+
+    Used when a worker learns a definite outcome AFTER it lost its claim
+    (the row was already resolved to UNKNOWN). It never changes state --
+    UNKNOWN is not rewritten to SENT/FAILED and never to QUEUED -- it only
+    leaves the fact for whoever reconciles. Matches only state=UNKNOWN.
+    """
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(
+            ExternalDispatch.id == dispatch_id,
+            ExternalDispatch.organization_id == organization_id,
+            ExternalDispatch.state == ExternalDispatchState.UNKNOWN.value,
+        )
+        .values(error_message=func.coalesce(ExternalDispatch.error_message, "") + " | " + note)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
 
 
 # ---------------------------------------------------------------------------

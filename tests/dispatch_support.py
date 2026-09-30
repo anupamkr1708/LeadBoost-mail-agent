@@ -158,3 +158,50 @@ class FakeSMTPServer:
     def __exit__(self, *exc) -> None:
         self._server.shutdown()
         self._server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Worker-test doubles
+# ---------------------------------------------------------------------------
+
+class TrackingFactory:
+    """Session factory that remembers every session it hands out, so a test
+    can assert that NO session/transaction is open at the moment of SMTP."""
+
+    def __init__(self, sessionmaker_):
+        self.sm = sessionmaker_
+        self.sessions: list = []
+
+    def __call__(self):
+        s = self.sm()
+        self.sessions.append(s)
+        return s
+
+    def open_transactions(self) -> list:
+        return [s for s in self.sessions if s.in_transaction()]
+
+
+class FakeSender:
+    """Stands in for send_email() at the worker's call site. Records every
+    call (kwargs incl. message_id_header) and can run a hook mid-'SMTP'."""
+
+    def __init__(self, outcome=None, error=None, raises=None, on_call=None):
+        from mailer_agent.mail.sender import SendOutcome
+
+        self.outcome = outcome or SendOutcome.SENT
+        self.error = error
+        self.raises = raises
+        self.on_call = on_call
+        self.calls: list[dict] = []
+
+    def __call__(self, **kw):
+        from mailer_agent.mail.sender import SendOutcome, SendResult
+
+        self.calls.append(kw)
+        if self.on_call:
+            self.on_call(kw)
+        if self.raises:
+            raise self.raises
+        return SendResult(
+            self.outcome is SendOutcome.SENT, kw.get("message_id_header"), self.error, self.outcome
+        )
