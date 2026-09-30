@@ -18,13 +18,48 @@ from mailer_agent.followup.engine import is_suppressed
 from mailer_agent.llm.grounding import validate_grounding
 from mailer_agent.mail.sender import send_email
 from mailer_agent.memory.store import build_conversation_context
-from mailer_agent.models import Campaign, Contact, Message, MessageStatus, SuppressionEntry
+from mailer_agent.models import (
+    Campaign,
+    Contact,
+    ExternalDispatch,
+    ExternalDispatchState,
+    Message,
+    MessageStatus,
+    SuppressionEntry,
+)
 from mailer_agent.schemas import MessageOut, SuppressRequest
 
 logger = logging.getLogger("mailer_agent.api.messages")
 settings = get_settings()
 
 router = APIRouter(tags=["messages"], dependencies=[Depends(require_api_key)])
+
+# A Message linked to an ExternalDispatch in one of these states is owned by
+# the async LeadBoost worker (mail/external_dispatch_worker.py). Terminal
+# states (sent/failed/unknown) are deliberately NOT listed: once the dispatch
+# is finished this endpoint behaves exactly as it always did.
+_ACTIVE_DISPATCH_STATES = (
+    ExternalDispatchState.QUEUED.value,
+    ExternalDispatchState.SENDING.value,
+)
+
+
+def _owned_by_active_external_dispatch(db: Session, message_id: int) -> bool:
+    """
+    True if an active (queued/sending) ExternalDispatch points at this
+    Message. Keyed on message_id alone, not the caller's org: the caller's
+    tenant is already proven by _get_message_or_404, and an active dispatch
+    on the message blocks a manual send regardless of which org row holds it.
+    """
+    return (
+        db.query(ExternalDispatch.id)
+        .filter(
+            ExternalDispatch.message_id == message_id,
+            ExternalDispatch.state.in_(_ACTIVE_DISPATCH_STATES),
+        )
+        .first()
+        is not None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +142,21 @@ def approve_and_send_draft(
     of review_required -- see semantic_models.GroundingValidation.
     """
     msg = _get_message_or_404(db, message_id, org_id)
+
+    # Ownership boundary: while a LeadBoost ExternalDispatch is queued or
+    # sending, its Message belongs to the async worker. While QUEUED the
+    # message is still a plain DRAFT, so without this check it would look
+    # sendable here and could be delivered out-of-band. Checked before the
+    # draft check so both active states give the same, accurate answer.
+    if _owned_by_active_external_dispatch(db, msg.id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This message is owned by an external dispatch workflow "
+                "(LeadBoost) and cannot be approved manually while that "
+                "dispatch is queued or sending."
+            ),
+        )
 
     if msg.status != MessageStatus.DRAFT.value:
         raise HTTPException(
