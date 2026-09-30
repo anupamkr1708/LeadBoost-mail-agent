@@ -245,38 +245,62 @@ def _smtp_send_with_retry(msg: MIMEMultipart, from_email: str, to_email: str) ->
     """
     context = ssl.create_default_context()
     accepted = False
+    body_error: BaseException | None = None
     try:
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as server:
-            if settings.smtp_use_tls:
-                server.starttls(context=context)
-            server.login(settings.smtp_username, settings.smtp_password)
-
             try:
-                server.sendmail(from_email, [to_email], msg.as_string())
-            except _EXPLICIT_REFUSAL_ERRORS:
-                # The server responded and explicitly rejected the message --
-                # unambiguous failure, not a delivery-uncertain condition.
+                if settings.smtp_use_tls:
+                    server.starttls(context=context)
+                server.login(settings.smtp_username, settings.smtp_password)
+
+                try:
+                    server.sendmail(from_email, [to_email], msg.as_string())
+                except _EXPLICIT_REFUSAL_ERRORS:
+                    # The server responded and explicitly rejected the message --
+                    # unambiguous failure, not a delivery-uncertain condition.
+                    raise
+                except Exception as e:
+                    raise AmbiguousSendError(
+                        f"Error during SMTP transmission -- delivery status unknown: {e}", e
+                    ) from e
+                # sendmail() returned: the server ACCEPTED the message. Nothing
+                # after this point may cause it to be sent again.
+                accepted = True
+            except BaseException as exc:
+                # Remember the primary failure. smtplib's __exit__ (QUIT +
+                # close) runs next and may raise its own error, which Python
+                # would let REPLACE this one -- see the handler below.
+                body_error = exc
                 raise
-            except Exception as e:
-                raise AmbiguousSendError(
-                    f"Error during SMTP transmission -- delivery status unknown: {e}", e
-                ) from e
-            # sendmail() returned: the server ACCEPTED the message. Nothing
-            # after this point may cause it to be sent again.
-            accepted = True
-    except Exception as cleanup_error:
-        # Once accepted, the only thing left in the `with` is smtplib's
-        # __exit__ (QUIT + close). A non-221 QUIT reply or a socket error
-        # there is an OSError/SMTPException -- i.e. in the retry set -- so it
-        # would re-run this whole function and deliver the message again,
-        # then report FAILED for a delivered message. The delivery already
-        # happened; the connection teardown failure is only worth a warning.
-        # (Failures before `accepted` -- connect, TLS, login, sendmail --
-        # are re-raised unchanged and keep their existing retry semantics.)
-        if not accepted:
+    except Exception as err:
+        if body_error is not None:
+            if err is not body_error:
+                # Cleanup failed while the body's exception was propagating
+                # and replaced it. The body's exception decides the outcome:
+                # an ambiguous sendmail failure must stay AmbiguousSendError
+                # (UNKNOWN, not retried) and an explicit rejection or a
+                # connect/TLS/login failure must keep its own identity -- not
+                # be recast as a QUIT error (an OSError, i.e. in the retry
+                # set), which used to turn an ambiguous send into three
+                # attempts and a FAILED. Same retry policy as before; only
+                # WHICH exception the policy sees changes.
+                logger.warning(
+                    "SMTP cleanup also failed (%s: %s); preserving the original "
+                    "%s from the send",
+                    type(err).__name__, err, type(body_error).__name__,
+                )
+                raise body_error
             raise
+        if not accepted:
+            raise  # e.g. the connection itself could not be opened
+        # The server accepted the message and only the connection teardown
+        # failed (non-221 QUIT reply, socket error while closing). That is an
+        # OSError/SMTPException -- in the retry set -- so letting it escape
+        # would re-run this whole function and deliver the message again, then
+        # report FAILED for a delivered message. The delivery already
+        # happened; the teardown failure is only worth a warning.
         logger.warning(
             "SMTP server accepted the message but closing the connection failed "
             "(%s: %s); treating as sent, NOT retrying",
-            type(cleanup_error).__name__, cleanup_error,
+            type(err).__name__, err,
         )
