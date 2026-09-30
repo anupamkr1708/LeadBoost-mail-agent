@@ -168,3 +168,110 @@ def test_concurrent_recovery_has_one_terminal_result(factory):
         row = s.get(ExternalDispatch, did)
         assert row.state == S.UNKNOWN.value and row.claimed_by is None
         assert wc.claim_next_external_dispatch(s, "w") is None    # never back to QUEUED
+
+
+# ---------------------------------------------------------------------------
+# Worker pipeline on real PostgreSQL
+# ---------------------------------------------------------------------------
+
+from mailer_agent.mail import external_dispatch_worker as w  # noqa: E402
+from mailer_agent.models import Message, MessageStatus  # noqa: E402
+from tests.dispatch_support import FakeSender  # noqa: E402
+
+
+@pytest.fixture()
+def live(monkeypatch):
+    monkeypatch.setattr(w.settings, "live_sending_enabled", True)
+
+
+def test_concurrent_workers_send_each_dispatch_exactly_once(factory, live, monkeypatch):
+    n_rows, n_workers = 24, 4
+    with factory() as s:
+        for i in range(n_rows):
+            seed_dispatch(s, email=f"lead{i}@example.com")
+    f = FakeSender()
+    monkeypatch.setattr(w, "send_email", f)
+
+    def worker(i, barrier):
+        rt = w.DispatchRuntime()
+        barrier.wait(timeout=30)
+        done = 0
+        while True:
+            got = w.run_external_dispatch_cycle(
+                session_factory=factory, worker_id=f"w-{i}", runtime=rt, max_items=3)
+            if not got:
+                return done
+            done += len(got)
+
+    counts = _run_threads(worker, n_workers)
+
+    assert sum(counts) == n_rows
+    recipients = [c["to_email"] for c in f.calls]
+    assert len(recipients) == n_rows and len(set(recipients)) == n_rows      # no duplicate send
+    with factory() as s:
+        rows = s.query(ExternalDispatch).all()
+        assert {r.state for r in rows} == {S.SENT.value}
+        assert all(r.claimed_by is None and r.claimed_at is None for r in rows)
+        ids = [m.message_id_header for m in s.query(Message).all()]
+        assert None not in ids and len(set(ids)) == n_rows
+        assert {c["message_id_header"] for c in f.calls} == set(ids)          # stored == transmitted
+
+
+def test_no_transaction_is_open_on_postgres_while_smtp_runs(factory, live, monkeypatch):
+    with factory() as s:
+        did = seed_dispatch(s).id
+    seen = {}
+
+    def during_smtp(kw):
+        with factory() as other:
+            d = other.get(ExternalDispatch, did)
+            m = other.get(Message, d.message_id)
+            seen["state"], seen["msg_status"], seen["db_id"] = d.state, m.status, m.message_id_header
+            seen["idle_in_txn"] = other.execute(text(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+                "AND state LIKE 'idle in transaction%'"
+            )).scalar()
+            other.rollback()
+        seen["kw_id"] = kw["message_id_header"]
+
+    monkeypatch.setattr(w, "send_email", FakeSender(on_call=during_smtp))
+    res = w.process_next_external_dispatch(session_factory=factory, worker_id="w-1", runtime=w.DispatchRuntime())
+
+    assert res.outcome == "sent"
+    assert seen["state"] == S.SENDING.value and seen["msg_status"] == MessageStatus.SENDING.value
+    assert seen["idle_in_txn"] == 0                       # no DB transaction open during SMTP
+    assert seen["db_id"] == seen["kw_id"] == res.message_id_header
+
+
+def test_fence_refuses_a_late_success_after_lease_recovery_on_postgres(factory, live, monkeypatch):
+    with factory() as s:
+        did = seed_dispatch(s).id
+
+    def expire_mid_smtp(kw):
+        with factory() as s:
+            assert len(wc.recover_expired_external_dispatches(s, lease_seconds=-1)) == 1
+            s.commit()
+
+    f = FakeSender(on_call=expire_mid_smtp)
+    monkeypatch.setattr(w, "send_email", f)
+    res = w.process_next_external_dispatch(session_factory=factory, worker_id="w-1", runtime=w.DispatchRuntime())
+
+    assert res.outcome == "sent" and res.persisted is False
+    with factory() as s:
+        d = s.get(ExternalDispatch, did)
+        assert d.state == S.UNKNOWN.value and "late_outcome_after_lease_loss" in d.error_message
+        assert wc.claim_next_external_dispatch(s, "w-2") is None
+    assert len(f.calls) == 1
+
+
+def test_gate_failure_is_committed_as_failed_on_postgres(factory, live, monkeypatch):
+    f = FakeSender()
+    monkeypatch.setattr(w, "send_email", f)
+    with factory() as s:
+        did = seed_dispatch(s, body="Our customers see a 40% lift in reply rates.").id
+    res = w.process_next_external_dispatch(session_factory=factory, worker_id="w-1", runtime=w.DispatchRuntime())
+    assert res.outcome == "failed" and f.calls == []
+    with factory() as s:
+        d = s.get(ExternalDispatch, did)
+        assert d.state == S.FAILED.value and d.claimed_by is None
