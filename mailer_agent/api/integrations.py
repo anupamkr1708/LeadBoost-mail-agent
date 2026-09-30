@@ -70,7 +70,11 @@ from mailer_agent.models import (
     ExternalDispatchState,
 )
 from mailer_agent.mail.exact_message import create_authorized_message
-from mailer_agent.schemas import LeadBoostOutreachActionAccepted, LeadBoostOutreachActionIn
+from mailer_agent.schemas import (
+    LeadBoostOutreachActionAccepted,
+    LeadBoostOutreachActionIn,
+    LeadBoostOutreachActionStatus,
+)
 
 logger = logging.getLogger("mailer_agent.api.integrations")
 
@@ -503,3 +507,60 @@ def create_leadboost_outreach_action(
         dispatch.public_reference, contact.id, message.id,
     )
     return _accepted_response(dispatch)
+
+
+# ---------------------------------------------------------------------------
+# GET /integrations/leadboost/outreach-actions/{idempotency_key}   (C9.1)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/outreach-actions/{idempotency_key}",
+    response_model=LeadBoostOutreachActionStatus,
+)
+def get_leadboost_outreach_action(
+    idempotency_key: str,
+    org_id: str = Depends(get_current_org_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Reconciliation read: "what is the current durable state of the
+    operation I submitted under this idempotency_key?"
+
+    Strictly read-only: one tenant-scoped SELECT, then serialize. It never
+    claims, recovers, updates, retries, enqueues or sends anything, and
+    touches no Message/Contact/Campaign. It imports nothing from the
+    LLM/follow-up/sender stack.
+
+    Tenancy: org_id comes only from the authenticated API key. The lookup
+    filters on (organization_id, idempotency_key) in the predicate itself
+    (served by uq_external_dispatches_org_idempotency_key). A key that
+    belongs to another organization is indistinguishable from a key that
+    does not exist: both return the same 404.
+
+    Only the columns needed for the response are selected, so
+    error_message (raw internal diagnostics) is never even loaded.
+
+    accepted=true means durable acceptance, never delivery. state is
+    passed through unchanged; UNKNOWN is not failure and is never retried.
+    """
+    row = (
+        db.query(
+            ExternalDispatch.public_reference,
+            ExternalDispatch.state,
+            ExternalDispatch.updated_at,
+        )
+        .filter(
+            ExternalDispatch.organization_id == org_id,
+            ExternalDispatch.idempotency_key == idempotency_key,
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Outreach action not found")
+
+    return LeadBoostOutreachActionStatus(
+        accepted=True,
+        state=row.state,
+        mailing_agent_reference=row.public_reference,
+        updated_at=row.updated_at,
+    )
