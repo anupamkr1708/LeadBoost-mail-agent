@@ -158,6 +158,50 @@ def health_check_job() -> None:
         logger.error(f"Health check failed: {e}")
 
 
+def dispatch_external_dispatches_job() -> None:
+    """
+    LeadBoost async dispatch: claim + send queued ExternalDispatch rows.
+
+    Its own job on its own cadence (settings.external_dispatch_poll_seconds,
+    default 15 s) -- NOT followup_poll_seconds (300 s), and it never touches
+    the follow-up drafting engine or Contact rows. The heavy lifting lives in
+    mail/external_dispatch_worker.py, which is imported lazily so this
+    module's import graph does not change.
+
+    max_instances=1 (below) only stops this job overlapping ITSELF inside one
+    process. Protection between worker processes is the database claim.
+    """
+    from mailer_agent.mail.external_dispatch_worker import run_external_dispatch_cycle
+
+    try:
+        results = run_external_dispatch_cycle()
+    except Exception:
+        logger.exception("dispatch_external_dispatches_job failed")
+        return
+    if results:
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r.outcome] = counts.get(r.outcome, 0) + 1
+        logger.info("External dispatch cycle processed %d: %s", len(results), counts)
+
+
+def recover_external_dispatch_leases_job() -> None:
+    """
+    Separate sweep: expired SENDING -> UNKNOWN (never QUEUED, no SMTP).
+    A distinct job so it still fires while dispatch_external_dispatches_job
+    is blocked inside a slow SMTP call.
+    """
+    from mailer_agent.mail.external_dispatch_worker import run_external_dispatch_lease_recovery
+
+    try:
+        n = run_external_dispatch_lease_recovery()
+    except Exception:
+        logger.exception("recover_external_dispatch_leases_job failed")
+        return
+    if n:
+        logger.warning("External dispatch lease recovery resolved %d row(s) to UNKNOWN", n)
+
+
 def start_scheduler() -> BackgroundScheduler:
     """
     Start the unified scheduler.
@@ -201,6 +245,24 @@ def start_scheduler() -> BackgroundScheduler:
         max_instances=1
     )
     
+    # LeadBoost async dispatch (ExternalDispatch QUEUED -> SENDING -> outcome)
+    scheduler.add_job(
+        dispatch_external_dispatches_job,
+        "interval",
+        seconds=settings.external_dispatch_poll_seconds,
+        id="dispatch_external_dispatches",
+        max_instances=1
+    )
+
+    # Expired-lease recovery for ExternalDispatch (SENDING -> UNKNOWN)
+    scheduler.add_job(
+        recover_external_dispatch_leases_job,
+        "interval",
+        seconds=settings.external_dispatch_recovery_poll_seconds,
+        id="recover_external_dispatch_leases",
+        max_instances=1
+    )
+
     # Health check (every 5 minutes)
     scheduler.add_job(
         health_check_job,
@@ -218,6 +280,8 @@ def start_scheduler() -> BackgroundScheduler:
         f"  Reply poll: every {settings.imap_poll_seconds}s\n"
         f"  Initial outreach dispatch: every {settings.followup_poll_seconds}s\n"
         f"  Follow-up dispatch: every {settings.followup_poll_seconds}s\n"
+        f"  External dispatch: every {settings.external_dispatch_poll_seconds}s "
+        f"(lease recovery every {settings.external_dispatch_recovery_poll_seconds}s)\n"
         f"  Health check: every 300s"
     )
     

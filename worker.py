@@ -46,21 +46,97 @@ On shutdown (KeyboardInterrupt / SIGTERM), this process releases any
 work claims it currently holds so the next worker cycle (possibly on a
 newly-started worker) can pick them up immediately rather than waiting
 for the lease to expire (default 300 s).
+
+SIGTERM (fix): the code above only ever ran on KeyboardInterrupt. Python's
+default SIGTERM action terminates the process immediately WITHOUT raising
+SystemExit, so on a platform that stops services with SIGTERM (Render) the
+release logic never executed. ``install_signal_handlers()`` converts SIGTERM
+into SystemExit so the shutdown path below actually runs.
+
+LeadBoost ExternalDispatch shutdown ordering (``graceful_shutdown``):
+  1. stop taking NEW external-dispatch claims;
+  2. stop the scheduler (no new job triggers);
+  3. wait a bounded time for in-flight dispatches to finish on their own;
+  4. dispatches THIS process still owns after the drain deadline are moved
+     SENDING -> UNKNOWN, by dispatch ID + claim token (never by worker_id
+     alone, never to QUEUED -- an interrupted send cannot be assumed unsent);
+  5. release Contact claims as before.
 """
 
 import logging
 import os
+import signal
 import time
 
 from mailer_agent.db import init_db, session_scope
 from mailer_agent.followup.scheduler import start_scheduler, stop_scheduler
 from mailer_agent.followup.work_claiming import make_worker_id, release_all_claims
+from mailer_agent.mail.external_dispatch_worker import (
+    begin_external_dispatch_shutdown,
+    drain_external_dispatches_on_shutdown,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("mailer_agent.worker")
 
+_terminating = False
+
+
+def _handle_sigterm(signum, frame):  # noqa: ARG001
+    """First SIGTERM -> SystemExit (runs graceful_shutdown). Repeats are
+    ignored so a second signal cannot interrupt a shutdown in progress."""
+    global _terminating
+    if _terminating:
+        logger.info("Repeated termination signal ignored; shutdown already in progress")
+        return
+    _terminating = True
+    raise SystemExit(0)
+
+
+def install_signal_handlers() -> None:
+    """Must be called from the main thread."""
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
+def graceful_shutdown(worker_id: str) -> None:
+    """The ordered shutdown described in the module docstring. Each step is
+    best-effort and isolated so one failure cannot skip the next."""
+    logger.info("Shutting down background worker (worker_id=%s)", worker_id)
+
+    try:
+        begin_external_dispatch_shutdown()  # 1. no new external-dispatch claims
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not stop external dispatch claiming: %s", exc)
+
+    try:
+        stop_scheduler()  # 2. no new job triggers (running jobs continue)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not stop scheduler cleanly: %s", exc)
+
+    try:
+        report = drain_external_dispatches_on_shutdown()  # 3 + 4
+        if report.abandoned_unknown or not report.drained:
+            logger.warning(
+                "External dispatch shutdown: drained=%s resolved_to_unknown=%s not_owned=%s",
+                report.drained, list(report.abandoned_unknown), list(report.still_owned_elsewhere),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("External dispatch drain failed; lease recovery will resolve: %s", exc)
+
+    # 5. Phase 8: Release any Contact claims so the next worker can pick them
+    # up immediately rather than waiting for lease expiry.
+    try:
+        with session_scope() as db:
+            released = release_all_claims(db, worker_id)
+            if released:
+                logger.info("Released %d claim(s) on graceful shutdown", released)
+    except Exception as exc:  # noqa: BLE001 — best-effort, don't mask shutdown
+        logger.warning("Could not release claims on shutdown: %s", exc)
+
+
 if __name__ == "__main__":
     init_db()
+    install_signal_handlers()
 
     worker_id = make_worker_id()
     # Expose worker_id in env so child scheduler jobs inherit it automatically.
@@ -72,20 +148,12 @@ if __name__ == "__main__":
         worker_id,
     )
 
-    scheduler = start_scheduler()
+    # start_scheduler() is INSIDE the try on purpose: a SIGTERM that lands
+    # right after the scheduler starts (before the loop below) would otherwise
+    # raise SystemExit outside the handler and skip graceful_shutdown().
     try:
+        scheduler = start_scheduler()
         while True:
             time.sleep(60)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down background worker (worker_id=%s)", worker_id)
-        stop_scheduler()
-
-        # Phase 8: Release any DB claims so the next worker can pick them up
-        # immediately rather than waiting for lease expiry.
-        try:
-            with session_scope() as db:
-                released = release_all_claims(db, worker_id)
-                if released:
-                    logger.info("Released %d claim(s) on graceful shutdown", released)
-        except Exception as exc:  # noqa: BLE001 — best-effort, don't mask shutdown
-            logger.warning("Could not release claims on shutdown: %s", exc)
+        graceful_shutdown(worker_id)

@@ -60,14 +60,23 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from sqlalchemy import text
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from mailer_agent.config import get_settings
-from mailer_agent.models import Contact, ContactStatus
+from mailer_agent.models import (
+    Contact,
+    ContactStatus,
+    ExternalDispatch,
+    ExternalDispatchState,
+    Message,
+    MessageStatus,
+)
 
 logger = logging.getLogger("mailer_agent.followup.work_claiming")
 settings = get_settings()
@@ -383,18 +392,347 @@ def _claim_sqlite(
 
 
 # ---------------------------------------------------------------------------
+# ExternalDispatch claiming (Phase C6) -- LeadBoost async dispatch
+# ---------------------------------------------------------------------------
+#
+# Same philosophy as the Contact claim above -- the database is the queue and
+# the only arbiter -- with three deliberate differences:
+#
+#  1. ONLY state=QUEUED is claimable. A SENDING row is never re-claimed, not
+#     even after its lease expires: an expired SENDING lease resolves to
+#     UNKNOWN (recover_expired_external_dispatches), never back to QUEUED and
+#     never to another SMTP attempt. See models.resolve_expired_sending_lease
+#     for why the two indistinguishable crash shapes force that.
+#  2. ONE row per claim. The caller claims, processes, then claims again, so a
+#     claim never idles behind other sends and ages toward its lease (the
+#     Contact path claims a batch and sleeps between sends).
+#  3. The claim does NOT commit. It runs inside the caller's "Transaction B"
+#     together with the pre-SMTP gates and the Message-ID persistence, and the
+#     caller commits once. A crash anywhere before that commit rolls the claim
+#     back and the row is simply QUEUED again -- no SMTP has happened.
+#
+# The lease used for recovery is settings.external_dispatch_lease_seconds
+# (default 900), NOT CLAIM_LEASE_SECONDS (300, contacts only).
+
+@dataclass(frozen=True)
+class ClaimedDispatch:
+    """
+    Identity of one successful claim. ``claimed_at`` is the exact naive-UTC
+    value written to the row and doubles as a FENCING TOKEN: the outcome
+    write (Transaction C) matches on (id, organization_id, state=SENDING,
+    claimed_by, claimed_at), so a worker that lost its lease -- or whose row
+    was moved on by recovery/shutdown -- cannot overwrite the newer state.
+    """
+    dispatch_id: int
+    organization_id: str
+    worker_id: str
+    claimed_at: datetime
+
+
+@dataclass(frozen=True)
+class RecoveredDispatch:
+    dispatch_id: int
+    organization_id: str
+    external_action_id: Optional[str]
+    correlation_id: Optional[str]
+    public_reference: str
+    previous_worker: Optional[str]
+    previous_claimed_at: Optional[datetime]
+
+
+def _naive_utc(dt: Optional[datetime] = None) -> datetime:
+    dt = dt or _utcnow()
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
+def claim_next_external_dispatch(
+    db: Session,
+    worker_id: str,
+    now: Optional[datetime] = None,
+) -> Optional[ClaimedDispatch]:
+    """
+    Atomically claim the oldest QUEUED ExternalDispatch for *worker_id*.
+
+    Sets state=SENDING, claimed_by, claimed_at in the caller's open
+    transaction and returns the claim, or None if nothing is claimable.
+    Does not commit and performs no I/O beyond the database.
+
+    PostgreSQL: ``SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1`` then a guarded
+    UPDATE of that locked row. (Two statements on purpose: the
+    UPDATE ... WHERE id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED) form
+    used for contacts can, under some plans, evaluate the subquery more than
+    once and claim more than n rows. With LIMIT 1 and an explicit id there is
+    nothing for the planner to get wrong.) The row lock is held until the
+    caller's commit/rollback; competing workers skip it rather than block.
+
+    SQLite (dev/tests): candidate SELECT, then ``UPDATE ... WHERE id=? AND
+    state='queued'`` with a rowcount check. This exercises the guarded-update
+    logic only; it does NOT prove PostgreSQL locking -- that is covered
+    separately against a real PostgreSQL (tests/test_external_dispatch_postgres.py).
+    """
+    claimed_at = _naive_utc(now)
+    queued = ExternalDispatchState.QUEUED.value
+    sending = ExternalDispatchState.SENDING.value
+
+    def _guarded_claim(dispatch_id: int) -> bool:
+        result = db.execute(
+            update(ExternalDispatch)
+            .where(ExternalDispatch.id == dispatch_id, ExternalDispatch.state == queued)
+            .values(
+                state=sending,
+                claimed_by=worker_id,
+                claimed_at=claimed_at,
+                updated_at=_utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    if _is_postgres(db):
+        row = db.execute(
+            select(ExternalDispatch.id, ExternalDispatch.organization_id)
+            .where(ExternalDispatch.state == queued)
+            .order_by(ExternalDispatch.id)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ).first()
+        if row is None or not _guarded_claim(row.id):
+            return None
+        chosen = row
+    else:
+        candidates = db.execute(
+            select(ExternalDispatch.id, ExternalDispatch.organization_id)
+            .where(ExternalDispatch.state == queued)
+            .order_by(ExternalDispatch.id)
+            .limit(10)
+        ).all()
+        chosen = next((c for c in candidates if _guarded_claim(c.id)), None)
+        if chosen is None:
+            return None
+
+    logger.info(
+        "Worker %s claimed external_dispatch id=%d org=%s (QUEUED -> SENDING)",
+        worker_id, chosen.id, chosen.organization_id,
+    )
+    return ClaimedDispatch(
+        dispatch_id=chosen.id,
+        organization_id=chosen.organization_id,
+        worker_id=worker_id,
+        claimed_at=claimed_at,
+    )
+
+
+def recover_expired_external_dispatches(
+    db: Session,
+    *,
+    now: Optional[datetime] = None,
+    lease_seconds: Optional[int] = None,
+    limit: int = 100,
+) -> List[RecoveredDispatch]:
+    """
+    Resolve expired SENDING leases: ``SENDING -> UNKNOWN``. Never QUEUED.
+
+    A row is expired when state=SENDING and claimed_at is older than the
+    lease (or claimed_at is NULL, an anomalous shape that can never be a live
+    claim). On expiry: state=UNKNOWN, claimed_by/claimed_at cleared, a clear
+    reason on the dispatch and on its Message (SENDING/DRAFT -> UNKNOWN).
+
+    Deliberately performs NO SMTP and imports no sender: it cannot resend.
+    Safe to run repeatedly and concurrently: every UPDATE re-checks the
+    expiry predicate, a second run finds nothing, and on PostgreSQL rows are
+    taken with FOR UPDATE SKIP LOCKED so two sweeps split the work. Does not
+    commit; the caller owns the transaction.
+    """
+    lease = (
+        settings.external_dispatch_lease_seconds
+        if lease_seconds is None else lease_seconds
+    )
+    now_naive = _naive_utc(now)
+    cutoff = now_naive - timedelta(seconds=lease)
+    sending = ExternalDispatchState.SENDING.value
+    expired = and_(
+        ExternalDispatch.state == sending,
+        or_(ExternalDispatch.claimed_at.is_(None), ExternalDispatch.claimed_at < cutoff),
+    )
+
+    query = (
+        select(
+            ExternalDispatch.id,
+            ExternalDispatch.organization_id,
+            ExternalDispatch.external_action_id,
+            ExternalDispatch.correlation_id,
+            ExternalDispatch.public_reference,
+            ExternalDispatch.claimed_by,
+            ExternalDispatch.claimed_at,
+            ExternalDispatch.message_id,
+        )
+        .where(expired)
+        .order_by(ExternalDispatch.id)
+        .limit(limit)
+    )
+    if _is_postgres(db):
+        query = query.with_for_update(skip_locked=True)
+
+    recovered: List[RecoveredDispatch] = []
+    for row in db.execute(query).all():
+        reason = (
+            "lease_expired: dispatch was SENDING and its claim "
+            f"(worker={row.claimed_by}, claimed_at={row.claimed_at}) expired "
+            f"after {lease}s. Whether SMTP accepted the message is unknown; "
+            "it will NOT be retried automatically."
+        )
+        result = db.execute(
+            update(ExternalDispatch)
+            .where(ExternalDispatch.id == row.id, expired)
+            .values(
+                state=ExternalDispatchState.UNKNOWN.value,
+                claimed_by=None,
+                claimed_at=None,
+                error_message=reason,
+                updated_at=_utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            continue  # another sweep (or a late outcome) got there first
+        db.execute(
+            update(Message)
+            .where(
+                Message.id == row.message_id,
+                Message.status.in_([MessageStatus.SENDING.value, MessageStatus.DRAFT.value]),
+            )
+            .values(status=MessageStatus.UNKNOWN.value, error_message=reason)
+            .execution_options(synchronize_session=False)
+        )
+        logger.warning(
+            "external_dispatch lease recovery: SENDING -> UNKNOWN id=%d org=%s "
+            "external_action_id=%s correlation_id=%s public_reference=%s "
+            "previous_worker=%s previous_claimed_at=%s lease=%ds (no resend)",
+            row.id, row.organization_id, row.external_action_id,
+            row.correlation_id, row.public_reference, row.claimed_by,
+            row.claimed_at, lease,
+        )
+        recovered.append(
+            RecoveredDispatch(
+                dispatch_id=row.id,
+                organization_id=row.organization_id,
+                external_action_id=row.external_action_id,
+                correlation_id=row.correlation_id,
+                public_reference=row.public_reference,
+                previous_worker=row.claimed_by,
+                previous_claimed_at=row.claimed_at,
+            )
+        )
+    return recovered
+
+
+def finish_external_dispatch(
+    db: Session,
+    claim: ClaimedDispatch,
+    *,
+    new_state: ExternalDispatchState,
+    error_message: Optional[str] = None,
+) -> bool:
+    """
+    OWNERSHIP-FENCED outcome write ("Transaction C", also used for
+    pre-SMTP gate failures and for shutdown's SENDING -> UNKNOWN).
+
+    Moves SENDING -> ``new_state`` and clears claimed_by/claimed_at only if
+    the row is STILL the one this worker claimed: id, organization_id,
+    state=SENDING, claimed_by and the exact claimed_at token must all match.
+    Returns False (and writes nothing) otherwise -- e.g. lease recovery or a
+    shutdown sweep already resolved it to UNKNOWN. A worker that lost its
+    claim therefore can never overwrite a newer state, in either direction.
+
+    On success the linked Message is moved to the matching terminal status
+    (sent/failed/unknown). Never targets QUEUED. Does not commit.
+    """
+    if new_state not in (
+        ExternalDispatchState.SENT,
+        ExternalDispatchState.FAILED,
+        ExternalDispatchState.UNKNOWN,
+    ):
+        raise ValueError(f"finish_external_dispatch cannot move to {new_state!r}")
+
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(
+            ExternalDispatch.id == claim.dispatch_id,
+            ExternalDispatch.organization_id == claim.organization_id,
+            ExternalDispatch.state == ExternalDispatchState.SENDING.value,
+            ExternalDispatch.claimed_by == claim.worker_id,
+            ExternalDispatch.claimed_at == claim.claimed_at,
+        )
+        .values(
+            state=new_state.value,
+            claimed_by=None,
+            claimed_at=None,
+            error_message=error_message,
+            updated_at=_utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return False
+    message_pk = db.execute(
+        select(ExternalDispatch.message_id).where(ExternalDispatch.id == claim.dispatch_id)
+    ).scalar_one()
+    db.execute(
+        update(Message)
+        .where(Message.id == message_pk)
+        .values(status=MessageStatus(new_state.value).value, error_message=error_message)
+        .execution_options(synchronize_session=False)
+    )
+    return True
+
+
+def annotate_unknown_dispatch(
+    db: Session, *, dispatch_id: int, organization_id: str, note: str
+) -> bool:
+    """
+    Append an informational note to an UNKNOWN dispatch's error_message.
+
+    Used when a worker learns a definite outcome AFTER it lost its claim
+    (the row was already resolved to UNKNOWN). It never changes state --
+    UNKNOWN is not rewritten to SENT/FAILED and never to QUEUED -- it only
+    leaves the fact for whoever reconciles. Matches only state=UNKNOWN.
+    """
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(
+            ExternalDispatch.id == dispatch_id,
+            ExternalDispatch.organization_id == organization_id,
+            ExternalDispatch.state == ExternalDispatchState.UNKNOWN.value,
+        )
+        .values(error_message=func.coalesce(ExternalDispatch.error_message, "") + " | " + note)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
 # Worker identity helper
 # ---------------------------------------------------------------------------
 
+# Fixed once per interpreter. Combined with the live PID it makes the default
+# worker identity unique per PROCESS, not per host: two worker.py processes on
+# one machine (a rolling deploy, a local dev box) previously both became
+# "worker-<hostname>", so anything keyed on worker_id alone (release_all_claims,
+# an ownership check) could not tell them apart.
+_PROCESS_INSTANCE = uuid.uuid4().hex[:8]
+
+
 def make_worker_id(prefix: str = "worker") -> str:
     """
-    Build a stable-enough worker identity string for lease attribution.
+    Build a process-unique worker identity string for lease attribution.
 
-    Uses ``WORKER_ID`` env var if set (recommended for Render / Docker
-    deployments where each container has a unique instance name), otherwise
-    falls back to ``<prefix>-<hostname>``.
-
-    For local dev, ``prefix`` defaults to ``"worker"`` giving ``"worker-mymachine"``.
+    An explicit ``WORKER_ID`` env var wins (worker.py exports the id it
+    generated so scheduler-job threads in the same process share it).
+    Otherwise: ``<prefix>-<hostname>-<pid>-<8 hex>``. Stable for the life of
+    the process, distinct across processes -- including two processes on the
+    same host. Note an operator who sets the SAME WORKER_ID on several
+    processes defeats that; nothing ownership-critical here relies on
+    worker_id alone (ExternalDispatch fences on claimed_at as well).
     """
     from_env = os.environ.get("WORKER_ID", "")
     if from_env:
@@ -403,4 +741,4 @@ def make_worker_id(prefix: str = "worker") -> str:
         hostname = socket.gethostname()
     except Exception:
         hostname = "unknown"
-    return f"{prefix}-{hostname}"
+    return f"{prefix}-{hostname}-{os.getpid()}-{_PROCESS_INSTANCE}"
