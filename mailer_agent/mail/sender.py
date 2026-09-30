@@ -244,18 +244,39 @@ def _smtp_send_with_retry(msg: MIMEMultipart, from_email: str, to_email: str) ->
     records UNKNOWN instead of a plain retryable FAILED.
     """
     context = ssl.create_default_context()
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as server:
-        if settings.smtp_use_tls:
-            server.starttls(context=context)
-        server.login(settings.smtp_username, settings.smtp_password)
+    accepted = False
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as server:
+            if settings.smtp_use_tls:
+                server.starttls(context=context)
+            server.login(settings.smtp_username, settings.smtp_password)
 
-        try:
-            server.sendmail(from_email, [to_email], msg.as_string())
-        except _EXPLICIT_REFUSAL_ERRORS:
-            # The server responded and explicitly rejected the message --
-            # unambiguous failure, not a delivery-uncertain condition.
+            try:
+                server.sendmail(from_email, [to_email], msg.as_string())
+            except _EXPLICIT_REFUSAL_ERRORS:
+                # The server responded and explicitly rejected the message --
+                # unambiguous failure, not a delivery-uncertain condition.
+                raise
+            except Exception as e:
+                raise AmbiguousSendError(
+                    f"Error during SMTP transmission -- delivery status unknown: {e}", e
+                ) from e
+            # sendmail() returned: the server ACCEPTED the message. Nothing
+            # after this point may cause it to be sent again.
+            accepted = True
+    except Exception as cleanup_error:
+        # Once accepted, the only thing left in the `with` is smtplib's
+        # __exit__ (QUIT + close). A non-221 QUIT reply or a socket error
+        # there is an OSError/SMTPException -- i.e. in the retry set -- so it
+        # would re-run this whole function and deliver the message again,
+        # then report FAILED for a delivered message. The delivery already
+        # happened; the connection teardown failure is only worth a warning.
+        # (Failures before `accepted` -- connect, TLS, login, sendmail --
+        # are re-raised unchanged and keep their existing retry semantics.)
+        if not accepted:
             raise
-        except Exception as e:
-            raise AmbiguousSendError(
-                f"Error during SMTP transmission -- delivery status unknown: {e}", e
-            ) from e
+        logger.warning(
+            "SMTP server accepted the message but closing the connection failed "
+            "(%s: %s); treating as sent, NOT retrying",
+            type(cleanup_error).__name__, cleanup_error,
+        )
