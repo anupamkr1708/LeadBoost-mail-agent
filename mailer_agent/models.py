@@ -22,6 +22,7 @@ Design notes:
 from __future__ import annotations
 
 import enum
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -666,3 +667,57 @@ class SuppressionEntry(Base):
     __table_args__ = (
         UniqueConstraint("email", "organization_id", name="uq_suppression_email_org"),
     )
+
+
+class MailboxStatus(str, enum.Enum):
+    ACTIVE = "active"      # operator-enabled; says nothing about credential validity
+    DISABLED = "disabled"
+
+
+def _new_public_reference() -> str:
+    return uuid.uuid4().hex
+
+
+class Mailbox(Base):
+    """
+    A Mailer-owned sending identity (M1). Organization-scoped, with SMTP and
+    optional IMAP credentials stored only as Fernet ciphertext (see
+    mailer_agent/mailbox_secrets.py). Nothing in the send/receive paths reads
+    this table yet; M2/M3 wire it in.
+
+    organization_id comes only from the authenticated API key. public_reference
+    is the only identifier exposed externally. Uniqueness is per organization:
+    two organizations may register the same address (M3 must decide how that
+    interacts with inbound routing -- see migrations/README.md).
+    """
+    __tablename__ = "mailboxes"
+
+    id = Column(Integer, primary_key=True)
+    public_reference = Column(String, nullable=False, default=_new_public_reference)
+    organization_id = Column(String, nullable=False)
+    email_address = Column(String, nullable=False)  # trimmed + lowercased before persistence
+
+    smtp_host = Column(String, nullable=False)
+    smtp_port = Column(Integer, nullable=False)
+    smtp_use_tls = Column(Boolean, nullable=False)
+    smtp_username = Column(String, nullable=False)
+    smtp_password_enc = Column(Text, nullable=False)
+
+    # IMAP is all-or-none (enforced in the request schema).
+    imap_host = Column(String, nullable=True)
+    imap_port = Column(Integer, nullable=True)
+    imap_username = Column(String, nullable=True)
+    imap_password_enc = Column(Text, nullable=True)
+
+    status = Column(String, nullable=False, default=MailboxStatus.ACTIVE.value)
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("public_reference", name="uq_mailboxes_public_reference"),
+        UniqueConstraint("organization_id", "email_address", name="uq_mailboxes_org_email"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Mailbox {self.public_reference}>"

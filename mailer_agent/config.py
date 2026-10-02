@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -110,6 +111,14 @@ class Settings(BaseSettings):
     # prefer ORG_KEY_MAP (JSON) or individual ORG_KEYS_<org_id>=<key> vars
     # -- see mailer_agent/api/deps.py for the full resolution order.
     api_key: str = ""  # if set, required as `X-API-Key` header on all routes
+
+    # --- Mailbox credential encryption (M1) --------------------------------
+    # Fernet key (urlsafe-base64, 32 bytes) used to encrypt mailbox SMTP/IMAP
+    # passwords at rest. Deployment configuration only: never stored in the
+    # database, never auto-generated. Unset/invalid => mailbox credential
+    # operations fail closed (503); the rest of the app is unaffected.
+    # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    mailbox_encryption_key: SecretStr = SecretStr("")
 
     # --- LeadBoost integration (Phase C) ----------------------------------
     # KNOWN OPEN ITEM, recorded explicitly rather than guessed around (see

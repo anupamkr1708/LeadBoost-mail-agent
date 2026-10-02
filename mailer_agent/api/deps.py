@@ -177,3 +177,20 @@ def get_integration_org_id(x_api_key: str | None = Header(default=None)) -> str:
             detail="Integration authentication is not configured on this deployment",
         )
     return get_current_org_id(x_api_key)
+
+
+def get_authenticated_org_id(x_api_key: str | None = Header(default=None)) -> str:
+    """
+    Fail-closed organization resolution for credential-bearing routes
+    (mailboxes). Unlike get_current_org_id, an unconfigured key map is a 503,
+    never an implicit "default" org. 401 for a missing/unknown key (same bodies
+    as get_current_org_id). The organization is only ever the one the presented
+    key maps to via _KEY_MAP.
+    """
+    if not _KEY_MAP:
+        logger.error("Request refused: no API keys are configured; credential routes fail closed.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API authentication is not configured on this deployment",
+        )
+    return get_current_org_id(x_api_key)
