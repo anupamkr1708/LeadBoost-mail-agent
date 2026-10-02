@@ -94,7 +94,7 @@ def test_clean_send_is_unchanged(wire):
     assert len(srv.accepted) == 1
 
 
-def test_login_failure_is_still_retried_three_times_then_failed(wire, monkeypatch):
+def test_login_failure_is_failed_after_one_attempt_not_retried(wire, monkeypatch):
     srv = wire()
     calls = []
 
@@ -105,10 +105,10 @@ def test_login_failure_is_still_retried_three_times_then_failed(wire, monkeypatc
     monkeypatch.setattr(smtplib.SMTP, "login", bad_login)
     result = sender.send_email(**KW)
     assert result.outcome == SendOutcome.FAILED
-    assert len(calls) == 3 and srv.accepted == []
+    assert len(calls) == 1 and srv.accepted == []
 
 
-def test_explicit_refusal_from_sendmail_is_still_failed_and_retried(wire, monkeypatch):
+def test_explicit_refusal_from_sendmail_is_failed_after_one_attempt_not_retried(wire, monkeypatch):
     srv = wire()
     calls = []
 
@@ -119,7 +119,7 @@ def test_explicit_refusal_from_sendmail_is_still_failed_and_retried(wire, monkey
     monkeypatch.setattr(smtplib.SMTP, "sendmail", refuse)
     result = sender.send_email(**KW)
     assert result.outcome == SendOutcome.FAILED
-    assert len(calls) == 3 and srv.accepted == []
+    assert len(calls) == 1 and srv.accepted == []
 
 
 def test_ambiguous_sendmail_failure_is_still_unknown_and_not_retried(wire, monkeypatch):

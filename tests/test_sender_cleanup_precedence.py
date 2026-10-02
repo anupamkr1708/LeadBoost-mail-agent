@@ -123,7 +123,7 @@ def test_explicit_rejection_plus_failing_quit_preserves_the_rejection(wire, monk
 
     assert result.outcome == SendOutcome.FAILED
     assert "no such user" in result.error and QUIT_MARKER not in result.error
-    assert len(calls) == 3                       # same retry count as with a healthy QUIT (unchanged policy)
+    assert len(calls) == 1                       # explicit refusal: one attempt, not retried
     assert srv.accepted == []
 
 
@@ -137,7 +137,7 @@ def test_login_failure_plus_failing_quit_preserves_the_login_failure(wire, monke
 
     assert result.outcome == SendOutcome.FAILED
     assert "bad credentials" in result.error and QUIT_MARKER not in result.error
-    assert len(calls) == 3 and srv.accepted == []
+    assert len(calls) == 1 and srv.accepted == []
 
 
 def test_tls_failure_plus_failing_quit_preserves_the_tls_failure(wire, monkeypatch):
