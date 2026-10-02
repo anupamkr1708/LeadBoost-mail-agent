@@ -46,7 +46,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid
 
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from mailer_agent.config import get_settings
 
@@ -224,11 +224,19 @@ _EXPLICIT_REFUSAL_ERRORS = (
 )
 
 
+def _is_retryable_smtp_error(exc: BaseException) -> bool:
+    """Transient/network-level only. Explicit server refusals are excluded
+    even though they subclass entries of _TRANSIENT_SMTP_ERRORS
+    (SMTPException -> OSError, SMTPResponseException): the server answered and
+    said no, so retrying only repeats a rejected login or recipient."""
+    return isinstance(exc, _TRANSIENT_SMTP_ERRORS) and not isinstance(exc, _EXPLICIT_REFUSAL_ERRORS)
+
+
 @retry(
     reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=15),
-    retry=retry_if_exception_type(_TRANSIENT_SMTP_ERRORS),
+    retry=retry_if_exception(_is_retryable_smtp_error),
 )
 def _smtp_send_with_retry(msg: MIMEMultipart, from_email: str, to_email: str) -> None:
     """
