@@ -54,13 +54,25 @@ Run once, in this order, against a fresh or partially-migrated database:
    new table is created via `ExternalDispatch.__table__.create(...,
    checkfirst=True)` rather than hand-written DDL.
 
-**Deployment note (as of this migration):** none of these six scripts are
+7. `005_external_dispatch_grounding_context.py` -- C9.2: nullable JSON
+   `external_dispatches.grounding_context`, the immutable per-dispatch
+   grounding snapshot written by
+   `POST /integrations/leadboost/outreach-requests`
+   (`mailer_agent/api/integrations_generated.py`). Purely additive; NULL for
+   every existing row and every exact-message dispatch (the worker then
+   grounds exactly as before). The only migration here with a
+   `--downgrade` (drops the column, discarding any snapshots written since).
+   **Apply before deploying C9.2 code:** the ORM selects this column on
+   every `ExternalDispatch` query, including the existing worker's claim
+   path, so code deployed ahead of the column fails on first use.
+
+**Deployment note (as of this migration):** none of these seven scripts are
 run automatically by this repo's `render.yaml` -- its `buildCommand` only
 installs dependencies. Until a pre-deploy migration step is added (tracked
 separately), apply new migrations manually, in the order above, before
 deploying application code that depends on them -- in particular, deploying
-the Phase C integration endpoint without first running `004_...py` against
-that environment will 500 on first use.
+the Phase C integration endpoint without first running `004_...py` (or the
+C9.2 code without `005_...py`) against that environment will 500 on first use.
 
 ## Known duplicate
 
@@ -88,7 +100,10 @@ python migrations/002_work_claiming.py
 python migrate_db.py
 python migrations/003_message_id_unique_constraint.py
 python migrations/004_external_dispatch_and_campaign_integration_source.py
+python migrations/005_external_dispatch_grounding_context.py
 ```
+
+To revert 005 only: `python migrations/005_external_dispatch_grounding_context.py --downgrade`.
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/
 indexes/constraints that already exist.

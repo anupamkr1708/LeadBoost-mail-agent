@@ -147,3 +147,33 @@ def get_current_org_id(x_api_key: str | None = Header(default=None)) -> str:
             detail="Invalid API key",
         )
     return org_id
+
+
+def get_integration_org_id(x_api_key: str | None = Header(default=None)) -> str:
+    """
+    Fail-closed variant of get_current_org_id for the external-integration
+    boundary (C9.2: POST /integrations/leadboost/outreach-requests).
+
+    get_current_org_id / require_api_key deliberately stay open in local
+    development when no key is configured at all (everything resolves to org
+    "default"). That is acceptable for the human-operated routes; it is not
+    acceptable for a boundary where an external system's already-authorized
+    action creates outbound email. Here an unconfigured deployment refuses
+    every request (503) instead of treating an absent key map as permission,
+    and the tenant is always the one the presented key maps to -- never
+    anything from the request body.
+
+    Reuses the existing key map and constant-time resolution; no second
+    authentication system. 401 for a missing/unknown key (same bodies as
+    get_current_org_id, so which keys exist is not distinguishable).
+    """
+    if not _KEY_MAP:
+        logger.error(
+            "Integration request refused: no API keys are configured "
+            "(API_KEY / ORG_KEY_MAP / ORG_KEYS_*); the integration boundary fails closed."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Integration authentication is not configured on this deployment",
+        )
+    return get_current_org_id(x_api_key)

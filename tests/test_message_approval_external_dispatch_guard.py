@@ -1,7 +1,14 @@
 """
-Ownership boundary: a Message linked to an ACTIVE LeadBoost ExternalDispatch
-(QUEUED or SENDING) belongs to the async worker and must not be deliverable
-through the legacy human-approval endpoint.
+Ownership boundary: a Message owned by a LeadBoost ExternalDispatch belongs to
+the async worker and must not be deliverable through the legacy
+human-approval endpoint -- in ANY state.
+
+C9.2 widened this from "only while the dispatch is QUEUED/SENDING" to "always
+for integration-managed Messages": LeadBoost owns authorization for
+integrated outbound, so native human approval must not become an alternate
+authorization path for a Message whose dispatch already FAILED, ended UNKNOWN
+or SENT either. (The earlier carve-out for terminal dispatches is gone; the
+tests that pinned it now pin the refusal.) Ordinary Messages are unaffected.
 
 Why it matters: the integration path creates the Message as DRAFT and the
 worker only flips it to SENDING when it claims the row, so while the dispatch
@@ -9,9 +16,8 @@ is QUEUED the message looks exactly like an ordinary draft to
 POST /messages/{id}/approve. Without this guard a person (or a script) could
 send it out-of-band, then the worker would find it no longer sendable.
 
-The guard is deliberately narrow: only the two ACTIVE states block; terminal
-dispatches (SENT/FAILED/UNKNOWN) leave the endpoint's existing behaviour
-exactly as it was, and ordinary drafts are unaffected.
+Ordinary drafts (any Message NOT under an integration Campaign) are
+unaffected.
 
 API tests use per-request sessions on a file-backed SQLite so the async
 worker and the HTTP layer see each other's COMMITTED state, as in production.
@@ -42,7 +48,7 @@ from mailer_agent.models import (
 from tests.dispatch_support import FakeSender, TrackingFactory, age, seed_dispatch
 
 ORG_A, ORG_B = "org-a", "org-b"
-OWNED_DETAIL = "external dispatch workflow"
+OWNED_DETAIL = "external integration"
 CLEAN_BODY = "Hi Jane,\n\nWorth a quick chat?\n\nBest"
 
 
@@ -175,7 +181,7 @@ def test_other_tenants_still_get_404_not_the_ownership_message(sm, client, org, 
     assert OWNED_DETAIL not in r.text
 
 
-# --------------------------------------------- terminal states: unchanged
+# --------------------------------- terminal states: refused too (C9.2)
 
 @pytest.mark.parametrize(
     "dispatch_state, msg_status",
@@ -185,7 +191,7 @@ def test_other_tenants_still_get_404_not_the_ownership_message(sm, client, org, 
         (S.UNKNOWN, MessageStatus.UNKNOWN),
     ],
 )
-def test_terminal_dispatch_leaves_the_legacy_response_exactly_as_before(sm, client, legacy_send, dispatch_state, msg_status):
+def test_terminal_dispatch_message_is_refused_not_reopened(sm, client, legacy_send, dispatch_state, msg_status):
     did, mid = _seed(sm, state=dispatch_state.value)
     with sm() as s:
         s.get(Message, mid).status = msg_status.value      # what the worker leaves behind
@@ -193,19 +199,21 @@ def test_terminal_dispatch_leaves_the_legacy_response_exactly_as_before(sm, clie
 
     r = _approve(client, mid)
 
-    # Exactly the pre-existing behaviour: not a draft -> 400. Not the new 409.
-    assert r.status_code == 400
-    assert r.json()["detail"] == f"Message is not a draft (status={msg_status.value})"
+    # Integration-owned: refused as such (409), not as a generic "not a draft".
+    assert r.status_code == 409 and OWNED_DETAIL in r.json()["detail"]
     assert legacy_send.calls == []
+    assert _msg_state(sm, mid)[0] == msg_status.value   # untouched
 
 
-def test_guard_is_keyed_to_active_dispatch_state_only(sm, client, legacy_send):
-    """A DRAFT message whose dispatch is terminal is not blocked by the guard:
-    the endpoint's own pre-existing rules apply (here: it proceeds and sends)."""
+def test_integration_draft_with_a_terminal_dispatch_is_still_refused(sm, client, legacy_send):
+    """Before C9.2 a DRAFT whose dispatch was already terminal fell through to
+    the legacy send path. It must not: the refusal no longer depends on the
+    dispatch state."""
     _, mid = _seed(sm, state=S.FAILED.value)               # terminal dispatch, message still DRAFT
     r = _approve(client, mid)
-    assert r.status_code == 200 and r.json()["status"] == "sent"
-    assert len(legacy_send.calls) == 1
+    assert r.status_code == 409 and OWNED_DETAIL in r.json()["detail"]
+    assert legacy_send.calls == []
+    assert _msg_state(sm, mid)[0] == MessageStatus.DRAFT.value
 
 
 def test_ordinary_draft_without_any_dispatch_still_approves_normally(sm, client, legacy_send):
@@ -226,8 +234,10 @@ def test_ordinary_draft_without_any_dispatch_still_approves_normally(sm, client,
     assert len(legacy_send.calls) == 1 and legacy_send.calls[0]["to_email"] == "j@example.com"
 
 
-def test_unrelated_messages_in_the_same_campaign_are_not_blocked(sm, client, legacy_send):
-    """Only the message the dispatch points at is owned -- not its siblings."""
+def test_every_message_in_the_integration_campaign_is_refused_not_only_the_dispatch_message(sm, client, legacy_send):
+    """Ownership is by campaign, not by dispatch pointer: a sibling Message on
+    the same integration Contact is refused as well (it could otherwise be
+    sent natively to an LeadBoost-managed recipient)."""
     did, owned_mid = _seed(sm)
     with sm() as s:
         contact_id = s.get(ExternalDispatch, did).contact_id
@@ -237,7 +247,8 @@ def test_unrelated_messages_in_the_same_campaign_are_not_blocked(sm, client, leg
         sibling_id = sibling.id
 
     assert _approve(client, owned_mid).status_code == 409
-    assert _approve(client, sibling_id).status_code == 200
+    assert _approve(client, sibling_id).status_code == 409
+    assert legacy_send.calls == []
 
 
 # ------------------------------------------------- async worker is unchanged
@@ -295,6 +306,6 @@ def test_worker_failure_and_unknown_outcomes_are_unchanged_and_approval_does_not
     w.process_next_external_dispatch(session_factory=TrackingFactory(sm), worker_id="w-1", runtime=w.DispatchRuntime())
     assert _dispatch_state(sm, did) == expected.value
 
-    r = _approve(client, mid)                          # terminal now: legacy behaviour, cannot be re-sent
-    assert r.status_code == 400 and "not a draft" in r.json()["detail"]
+    r = _approve(client, mid)                          # terminal now: still refused, cannot be re-sent
+    assert r.status_code == 409 and OWNED_DETAIL in r.json()["detail"]
     assert legacy_send.calls == [] and len(fake.calls) == 1

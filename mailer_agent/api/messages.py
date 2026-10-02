@@ -26,6 +26,7 @@ from mailer_agent.models import (
     Message,
     MessageStatus,
     SuppressionEntry,
+    contact_is_integration_managed,
 )
 from mailer_agent.schemas import MessageOut, SuppressRequest
 
@@ -142,6 +143,22 @@ def approve_and_send_draft(
     of review_required -- see semantic_models.GroundingValidation.
     """
     msg = _get_message_or_404(db, message_id, org_id)
+
+    # Integration-owned Messages (anything under an integration Campaign)
+    # are NEVER manually sendable here, in any status. LeadBoost owns the
+    # authorization for integrated outbound and the ExternalDispatch worker
+    # owns delivery; this native human-approval path must not become a second
+    # authorization route -- including for a Message whose dispatch already
+    # failed, ended UNKNOWN or completed (the active-dispatch guard below only
+    # covers queued/sending). Checked first so every state gets the same answer.
+    if contact_is_integration_managed(msg.contact):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This message belongs to an external integration (LeadBoost) and "
+                "cannot be approved or sent through the native approval path."
+            ),
+        )
 
     # Ownership boundary: while a LeadBoost ExternalDispatch is queued or
     # sending, its Message belongs to the async worker. While QUEUED the

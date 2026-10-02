@@ -189,7 +189,8 @@ def _get_or_create_integration_campaign(db: Session, org_id: str) -> Campaign:
         sender_email=settings.leadboost_integration_sender_email,
         value_prop=(
             "LeadBoost-authorized outreach -- every message sent under this "
-            "campaign is supplied verbatim per action by LeadBoost; this "
+            "campaign is authorized per action by LeadBoost (supplied verbatim, "
+            "or generated from that action's own request-local context); this "
             "campaign's own value_prop is never used to draft or alter any "
             "message."
         ),

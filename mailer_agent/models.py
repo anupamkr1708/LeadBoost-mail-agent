@@ -37,6 +37,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import event, inspect as sa_inspect
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 from mailer_agent.utils.datetime_utils import utcnow
@@ -567,6 +568,25 @@ class ExternalDispatch(Base):
     # body} -- see api/integrations.py::_compute_request_fingerprint.
     request_fingerprint = Column(String, nullable=False)
 
+    # C9.2: immutable per-dispatch grounding snapshot. NULL for dispatches
+    # created by the exact-message route (POST /outreach-actions), whose
+    # grounding inputs are the integration Campaign/Contact fields exactly
+    # as before. For a dispatch created by POST /outreach-requests this
+    # holds the grounding material THIS dispatch's Message was generated
+    # and validated against:
+    #     {"version": 1,
+    #      "value_prop": str,                    # request's value_proposition
+    #      "context_notes": str | None,          # request's recipient_facts
+    #      "conversation_transcript": str | None}
+    # Written once, in the same commit that creates the Message and this
+    # row, and never updated (see _forbid_grounding_context_update below).
+    # The worker grounds against THIS value, never against the shared
+    # integration Campaign/Contact rows, which other requests may touch:
+    # request A's message must never be re-validated against request B's
+    # context. Not a place for sender/SMTP/mailbox data and not exposed
+    # through any API.
+    grounding_context = Column(JSON, nullable=True)
+
     # Opaque external handle -- see class docstring. uuid4 hex, generated
     # at creation time, never the internal sequential `id`.
     public_reference = Column(String, nullable=False)
@@ -592,6 +612,43 @@ class ExternalDispatch(Base):
     campaign = relationship("Campaign")
     contact = relationship("Contact")
     message = relationship("Message")
+
+
+def campaign_is_integration_managed(campaign: "Campaign | None") -> bool:
+    """
+    True for a Campaign that is the structural home of an external
+    integration's work (integration_source is non-NULL, today only
+    "leadboost"). Authorization for everything sent under such a campaign
+    belongs to the integration (LeadBoost's OutreachAction), not to Mailer's
+    native campaign automation, so every native outbound path (campaign
+    start, initial/follow-up schedulers, force-followup, manual approval,
+    automatic reply) must refuse it. Deliberately "is not None" rather than
+    "== 'leadboost'": any future integration_source is equally not a native
+    campaign, and the safe default for an unknown source is to refuse.
+    """
+    return campaign is not None and campaign.integration_source is not None
+
+
+def contact_is_integration_managed(contact: "Contact | None") -> bool:
+    """See campaign_is_integration_managed. Reads contact.campaign (lazy)."""
+    return contact is not None and campaign_is_integration_managed(contact.campaign)
+
+
+@event.listens_for(ExternalDispatch, "before_update")
+def _forbid_grounding_context_update(mapper, connection, target) -> None:
+    """
+    grounding_context is write-once. Every legitimate update to an
+    ExternalDispatch (claiming, finishing, annotating) leaves it untouched;
+    an ORM update that changes it is a bug, so fail loudly instead of
+    letting a later request rewrite what an accepted message is grounded
+    against. (Core/bulk UPDATE statements bypass ORM events; nothing in this
+    code base issues one against this column.)
+    """
+    if sa_inspect(target).attrs.grounding_context.history.has_changes():
+        raise ValueError(
+            "ExternalDispatch.grounding_context is immutable once the "
+            "dispatch has been accepted"
+        )
 
 
 class SuppressionEntry(Base):

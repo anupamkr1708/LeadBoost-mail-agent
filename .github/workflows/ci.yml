@@ -133,7 +133,9 @@ jobs:
           # silently SKIPS (reported not-available) instead of running.
           POSTGRES_TEST_URL: postgresql+psycopg2://mailer_agent:mailer_agent_test_pw@localhost:5432/mailer_agent_test
         run: |
-          python -m pytest -o addopts="" tests/test_postgresql_concurrency.py -v
+          python -m pytest -o addopts="" \
+            tests/test_postgresql_concurrency.py \
+            tests/test_leadboost_generated_outreach_postgres.py -v
 
   local-smtp:
     name: Local SMTP protocol integration

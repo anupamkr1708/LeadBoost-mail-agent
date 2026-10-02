@@ -25,6 +25,7 @@ from mailer_agent.models import (
     MessageDirection,
     MessageStatus,
     MessageType,
+    contact_is_integration_managed,
 )
 from mailer_agent.state_machine import (
     StateTransitionEvent,
@@ -79,6 +80,15 @@ class IntegratedFollowUpEngine:
         """
         from mailer_agent.followup.engine import is_suppressed
         
+        # Integration-managed contacts are never sent by the native engine
+        # (their outreach is authorized per action by LeadBoost). The claim
+        # query already excludes them; this covers every other caller.
+        if contact_is_integration_managed(contact):
+            logger.warning(
+                "Refusing native initial outreach for integration-managed contact %s", contact.id
+            )
+            return {"contact_id": contact.id, "action": "skipped_integration_managed"}
+
         campaign = contact.campaign
         
         # Suppression check
@@ -200,6 +210,15 @@ class IntegratedFollowUpEngine:
         from mailer_agent.followup.engine import is_suppressed
         from mailer_agent.mail.imap_reader import as_reply_subject
         
+        # Integration-managed contacts never get a native follow-up, whatever
+        # their state or next_action_at (see send_initial_outreach). Checked
+        # before anything else so no draft, send or state change can follow.
+        if contact_is_integration_managed(contact):
+            logger.warning(
+                "Refusing native follow-up for integration-managed contact %s", contact.id
+            )
+            return {"contact_id": contact.id, "action": "skipped_integration_managed"}
+
         # Check if should send
         should_send, reason = self.scheduler.should_send_followup_now(contact)
         if not should_send:

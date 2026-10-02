@@ -171,6 +171,7 @@ def test_external_dispatch_model_exists_with_expected_columns():
         "correlation_id", "campaign_id", "contact_id", "message_id",
         "request_fingerprint", "public_reference", "state", "claimed_by",
         "claimed_at", "error_message", "created_at", "updated_at",
+        "grounding_context",  # C9.2
     }
 
 

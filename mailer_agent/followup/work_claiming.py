@@ -127,6 +127,12 @@ def claim_due_contacts(
       - ``next_action_at`` is set and <= now
       - Either not claimed (``claimed_by IS NULL``) **or** the current
         claim has expired (``claimed_at < now() - CLAIM_LEASE_SECONDS``)
+      - the contact's Campaign is NOT integration-managed
+        (``integration_source IS NULL``): LeadBoost-owned contacts are
+        authorized per action by LeadBoost and delivered via
+        ExternalDispatch, so the native initial/follow-up schedulers -- the
+        only callers of this function -- must never claim them, whatever
+        their status or next_action_at.
 
     Returns a list of Contact ORM objects whose ``claimed_by`` has been
     updated to *worker_id* in the same transaction.  The caller is
@@ -302,6 +308,11 @@ def _claim_postgres(
                               c.claimed_by IS NULL
                               OR c.claimed_at < :cutoff
                             )
+                        AND NOT EXISTS (
+                              SELECT 1 FROM campaigns cm
+                               WHERE cm.id = c.campaign_id
+                                 AND cm.integration_source IS NOT NULL
+                            )
                       ORDER BY c.next_action_at
                       LIMIT :limit
                          FOR UPDATE SKIP LOCKED
@@ -355,6 +366,11 @@ def _claim_sqlite(
                AND (
                      claimed_by IS NULL
                      OR claimed_at < :cutoff
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM campaigns cm
+                      WHERE cm.id = contacts.campaign_id
+                        AND cm.integration_source IS NOT NULL
                    )
              ORDER BY next_action_at
              LIMIT :limit

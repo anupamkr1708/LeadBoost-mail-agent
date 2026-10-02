@@ -233,9 +233,17 @@ class ExactGroundingDecision:
 
 
 def evaluate_exact_message_grounding(
-    message: Message, contact: Contact, campaign: Campaign
+    message: Message,
+    contact: Contact,
+    campaign: Campaign,
+    grounding_context: dict | None = None,
 ) -> ExactGroundingDecision:
     """
+    ``grounding_context`` (C9.2): the ExternalDispatch.grounding_context
+    snapshot, when the dispatch has one. If given it REPLACES the
+    Campaign/Contact grounding sources described below (see the branch in the
+    body); if None -- every exact-message dispatch -- behaviour is unchanged.
+
     Run the existing ``validate_grounding`` against the exact stored body
     -- same function, same source fields as api/messages.py::
     approve_and_send_draft (campaign.proof_points, contact.context_notes,
@@ -265,13 +273,27 @@ def evaluate_exact_message_grounding(
     Fail-closed by design; the message is never edited to pass.
     """
     _assert_wired(message, contact, campaign)
-    validation = validate_grounding(
-        message.body,
-        proof_points=campaign.proof_points,
-        context_notes=contact.context_notes,
-        conversation_transcript=None,
-        value_prop=campaign.value_prop,
-    )
+    if grounding_context is None:
+        validation = validate_grounding(
+            message.body,
+            proof_points=campaign.proof_points,
+            context_notes=contact.context_notes,
+            conversation_transcript=None,
+            value_prop=campaign.value_prop,
+        )
+    else:
+        # C9.2: the dispatch carries its own immutable snapshot of what its
+        # message was generated and validated against. Use ONLY that -- never
+        # the shared Campaign/Contact fields, which another request may have
+        # changed since this one was accepted. No operator proof_points exist
+        # for generated outreach (the contract has none), so None.
+        validation = validate_grounding(
+            message.body,
+            proof_points=None,
+            context_notes=grounding_context.get("context_notes"),
+            conversation_transcript=grounding_context.get("conversation_transcript"),
+            value_prop=grounding_context.get("value_prop"),
+        )
     blocked = validation.hard_block
     error_message = None
     if blocked:

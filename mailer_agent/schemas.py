@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -191,3 +191,58 @@ class LeadBoostOutreachActionStatus(BaseModel):
     state: Literal["queued", "sending", "sent", "failed", "unknown"]
     mailing_agent_reference: str
     updated_at: datetime | None = None
+
+
+# ---- LeadBoost generated-outreach intake (C9.2) ---------------------------
+# POST /integrations/leadboost/outreach-requests. LeadBoost has already
+# authorized the action; Mailer generates the message from the context below.
+#
+# Deliberately narrow, and strict: extra="forbid" on EVERY model so an
+# undeclared field is a 422, never silently dropped or honoured. In
+# particular there is no organization/tenant, subject, body, sender identity,
+# reply-to, SMTP/IMAP setting, credential, mailbox reference, proof_points,
+# tone, action type, cadence or campaign setting -- sender identity is the
+# deployment-level integration sender (config.leadboost_integration_sender_*)
+# until the Mailer-owned Mailbox lands (M1/M2). Do not add fields here
+# "because they might be useful"; every one is a new caller-controlled input.
+#
+# Length limits are this stage's choice (bounded prompt size, no
+# prompt-stuffing), not a LeadBoost contract.
+
+_STRICT = ConfigDict(extra="forbid")
+
+
+class LeadBoostGeneratedRecipientIn(BaseModel):
+    model_config = _STRICT
+
+    email: EmailStr
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    company: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class LeadBoostGenerationContextIn(BaseModel):
+    model_config = _STRICT
+
+    # The offer for THIS action. Request-local: used to draft and ground this
+    # one message, snapshotted on its ExternalDispatch, never stored on the
+    # shared integration Campaign.
+    value_proposition: str = Field(..., min_length=1, max_length=2000)
+    # Verified facts about the recipient for THIS action (the only facts the
+    # drafted message may cite about them). At most 8.
+    recipient_facts: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=8
+    )
+
+
+class LeadBoostOutreachRequestIn(BaseModel):
+    model_config = _STRICT
+
+    # Operation identity. external_action_id is required (unlike the
+    # exact-message route) because the idempotency fingerprint is built from
+    # it and the recipient: see api/integrations.py::_compute_generated_request_fingerprint.
+    external_action_id: str = Field(..., min_length=1, max_length=255)
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+    correlation_id: str | None = Field(default=None, max_length=255)
+    recipient: LeadBoostGeneratedRecipientIn
+    context: LeadBoostGenerationContextIn

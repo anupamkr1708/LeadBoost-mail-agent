@@ -19,7 +19,7 @@ from mailer_agent.api.deps import get_current_org_id, require_api_key
 from mailer_agent.db import get_db
 from mailer_agent.followup.engine import is_suppressed
 from mailer_agent.lead_ingestion import LeadIngestionError, normalize_lead_payload
-from mailer_agent.models import Campaign, Contact, ContactStatus
+from mailer_agent.models import Campaign, Contact, ContactStatus, campaign_is_integration_managed
 from mailer_agent.schemas import (
     CampaignCreate,
     CampaignOut,
@@ -266,6 +266,20 @@ def start_campaign(
     Idempotent: already-ACTIVE contacts are not touched.
     """
     campaign = _get_campaign_or_404(db, campaign_id, org_id)
+
+    # The LeadBoost integration Campaign is not a native campaign: its
+    # outreach is authorized per action by LeadBoost and queued as
+    # ExternalDispatch. Starting it here would mark its contacts due for
+    # Mailer-native initial outreach, an authorization path LeadBoost never
+    # granted. Nothing is mutated.
+    if campaign_is_integration_managed(campaign):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This campaign is managed by an external integration and cannot "
+                "be started through the native campaign API."
+            ),
+        )
 
     new_contacts = (
         db.query(Contact)
