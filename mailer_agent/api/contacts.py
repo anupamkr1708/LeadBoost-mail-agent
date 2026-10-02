@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from mailer_agent.api.deps import get_current_org_id, require_api_key
 from mailer_agent.db import get_db
 from mailer_agent.followup.engine import send_followup_if_due
-from mailer_agent.models import Campaign, Contact
+from mailer_agent.models import Campaign, Contact, contact_is_integration_managed
 from mailer_agent.schemas import ContactOut, ThreadOut
 from mailer_agent.state_machine import StateTransitionEvent, can_send_followup, transition_contact_state
 from mailer_agent.utils.datetime_utils import utcnow
@@ -145,6 +145,19 @@ def force_followup(
     sendable state.
     """
     contact = _get_contact_or_404(db, contact_id, org_id)
+
+    # A manual override must not bypass LeadBoost's authorization boundary:
+    # an integration-managed contact is only ever messaged via an authorized
+    # ExternalDispatch. Rejected before next_action_at is touched or anything
+    # is sent.
+    if contact_is_integration_managed(contact):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This contact is managed by an external integration; follow-ups "
+                "cannot be forced through the native API."
+            ),
+        )
 
     if not can_send_followup(contact):
         raise HTTPException(

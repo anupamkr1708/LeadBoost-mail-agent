@@ -342,7 +342,9 @@ def _transaction_b(
             if is_email_suppressed(db, contact.email):
                 raise _Gate("suppressed: recipient is on the suppression list; not sent")
 
-            grounding = evaluate_exact_message_grounding(message, contact, campaign)
+            grounding = evaluate_exact_message_grounding(
+                message, contact, campaign, dispatch.grounding_context
+            )
             if grounding.blocked:
                 raise _Gate(grounding.error_message or "grounding hard block; not sent")
             if grounding.review_required:

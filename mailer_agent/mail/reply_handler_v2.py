@@ -34,6 +34,7 @@ from mailer_agent.models import (
     MessageStatus,
     MessageType,
     SuppressionEntry,
+    contact_is_integration_managed,
 )
 from mailer_agent.semantic.classifier import classify_prospect_reply
 from mailer_agent.semantic_models import IntentType, attach_fact_provenance, serialize_semantic_intent
@@ -319,6 +320,19 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
             # No state change, no action - just wait
             result["action"] = "ignored_oos"
             
+        elif contact_is_integration_managed(contact):
+            # LeadBoost-owned contact. The reply is stored, classified and
+            # state-tracked above/here, but Mailer-native automation must not
+            # turn it into an outbound email nobody authorized: no native
+            # follow-up rescheduling, no drafting, and in particular no
+            # automatic send -- AUTO_REPLY_ENABLED does not apply to this
+            # contact. next_action_at is pinned to None so the contact can
+            # never become native-scheduler-eligible. The bilateral reply
+            # contract is C9.3.
+            transition_contact_state(contact, event, reason=f"Semantic: {intent.reasoning[:100]}")
+            contact.next_action_at = None
+            result["action"] = "recorded_integration_managed"
+
         else:
             # Regular reply - transition state
             transition_contact_state(contact, event, reason=f"Semantic: {intent.reasoning[:100]}")
