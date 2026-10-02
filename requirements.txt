@@ -11,6 +11,7 @@ tenacity>=8.2.0,<9.0.0
 APScheduler>=3.10.0,<4.0.0
 email-validator>=2.0.0,<3.0.0
 alembic>=1.12.0,<2.0.0
+cryptography>=42,<47  # Fernet encryption of mailbox credentials (mailer_agent/mailbox_secrets.py)
 
 # Testing
 pytest>=7.4.0,<8.0.0

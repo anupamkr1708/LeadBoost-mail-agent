@@ -10,6 +10,7 @@ from mailer_agent.api import (
     contacts,
     integrations,
     integrations_generated,
+    mailboxes,
     messages,
     system,
     webhooks,
@@ -67,6 +68,7 @@ app.include_router(webhooks.router)
 app.include_router(system.router)
 app.include_router(integrations.router)
 app.include_router(integrations_generated.router)
+app.include_router(mailboxes.router)
 
 
 @app.get("/health")

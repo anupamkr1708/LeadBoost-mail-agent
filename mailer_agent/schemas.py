@@ -3,7 +3,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    SecretStr,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
+
+from mailer_agent.models import MailboxStatus
 
 
 # ---- Campaigns -----------------------------------------------------------
@@ -246,3 +257,81 @@ class LeadBoostOutreachRequestIn(BaseModel):
     correlation_id: str | None = Field(default=None, max_length=255)
     recipient: LeadBoostGeneratedRecipientIn
     context: LeadBoostGenerationContextIn
+
+
+# ---- Mailboxes (M1) --------------------------------------------------------
+# Strict on every model (extra="forbid"): organization, public_reference and
+# the encrypted columns are never caller-settable. Passwords are SecretStr so
+# a model repr can't leak them; the output model is an explicit allowlist.
+
+_Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+_Password = Annotated[SecretStr, Field(min_length=1, max_length=1024)]
+
+
+class MailboxCreate(BaseModel):
+    model_config = _STRICT
+
+    email_address: EmailStr
+    smtp_host: _Text
+    smtp_port: int = Field(..., ge=1, le=65535)
+    smtp_use_tls: bool
+    smtp_username: _Text
+    smtp_password: _Password
+    # IMAP is optional but all-or-none.
+    imap_host: _Text | None = None
+    imap_port: int | None = Field(default=None, ge=1, le=65535)
+    imap_username: _Text | None = None
+    imap_password: _Password | None = None
+
+    @field_validator("email_address", mode="before")
+    @classmethod
+    def _strip_email(cls, v: Any) -> Any:
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("email_address", mode="after")
+    @classmethod
+    def _lower_email(cls, v: str) -> str:
+        return v.lower()
+
+    @model_validator(mode="after")
+    def _imap_all_or_none(self) -> "MailboxCreate":
+        imap = (self.imap_host, self.imap_port, self.imap_username, self.imap_password)
+        if any(v is not None for v in imap) and any(v is None for v in imap):
+            raise ValueError(
+                "imap_host, imap_port, imap_username and imap_password must be provided together or not at all"
+            )
+        return self
+
+
+class MailboxUpdate(BaseModel):
+    """Omitted field = unchanged. Passwords are write-only replacements."""
+
+    model_config = _STRICT
+
+    status: MailboxStatus | None = None
+    smtp_password: _Password | None = None
+    imap_password: _Password | None = None
+
+    @model_validator(mode="after")
+    def _no_explicit_null(self) -> "MailboxUpdate":
+        for name in self.model_fields_set:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} must not be null")
+        return self
+
+
+class MailboxOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    public_reference: str
+    email_address: str
+    smtp_host: str
+    smtp_port: int
+    smtp_use_tls: bool
+    smtp_username: str
+    imap_host: str | None = None
+    imap_port: int | None = None
+    imap_username: str | None = None
+    status: MailboxStatus
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

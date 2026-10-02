@@ -66,7 +66,27 @@ Run once, in this order, against a fresh or partially-migrated database:
    every `ExternalDispatch` query, including the existing worker's claim
    path, so code deployed ahead of the column fails on first use.
 
-**Deployment note (as of this migration):** none of these seven scripts are
+8. `006_mailboxes.py` -- M1: the Mailer-owned `mailboxes` table
+   (`mailer_agent/models.py::Mailbox`, API in `mailer_agent/api/mailboxes.py`).
+   Purely additive; nothing existing reads or writes it yet (M2/M3 wire it in).
+   Created via `Mailbox.__table__.create(..., checkfirst=True)` (same pattern
+   as 004), so it coexists with `init_db()`'s `create_all()`: whichever runs
+   first creates the table, the other no-ops. Has a `--downgrade`, which is
+   **destructive**: it drops the table and every stored mailbox record and
+   encrypted credential. SMTP/IMAP passwords in this table are Fernet
+   ciphertext produced with the deployment's `MAILBOX_ENCRYPTION_KEY` (never
+   stored in the database): losing or changing that key makes stored
+   credentials unreadable, and restoring a backup requires the same key.
+   Security boundary: this protects credentials in database dumps/backups and
+   against direct database reads; it does NOT protect against compromise of
+   the application host, where the database connection and the key coexist.
+   Uniqueness is `(organization_id, email_address)` and `public_reference`.
+   **M3 consideration (deliberately not solved here):** two organizations may
+   register the same address, so per-mailbox IMAP polling could later poll one
+   physical inbox twice and face ambiguous inbound routing; M3 must decide how
+   physical-mailbox identity interacts with multi-tenant ownership.
+
+**Deployment note (as of this migration):** none of these eight scripts are
 run automatically by this repo's `render.yaml` -- its `buildCommand` only
 installs dependencies. Until a pre-deploy migration step is added (tracked
 separately), apply new migrations manually, in the order above, before
@@ -101,9 +121,11 @@ python migrate_db.py
 python migrations/003_message_id_unique_constraint.py
 python migrations/004_external_dispatch_and_campaign_integration_source.py
 python migrations/005_external_dispatch_grounding_context.py
+python migrations/006_mailboxes.py
 ```
 
 To revert 005 only: `python migrations/005_external_dispatch_grounding_context.py --downgrade`.
+To revert 006 only (destroys all mailbox records/credentials): `python migrations/006_mailboxes.py --downgrade`.
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/
 indexes/constraints that already exist.
