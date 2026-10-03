@@ -52,7 +52,7 @@ jobs:
         # workflow; enforcing it now would fail CI on unrelated findings
         # rather than a real regression. Reported every run, not blocking.
         # --exit-zero always exits 0; if/when the codebase is cleaned up,
-        # drop that flag to make this a real gate.
+        # drop that flag to make it a real gate.
         run: ruff check --exit-zero mailer_agent tests
 
       - name: Dependency sanity (pip check)
@@ -91,7 +91,7 @@ jobs:
           retention-days: 14
 
   postgres-integration:
-    name: PostgreSQL concurrency
+    name: PostgreSQL integration
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -124,7 +124,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run PostgreSQL concurrency suite
+      - name: Run PostgreSQL integration suite
         env:
           # Explicit +psycopg2 driver is required: the pinned SQLAlchemy
           # 2.x range resolves a bare postgresql:// URL to the psycopg
@@ -134,8 +134,9 @@ jobs:
           POSTGRES_TEST_URL: postgresql+psycopg2://mailer_agent:mailer_agent_test_pw@localhost:5432/mailer_agent_test
         run: |
           python -m pytest -o addopts="" \
-            tests/test_postgresql_concurrency.py \
-            tests/test_leadboost_generated_outreach_postgres.py -v
+            tests/test_external_dispatch_postgres.py \
+            tests/test_leadboost_generated_outreach_postgres.py \
+            tests/test_postgresql_concurrency.py -v
 
   local-smtp:
     name: Local SMTP protocol integration
