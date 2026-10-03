@@ -604,9 +604,16 @@ def get_leadboost_outreach_action(
     if row is None:
         raise HTTPException(status_code=404, detail="Outreach action not found")
 
+    # GENERATING (M2-B) is an internal step of "accepted, not yet completed by
+    # a worker": the public vocabulary is unchanged, so it reads as queued.
+    state = (
+        ExternalDispatchState.QUEUED.value
+        if row.state == ExternalDispatchState.GENERATING.value
+        else row.state
+    )
     return LeadBoostOutreachActionStatus(
         accepted=True,
-        state=row.state,
+        state=state,
         mailing_agent_reference=row.public_reference,
         updated_at=row.updated_at,
     )

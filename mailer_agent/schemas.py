@@ -186,7 +186,8 @@ class LeadBoostOutreachActionStatus(BaseModel):
     Agent durably accepted the operation. It says nothing about delivery.
 
     state is the durable ExternalDispatchState, passed through verbatim:
-      queued   accepted, not yet completed by a worker
+      queued   accepted, not yet completed by a worker (for generated
+               outreach this includes the message still being generated)
       sending  a worker owns it; SMTP may be executing
       sent     the sender reported success and that was recorded
       failed   the sender reported a definite failure and that was recorded

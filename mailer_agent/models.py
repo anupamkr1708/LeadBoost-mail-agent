@@ -373,8 +373,18 @@ class ExternalDispatchState(str, enum.Enum):
     This batch (C2-C4) only ever creates rows in QUEUED. The other four
     values are defined now so the column's full vocabulary is fixed
     before any code writes to it, but nothing in this batch sets them.
+
+    GENERATING (M2-B) -- a generation worker owns a generated-outreach row
+      whose Message does not exist yet (message_id IS NULL). Internal only:
+      the reconciliation read reports it as "queued". Generation has no
+      external side effect, so -- unlike SENDING -- an expired GENERATING
+      lease is safely returned to QUEUED (see
+      work_claiming.recover_expired_generations). A QUEUED row with
+      message_id NULL is "accepted, awaiting generation"; the send claim
+      only ever takes QUEUED rows whose message_id is set.
     """
     QUEUED = "queued"
+    GENERATING = "generating"
     SENDING = "sending"
     SENT = "sent"
     FAILED = "failed"
@@ -557,12 +567,13 @@ class ExternalDispatch(Base):
     # whole delete fails, not just the one row this FK is on).
     campaign_id = Column(Integer, ForeignKey("campaigns.id", ondelete="RESTRICT"), nullable=False)
     contact_id = Column(Integer, ForeignKey("contacts.id", ondelete="RESTRICT"), nullable=False)
-    # Set in the same final commit that creates this row (together with
-    # the ExternalDispatch row itself -- see
-    # api/integrations.py::create_leadboost_outreach_action's
-    # transaction-boundary docstring) -- never nullable, unlike a
-    # "resolved later" design would need.
-    message_id = Column(Integer, ForeignKey("messages.id", ondelete="RESTRICT"), nullable=False)
+    # Exact-message route: set in the same final commit that creates this row
+    # (see api/integrations.py::create_leadboost_outreach_action).
+    # M2-B generated-outreach route: NULL from acceptance until the generation
+    # worker creates the ONE Message and sets this in a single fenced commit
+    # (state GENERATING -> QUEUED). Nothing sends a row whose message_id is
+    # NULL. NULL on a FAILED row means generation failed and no Message exists.
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="RESTRICT"), nullable=True)
 
     # M2-A: the Mailer-owned sending identity this dispatch executes through.
     # Resolved from the authenticated organization at acceptance (exactly one
@@ -585,12 +596,15 @@ class ExternalDispatch(Base):
     # as before. For a dispatch created by POST /outreach-requests this
     # holds the grounding material THIS dispatch's Message was generated
     # and validated against:
-    #     {"version": 1,
+    #     {"version": 2,
     #      "value_prop": str,                    # request's value_proposition
     #      "context_notes": str | None,          # request's recipient_facts
-    #      "conversation_transcript": str | None}
-    # Written once, in the same commit that creates the Message and this
-    # row, and never updated (see _forbid_grounding_context_update below).
+    #      "conversation_transcript": str | None,
+    #      "recipient": {"name", "title", "company"}}   # request-local (M2-B)
+    # (version 1, pre-M2-B, had no "recipient": its Message already existed.)
+    # Written once, in the commit that accepts this row (M2-B: before any
+    # Message exists, so it is also the durable generation input), and never
+    # updated (see _forbid_grounding_context_update below).
     # The worker grounds against THIS value, never against the shared
     # integration Campaign/Contact rows, which other requests may touch:
     # request A's message must never be re-validated against request B's

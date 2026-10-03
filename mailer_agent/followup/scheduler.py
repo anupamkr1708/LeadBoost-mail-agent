@@ -185,6 +185,44 @@ def dispatch_external_dispatches_job() -> None:
         logger.info("External dispatch cycle processed %d: %s", len(results), counts)
 
 
+def generate_external_dispatches_job() -> None:
+    """
+    M2-B: draft the message for accepted generated-outreach dispatches
+    (QUEUED, no Message yet) behind the durable acceptance. Its own job so a
+    slow LLM call never delays sending; the LLM-free dispatch job above then
+    sends what this job finishes. Imported lazily like its sibling.
+    """
+    from mailer_agent.mail.outreach_generation_worker import run_generation_cycle
+
+    try:
+        results = run_generation_cycle()
+    except Exception:
+        logger.exception("generate_external_dispatches_job failed")
+        return
+    if results:
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r.outcome] = counts.get(r.outcome, 0) + 1
+        logger.info("External dispatch generation cycle processed %d: %s", len(results), counts)
+
+
+def recover_external_generation_leases_job() -> None:
+    """
+    Separate sweep: expired GENERATING -> QUEUED (nothing was sent; the row is
+    simply regenerated). Distinct job so it fires while generation is blocked
+    inside a slow LLM call.
+    """
+    from mailer_agent.mail.outreach_generation_worker import run_generation_lease_recovery
+
+    try:
+        n = run_generation_lease_recovery()
+    except Exception:
+        logger.exception("recover_external_generation_leases_job failed")
+        return
+    if n:
+        logger.warning("External dispatch generation lease recovery requeued %d row(s)", n)
+
+
 def recover_external_dispatch_leases_job() -> None:
     """
     Separate sweep: expired SENDING -> UNKNOWN (never QUEUED, no SMTP).
@@ -251,6 +289,24 @@ def start_scheduler() -> BackgroundScheduler:
         "interval",
         seconds=settings.external_dispatch_poll_seconds,
         id="dispatch_external_dispatches",
+        max_instances=1
+    )
+
+    # M2-B: durable generation of generated-outreach messages (QUEUED, no
+    # Message -> GENERATING -> QUEUED with Message / FAILED)
+    scheduler.add_job(
+        generate_external_dispatches_job,
+        "interval",
+        seconds=settings.external_dispatch_poll_seconds,
+        id="generate_external_dispatches",
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        recover_external_generation_leases_job,
+        "interval",
+        seconds=settings.external_dispatch_recovery_poll_seconds,
+        id="recover_external_generation_leases",
         max_instances=1
     )
 
