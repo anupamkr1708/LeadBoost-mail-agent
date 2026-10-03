@@ -53,7 +53,7 @@ from tests.dispatch_support import seed_dispatch  # noqa: E402
 
 BASE = "/integrations/leadboost/outreach-actions"
 _TRUNC = (
-    "TRUNCATE external_dispatches, messages, contacts, campaigns, "
+    "TRUNCATE external_dispatches, mailboxes, messages, contacts, campaigns, "
     "suppression_list RESTART IDENTITY CASCADE"
 )
 

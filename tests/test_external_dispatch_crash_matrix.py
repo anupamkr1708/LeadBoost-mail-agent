@@ -152,11 +152,7 @@ def test_E_ambiguous_smtp_outcome_is_unknown_and_never_resent(factory, monkeypat
 
 def test_F_smtp_success_commits_sent_and_releases_the_claim(factory, monkeypatch):
     with FakeSMTPServer() as srv:
-        s = sender.settings
-        for k, v in dict(smtp_host="127.0.0.1", smtp_port=srv.port, smtp_use_tls=False,
-                         smtp_username="u", smtp_password="p").items():
-            monkeypatch.setattr(s, k, v)
-        did = _seed(factory)
+        did = _seed(factory, smtp_host="127.0.0.1", smtp_port=srv.port)   # mailbox transport, not global
         _cycle(factory)
         state, claimed_by, claimed_at, msg_status, msg_id = _row(factory, did)
         assert (state, claimed_by, claimed_at, msg_status) == (S.SENT.value, None, None, MessageStatus.SENT.value)
@@ -175,11 +171,7 @@ def test_G_definite_failure_is_failed_and_not_blindly_retried(factory, monkeypat
 
 def test_H_smtp_accepted_then_crash_before_transaction_c_ends_unknown_with_one_delivery(factory, monkeypatch):
     with FakeSMTPServer() as srv:
-        s = sender.settings
-        for k, v in dict(smtp_host="127.0.0.1", smtp_port=srv.port, smtp_use_tls=False,
-                         smtp_username="u", smtp_password="p").items():
-            monkeypatch.setattr(s, k, v)
-        did = _seed(factory)
+        did = _seed(factory, smtp_host="127.0.0.1", smtp_port=srv.port)
 
         def die(*a, **k):
             raise Dead()
@@ -189,9 +181,6 @@ def test_H_smtp_accepted_then_crash_before_transaction_c_ends_unknown_with_one_d
             w.process_next_external_dispatch(session_factory=factory, worker_id="w-dead", runtime=w.DispatchRuntime())
         monkeypatch.undo()
         monkeypatch.setattr(w.settings, "live_sending_enabled", True)
-        for k, v in dict(smtp_host="127.0.0.1", smtp_port=srv.port, smtp_use_tls=False,
-                         smtp_username="u", smtp_password="p").items():
-            monkeypatch.setattr(sender.settings, k, v)
 
         assert len(srv.accepted) == 1
         assert _row(factory, did)[0] == S.SENDING.value                # indistinguishable from D

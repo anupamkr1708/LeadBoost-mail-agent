@@ -59,13 +59,13 @@ def factory():
     Base.metadata.create_all(bind=eng)
     with eng.begin() as c:
         c.execute(text(
-            "TRUNCATE external_dispatches, messages, contacts, campaigns, "
+            "TRUNCATE external_dispatches, mailboxes, messages, contacts, campaigns, "
             "suppression_list RESTART IDENTITY CASCADE"
         ))
     yield sessionmaker(bind=eng)
     with eng.begin() as c:
         c.execute(text(
-            "TRUNCATE external_dispatches, messages, contacts, campaigns, "
+            "TRUNCATE external_dispatches, mailboxes, messages, contacts, campaigns, "
             "suppression_list RESTART IDENTITY CASCADE"
         ))
     eng.dispose()

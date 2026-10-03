@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import enum
 import logging
+from dataclasses import dataclass, field
 import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
@@ -53,6 +54,22 @@ from mailer_agent.config import get_settings
 logger = logging.getLogger("mailer_agent.mail.sender")
 
 settings = get_settings()
+
+
+@dataclass(frozen=True)
+class SmtpConfig:
+    """
+    Per-call SMTP transport (M2-A): a Mailer-owned mailbox's decrypted SMTP
+    settings, handed in by the caller for ONE send. send_email() never
+    reads, stores or logs credentials beyond using them for that connection;
+    the password is excluded from repr(). When omitted (None) the legacy
+    deployment-wide settings.smtp_* are used, unchanged.
+    """
+    host: str
+    port: int
+    use_tls: bool
+    username: str
+    password: str = field(repr=False)
 
 
 class SendOutcome(str, enum.Enum):
@@ -129,6 +146,7 @@ def send_email(
     in_reply_to_header: str | None = None,
     references_header: str | None = None,
     message_id_header: str | None = None,
+    smtp_config: SmtpConfig | None = None,
 ) -> SendResult:
     """
     Sends a plain-text email (deliberately plain text, not HTML -- plain
@@ -148,6 +166,10 @@ def send_email(
     Omitted -> the legacy behaviour, unchanged: an ID is minted internally.
     Note this only closes the stored-ID/sent-ID mismatch; it does not make
     delivery exactly-once.
+
+    ``smtp_config`` (optional, M2-A): send through these SMTP settings instead
+    of the deployment-wide ``settings.smtp_*``. Omitted -> legacy behaviour.
+    Outcome classification (SENT / FAILED / UNKNOWN) is identical either way.
     """
     if message_id_header is not None:
         msg_id = _validate_message_id_header(message_id_header)
@@ -175,7 +197,10 @@ def send_email(
         return SendResult(success=True, message_id=msg_id, outcome=SendOutcome.SENT)
 
     try:
-        _smtp_send_with_retry(msg, from_email, to_email)
+        if smtp_config is None:
+            _smtp_send_with_retry(msg, from_email, to_email)
+        else:
+            _smtp_send_with_retry(msg, from_email, to_email, smtp_config)
         logger.info("Sent email to %s | msg_id=%s", to_email, msg_id)
         return SendResult(success=True, message_id=msg_id, outcome=SendOutcome.SENT)
     except AmbiguousSendError as e:
@@ -238,7 +263,9 @@ def _is_retryable_smtp_error(exc: BaseException) -> bool:
     wait=wait_exponential(multiplier=1, min=2, max=15),
     retry=retry_if_exception(_is_retryable_smtp_error),
 )
-def _smtp_send_with_retry(msg: MIMEMultipart, from_email: str, to_email: str) -> None:
+def _smtp_send_with_retry(
+    msg: MIMEMultipart, from_email: str, to_email: str, smtp_config: SmtpConfig | None = None
+) -> None:
     """
     Connect, authenticate, and send.
 
@@ -251,15 +278,22 @@ def _smtp_send_with_retry(msg: MIMEMultipart, from_email: str, to_email: str) ->
     DATA-phase) is re-raised as ``AmbiguousSendError`` so the caller
     records UNKNOWN instead of a plain retryable FAILED.
     """
+    cfg = smtp_config or SmtpConfig(
+        host=settings.smtp_host,
+        port=settings.smtp_port,
+        use_tls=settings.smtp_use_tls,
+        username=settings.smtp_username,
+        password=settings.smtp_password,
+    )
     context = ssl.create_default_context()
     accepted = False
     body_error: BaseException | None = None
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as server:
+        with smtplib.SMTP(cfg.host, cfg.port, timeout=30) as server:
             try:
-                if settings.smtp_use_tls:
+                if cfg.use_tls:
                     server.starttls(context=context)
-                server.login(settings.smtp_username, settings.smtp_password)
+                server.login(cfg.username, cfg.password)
 
                 try:
                     server.sendmail(from_email, [to_email], msg.as_string())

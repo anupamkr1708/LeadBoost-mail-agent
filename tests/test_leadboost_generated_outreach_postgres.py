@@ -6,13 +6,14 @@ reachable PostgreSQL -- same harness/contract as test_external_dispatch_postgres
 Dedicated test database only: it is TRUNCATEd.
 
 Each racer is its own thread with its own engine-backed session, calling the
-endpoint handler directly. A barrier INSIDE the (stubbed) LLM call holds every
-racer mid-request -- all have already passed the idempotency lookup and the
-Campaign/Contact get-or-create -- so the final Message+ExternalDispatch commit
-race is real, not an accident of timing. The LLM stub is local to this module
-(the shared fake never infers from prompts, and context-isolation needs a
-response that depends on which request's context the prompt carries); it makes
-no network call.
+endpoint handler directly. M2-B: intake makes no LLM call, so the barrier now
+sits right after the idempotency lookup -- every racer has seen "no such
+dispatch" before any of them commits -- which keeps the final
+ExternalDispatch commit race real, not an accident of timing. Generation is a
+separate worker (mail/outreach_generation_worker.py), raced separately below
+(FOR UPDATE SKIP LOCKED). The LLM stub is local to this module (the shared fake
+never infers from prompts, and context-isolation needs a response that depends
+on which request's context the prompt carries); it makes no network call.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ from mailer_agent.api import integrations_generated as gen  # noqa: E402
 from mailer_agent.config import get_settings  # noqa: E402
 from mailer_agent.llm import provider_v2  # noqa: E402
 from mailer_agent.llm.provider_v2 import LLMJsonResult  # noqa: E402
+from mailer_agent.mail import outreach_generation_worker as gw  # noqa: E402
 from mailer_agent.mail.exact_message import evaluate_exact_message_grounding  # noqa: E402
 from mailer_agent.models import (  # noqa: E402
     Base,
@@ -64,6 +66,7 @@ from mailer_agent.models import (  # noqa: E402
     Message,
 )
 from mailer_agent.schemas import LeadBoostOutreachRequestIn  # noqa: E402
+from tests.dispatch_support import seed_mailbox  # noqa: E402
 
 ORG = "org-race"
 VP_A = "We cut manual invoice reconciliation time by 40% for finance teams."
@@ -71,7 +74,7 @@ BODY_A = "Hi Jane,\n\nWe cut manual invoice reconciliation time by 40% for finan
 VP_B = "We help support teams cut ticket backlog by 65% with automatic triage."
 BODY_B = "Hi Sam,\n\nWe help support teams cut ticket backlog by 65% with automatic triage.\n\nBest"
 
-_TABLES = "external_dispatches, messages, contacts, campaigns, suppression_list"
+_TABLES = "external_dispatches, mailboxes, messages, contacts, campaigns, suppression_list"
 
 
 @pytest.fixture()
@@ -80,7 +83,11 @@ def factory():
     Base.metadata.create_all(bind=eng)
     with eng.begin() as c:
         c.execute(text(f"TRUNCATE {_TABLES} RESTART IDENTITY CASCADE"))
-    yield sessionmaker(bind=eng)
+    sm = sessionmaker(bind=eng)
+    with sm() as s:
+        seed_mailbox(s, org=ORG, email="outreach@mailer.example.com")   # M2-A: intake needs exactly one ACTIVE mailbox
+        s.commit()
+    yield sm
     with eng.begin() as c:
         c.execute(text(f"TRUNCATE {_TABLES} RESTART IDENTITY CASCADE"))
     eng.dispose()
@@ -164,6 +171,32 @@ def _race(fn, n):
     return results
 
 
+@pytest.fixture()
+def race_after_lookup(monkeypatch):
+    """Hold each racer (once, per thread) right after its idempotency lookup."""
+    def install(parties):
+        barrier = threading.Barrier(parties)
+        local = threading.local()
+        real = gen._find_dispatch
+
+        def find(db, org_id, key):
+            found = real(db, org_id, key)
+            if not getattr(local, "waited", False):
+                local.waited = True
+                barrier.wait(timeout=30)
+            return found
+
+        monkeypatch.setattr(gen, "_find_dispatch", find)
+
+    return install
+
+
+def _generate(factory, n=50, worker="gen-pg"):
+    return gw.run_generation_cycle(
+        session_factory=factory, worker_id=worker, runtime=gw.DispatchRuntime(), max_items=n
+    )
+
+
 def _counts(factory):
     with factory() as s:
         return {
@@ -176,25 +209,30 @@ def _counts(factory):
 
 # --------------------------------------------------- A. same idempotency key
 
-def test_concurrent_same_idempotency_key_yields_one_message_one_dispatch(factory, llm):
+def test_concurrent_same_idempotency_key_yields_one_dispatch_and_no_llm_call(factory, llm, race_after_lookup):
     n = 6
-    gate = llm(parties=n)                      # all n are mid-generation when they race to commit
+    gate = llm()
+    race_after_lookup(n)                       # all n have passed the lookup when they race to commit
     results = _race(lambda i: _call(factory, _payload()), n)
 
     assert all(not isinstance(r, HTTPException) for r in results), results
     refs = {r.mailing_agent_reference for r in results}
     assert len(refs) == 1                      # every caller converged on the same operation
-    assert gate.calls == n                     # the race was real: every racer generated a draft
+    assert gate.calls == 0                     # acceptance never touches the LLM
     c = _counts(factory)
-    assert c["messages"] == 1 and c["dispatches"] == 1 and c["campaigns"] == 1 and c["contacts"] == 1
+    assert c["messages"] == 0 and c["dispatches"] == 1 and c["campaigns"] == 1 and c["contacts"] == 1
     with factory() as s:
         d = s.query(ExternalDispatch).one()
-        assert d.public_reference in refs and d.message_id == s.query(Message).one().id
+        assert d.public_reference in refs and d.message_id is None and d.mailbox_id is not None
         assert d.state == "queued"
+    # then generation produces exactly one Message
+    assert [r.outcome for r in _generate(factory)] == ["generated"] and gate.calls == 1
+    assert _counts(factory)["messages"] == 1
 
 
-def test_concurrent_same_key_conflicting_operation_is_409_and_creates_nothing_extra(factory, llm):
-    llm(parties=2)
+def test_concurrent_same_key_conflicting_operation_is_409_and_creates_nothing_extra(factory, llm, race_after_lookup):
+    llm()
+    race_after_lookup(2)
     results = _race(
         lambda i: _call(factory, _payload(action="481" if i == 0 else "999")), 2
     )
@@ -202,7 +240,7 @@ def test_concurrent_same_key_conflicting_operation_is_409_and_creates_nothing_ex
     bad = [r for r in results if isinstance(r, HTTPException)]
     assert len(ok) == 1 and len(bad) == 1 and bad[0].status_code == 409
     c = _counts(factory)
-    assert c["messages"] == 1 and c["dispatches"] == 1
+    assert c["messages"] == 0 and c["dispatches"] == 1
 
 
 def test_replay_after_acceptance_is_a_noop_without_llm(factory, llm):
@@ -210,9 +248,9 @@ def test_replay_after_acceptance_is_a_noop_without_llm(factory, llm):
     first = _call(factory, _payload())
     again = _call(factory, _payload())
     assert again.mailing_agent_reference == first.mailing_agent_reference
-    assert gate.calls == 1
+    assert gate.calls == 0
     c = _counts(factory)
-    assert c["messages"] == 1 and c["dispatches"] == 1
+    assert c["messages"] == 0 and c["dispatches"] == 1
 
 
 # --------------------------------------------------- B. campaign get-or-create
@@ -235,13 +273,15 @@ def test_concurrent_first_use_creates_exactly_one_integration_campaign(factory):
         assert len(rows) == 1
 
 
-def test_concurrent_distinct_requests_still_share_one_campaign_and_one_contact_per_recipient(factory, llm):
+def test_concurrent_distinct_requests_still_share_one_campaign_and_one_contact_per_recipient(factory, llm, race_after_lookup):
     n = 6
-    llm(parties=n)
+    llm()
+    race_after_lookup(n)
     _race(lambda i: _call(factory, _payload(key=f"k-{i}", action=f"a-{i}")), n)   # same recipient, n operations
     c = _counts(factory)
     assert c["campaigns"] == 1 and c["contacts"] == 1
-    assert c["messages"] == n and c["dispatches"] == n
+    assert c["messages"] == 0 and c["dispatches"] == n
+    assert len(_generate(factory)) == n and _counts(factory)["messages"] == n
 
 
 # --------------------------------------------------- C. contact get-or-create
@@ -267,14 +307,16 @@ def test_concurrent_requests_for_same_recipient_create_exactly_one_contact(facto
 
 # --------------------------------------------------- D. context isolation
 
-def test_concurrent_requests_a_and_b_are_grounded_by_their_own_context(factory, llm):
-    llm(parties=2)
+def test_concurrent_requests_a_and_b_are_grounded_by_their_own_context(factory, llm, race_after_lookup):
+    llm()
+    race_after_lookup(2)
     results = _race(lambda i: _call(
         factory,
         _payload(key="A", action="1", email="jane@acme.example.com", name="Jane", vp=VP_A) if i == 0
         else _payload(key="B", action="2", email="sam@globex.example.com", name="Sam", vp=VP_B),
     ), 2)
     assert all(not isinstance(r, HTTPException) for r in results), results
+    assert [r.outcome for r in _generate(factory)] == ["generated", "generated"]   # prompts carry ONE offer each (stub asserts)
 
     with factory() as s:
         da = s.query(ExternalDispatch).filter_by(idempotency_key="A").one()
@@ -297,6 +339,7 @@ def test_a_then_b_on_the_same_contact_keeps_each_dispatch_snapshot(factory, llm)
     llm()
     _call(factory, _payload(key="A", action="1", vp=VP_A))
     _call(factory, _payload(key="B", action="2", vp=VP_B))        # same recipient, different offer
+    assert len(_generate(factory)) == 2
     with factory() as s:
         da = s.query(ExternalDispatch).filter_by(idempotency_key="A").one()
         db_ = s.query(ExternalDispatch).filter_by(idempotency_key="B").one()
@@ -308,16 +351,14 @@ def test_a_then_b_on_the_same_contact_keeps_each_dispatch_snapshot(factory, llm)
 
 # --------------------------------------------------- atomicity
 
-def test_message_and_dispatch_are_created_in_one_transaction(factory, llm, monkeypatch):
-    """If the final commit fails, neither row survives (no Message without its dispatch)."""
+def test_dispatch_with_its_snapshot_is_created_in_one_commit(factory, llm, monkeypatch):
+    """If the final commit fails, no dispatch (and so no snapshot) survives."""
     llm()
     from sqlalchemy.orm import Session
     real_commit = Session.commit
-    calls = {"n": 0}
 
     def flaky_commit(self):
         # campaign + contact get-or-create commit first; fail the FINAL commit only
-        calls["n"] += 1
         if any(isinstance(o, ExternalDispatch) for o in self.new):
             raise RuntimeError("boom at final commit")
         return real_commit(self)
@@ -328,7 +369,45 @@ def test_message_and_dispatch_are_created_in_one_transaction(factory, llm, monke
     monkeypatch.setattr(Session, "commit", real_commit)
     c = _counts(factory)
     assert c["messages"] == 0 and c["dispatches"] == 0
-    # and a clean retry with the same key then succeeds with exactly one pair
+    # and a clean retry with the same key then succeeds with exactly one dispatch
     _call(factory, _payload())
     c = _counts(factory)
-    assert c["messages"] == 1 and c["dispatches"] == 1
+    assert c["messages"] == 0 and c["dispatches"] == 1
+
+
+# --------------------------------------------------- E. generation workers (M2-B)
+
+def test_concurrent_generation_workers_generate_each_dispatch_exactly_once(factory, llm):
+    n, workers = 12, 4
+    gate = llm()
+    for i in range(n):
+        _call(factory, _payload(key=f"k-{i}", action=f"a-{i}"))
+    assert _counts(factory)["messages"] == 0
+
+    results = _race(lambda i: _generate(factory, worker=f"gen-{i}"), workers)
+    flat = [r for batch in results for r in batch]
+
+    assert len(flat) == n and {r.outcome for r in flat} == {"generated"}
+    assert len({r.dispatch_id for r in flat}) == n          # no dispatch processed twice
+    assert gate.calls == n                                   # SKIP LOCKED: one LLM call per dispatch, ever
+    with factory() as s:
+        rows = s.query(ExternalDispatch).all()
+        assert {d.state for d in rows} == {"queued"} and all(d.claimed_by is None for d in rows)
+        assert len({d.message_id for d in rows}) == n and None not in {d.message_id for d in rows}
+        assert s.query(Message).count() == n
+
+
+def test_generating_rows_are_invisible_to_a_second_claimer_on_postgres(factory, llm):
+    from mailer_agent.followup import work_claiming as wc
+
+    llm()
+    _call(factory, _payload())
+    s1, s2 = factory(), factory()
+    try:
+        assert wc.claim_next_generation_dispatch(s1, "gen-a") is not None   # lock held, uncommitted
+        assert wc.claim_next_generation_dispatch(s2, "gen-b") is None       # SKIP LOCKED: not blocked, not duplicated
+        s1.commit()
+        assert wc.claim_next_generation_dispatch(s2, "gen-b") is None       # now GENERATING, no longer QUEUED
+    finally:
+        s1.close()
+        s2.close()

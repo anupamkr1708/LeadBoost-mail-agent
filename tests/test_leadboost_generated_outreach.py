@@ -23,6 +23,7 @@ from mailer_agent.config import get_settings
 from mailer_agent.db import get_db
 from mailer_agent.llm.provider import LLMUnavailableError
 from mailer_agent.mail import external_dispatch_worker as w
+from mailer_agent.mail import outreach_generation_worker as gw
 from mailer_agent.mail.exact_message import evaluate_exact_message_grounding
 from mailer_agent.models import (
     Base,
@@ -34,7 +35,7 @@ from mailer_agent.models import (
     Message,
     MessageStatus,
 )
-from tests.dispatch_support import FakeSender, TrackingFactory
+from tests.dispatch_support import FakeSender, TrackingFactory, seed_org_mailboxes
 
 ORG_A, ORG_B = "org-a", "org-b"
 URL = "/integrations/leadboost/outreach-requests"
@@ -71,7 +72,10 @@ def sm(tmp_path):
         f"sqlite:///{tmp_path/'gen.db'}", connect_args={"check_same_thread": False, "timeout": 15}
     )
     Base.metadata.create_all(bind=eng)
-    yield sessionmaker(bind=eng)
+    sm_ = sessionmaker(bind=eng)
+    with sm_() as s:
+        seed_org_mailboxes(s)
+    yield sm_
     eng.dispose()
 
 
@@ -141,6 +145,13 @@ def _req(**over):
 
 def _queue_draft(fake_llm, body=BODY_A, subject="Quick question about reconciliation"):
     fake_llm.queue_response({"subject": subject, "body": body, "reasoning": "test"})
+
+
+def _generate(sm, n=5):
+    """Run the M2-B generation worker (the only place the LLM is called after acceptance)."""
+    return gw.run_generation_cycle(
+        session_factory=TrackingFactory(sm), worker_id="gen-test", runtime=gw.DispatchRuntime(), max_items=n
+    )
 
 
 def _counts(sm):
@@ -258,7 +269,8 @@ def test_same_key_in_two_tenants_are_independent_and_not_discoverable(real_auth_
     assert ra.status_code == rb.status_code == 202
     assert ra.json()["mailing_agent_reference"] != rb.json()["mailing_agent_reference"]
     c = _counts(sm)
-    assert c["campaigns"] == 2 and c["dispatches"] == 2 and c["messages"] == 2
+    assert c["campaigns"] == 2 and c["dispatches"] == 2 and c["messages"] == 0   # accepted, not yet generated
+    assert len(_generate(sm)) == 2 and _counts(sm)["messages"] == 2
     # org B cannot see org A's dispatch through reconciliation
     ref_a_key = "idem-1"
     assert real_auth_client.get(f"{EXACT_URL}/{ref_a_key}", headers={"X-API-Key": "key-b"}).status_code == 200
@@ -267,26 +279,34 @@ def test_same_key_in_two_tenants_are_independent_and_not_discoverable(real_auth_
 
 # ---------------------------------------------------------------- happy path / persistence shape
 
-def test_accepts_and_creates_exactly_one_message_and_one_dispatch(client, sm, fake_llm, send_spy):
+def test_accepts_without_llm_or_message_then_generation_creates_exactly_one(client, sm, fake_llm, send_spy):
     _queue_draft(fake_llm)
     r = client.post(URL, json=_req())
     assert r.status_code == 202
     body = r.json()
     assert body["accepted"] is True and body["mailing_agent_reference"]
 
+    # durable acceptance: no LLM call, no Message, nothing sent
+    assert fake_llm.call_count == 0 and send_spy.calls == []
+    assert _counts(sm) == {"campaigns": 1, "contacts": 1, "messages": 0, "dispatches": 1}
+    with sm() as s:
+        d = s.query(ExternalDispatch).one()
+        assert d.public_reference == body["mailing_agent_reference"]
+        assert d.state == S.QUEUED.value and d.message_id is None and d.mailbox_id is not None
+        assert d.organization_id == ORG_A and d.external_action_id == "481"
+        assert d.correlation_id == "corr-1"
+
+    (res,) = _generate(sm)
+    assert (res.outcome, res.persisted) == ("generated", True) and fake_llm.call_count == 1
     assert _counts(sm) == {"campaigns": 1, "contacts": 1, "messages": 1, "dispatches": 1}
     with sm() as s:
         d = s.query(ExternalDispatch).one()
         m = s.query(Message).one()
-        assert d.public_reference == body["mailing_agent_reference"]
-        assert d.state == S.QUEUED.value and d.message_id == m.id
-        assert d.organization_id == ORG_A and d.external_action_id == "481"
-        assert d.correlation_id == "corr-1"
-        # the generated artifact is exactly what the worker will transmit
+        assert d.state == S.QUEUED.value and d.message_id == m.id and d.claimed_by is None
+        # the generated artifact is exactly what the dispatch worker will transmit
         assert m.status == MessageStatus.DRAFT.value
         assert m.subject == "Quick question about reconciliation" and m.body == BODY_A
-    assert send_spy.calls == []                                   # intake sends nothing
-    assert fake_llm.call_count == 1                               # one generation, nothing else
+    assert send_spy.calls == [] and fake_llm.call_count == 1
 
 
 def test_sender_identity_is_the_deployment_integration_sender(client, sm, fake_llm):
@@ -313,23 +333,26 @@ def test_request_context_is_not_persisted_on_shared_campaign_or_contact(client, 
         assert k.next_action_at is None and k.status == ContactStatus.NEW.value
         # the one durable copy is the per-dispatch snapshot
         snap = s.query(ExternalDispatch).one().grounding_context
-        assert snap["version"] == 1 and snap["value_prop"] == VP_A
+        assert snap["version"] == 2 and snap["value_prop"] == VP_A
         assert "Acme just opened a second finance office in Austin." in snap["context_notes"]
         assert snap["conversation_transcript"]            # Mailer-owned history (first-contact placeholder)
+        assert snap["recipient"] == {"name": "Jane Doe", "title": "VP Finance", "company": "Acme"}
 
 
-def test_generation_is_fed_this_requests_context_through_existing_prompt_stack(client, fake_llm):
+def test_generation_is_fed_this_requests_context_through_existing_prompt_stack(client, sm, fake_llm):
     _queue_draft(fake_llm)
     assert client.post(URL, json=_req()).status_code == 202
+    _generate(sm)
     system_prompt, human_prompt = fake_llm.last_prompts[-1]
     prompt = system_prompt + "\n" + human_prompt
     for needle in (VP_A, FACTS_A[0], "Jane Doe", "VP Finance", "Acme", "Test Sender"):
         assert needle in prompt
 
 
-def test_prompt_does_not_leak_the_placeholder_campaign_text(client, fake_llm):
+def test_prompt_does_not_leak_the_placeholder_campaign_text(client, sm, fake_llm):
     _queue_draft(fake_llm)
     assert client.post(URL, json=_req()).status_code == 202
+    _generate(sm)
     prompt = "\n".join(fake_llm.last_prompts[-1])
     assert "LeadBoost-authorized outreach" not in prompt
 
@@ -337,6 +360,7 @@ def test_prompt_does_not_leak_the_placeholder_campaign_text(client, fake_llm):
 def test_existing_contact_conversation_history_is_used_not_caller_supplied(client, sm, fake_llm):
     _queue_draft(fake_llm)
     assert client.post(URL, json=_req()).status_code == 202
+    _generate(sm)
     with sm() as s:   # a real prior message in Mailer's own table
         k = s.query(Contact).one()
         s.add(Message(contact_id=k.id, direction="inbound", subject="Re: hi",
@@ -345,6 +369,7 @@ def test_existing_contact_conversation_history_is_used_not_caller_supplied(clien
         s.commit()
     _queue_draft(fake_llm, body="Hi Jane,\n\nWorth a quick chat?\n\nBest")
     assert client.post(URL, json=_req(idempotency_key="idem-2", external_action_id="482")).status_code == 202
+    _generate(sm)
     human = fake_llm.last_prompts[-1][1]
     assert "Please send details about onboarding." in human
     assert _counts(sm)["contacts"] == 1                            # reused, not duplicated
@@ -362,7 +387,7 @@ def test_replay_returns_same_operation_without_llm_or_mutation(client, sm, fake_
     second = client.post(URL, json=retry)
     assert second.status_code == 202
     assert second.json() == first.json()
-    assert fake_llm.call_count == 1 and _counts(sm) == before
+    assert fake_llm.call_count == 0 and _counts(sm) == before
     with sm() as s:
         assert s.query(ExternalDispatch).one().grounding_context["value_prop"] == VP_A   # not overwritten
 
@@ -372,14 +397,13 @@ def test_replay_returns_same_operation_without_llm_or_mutation(client, sm, fake_
     lambda r: r["recipient"].__setitem__("email", "other@acme.example.com"),
 ])
 def test_same_key_different_operation_is_409_and_mutates_nothing(client, sm, fake_llm, mutate):
-    _queue_draft(fake_llm)
     assert client.post(URL, json=_req()).status_code == 202
     before = _counts(sm)
     conflicting = _req()
     mutate(conflicting)
     r = client.post(URL, json=conflicting)
     assert r.status_code == 409
-    assert fake_llm.call_count == 1 and _counts(sm) == before
+    assert fake_llm.call_count == 0 and _counts(sm) == before
 
 
 def test_key_first_used_on_the_exact_message_route_conflicts_here(client, sm, fake_llm):
@@ -403,62 +427,79 @@ def test_fingerprint_depends_only_on_operation_identity():
 
 # ---------------------------------------------------------------- generation failure / grounding
 
-def test_provider_failure_queues_nothing_and_retry_with_same_key_succeeds(client, sm, fake_llm):
+def test_provider_failure_after_acceptance_is_failed_without_message_or_send(client, sm, fake_llm, send_spy):
     fake_llm.queue_error(RuntimeError("provider exploded"))
-    r = client.post(URL, json=_req())
-    assert r.status_code == 503
-    c = _counts(sm)
-    assert c["messages"] == 0 and c["dispatches"] == 0            # nothing half-created
+    assert client.post(URL, json=_req()).status_code == 202        # acceptance never depended on the LLM
+    (res,) = _generate(sm)
+    assert (res.outcome, res.persisted) == ("failed", True)
+    with sm() as s:
+        d = s.query(ExternalDispatch).one()
+        assert d.state == S.FAILED.value and d.message_id is None and d.claimed_by is None
+        assert d.error_message.startswith("generation_failed")
+        assert s.query(Message).count() == 0
+    assert send_spy.calls == [] and _generate(sm) == []              # never regenerated or retried
+    # a retry is a NEW idempotency key (same rule as any FAILED dispatch); the same key replays the failure
+    assert client.post(URL, json=_req()).json()["mailing_agent_reference"] == _ref(sm, "idem-1")
     _queue_draft(fake_llm)
-    assert client.post(URL, json=_req()).status_code == 202
-    assert _counts(sm)["dispatches"] == 1 and _counts(sm)["messages"] == 1
+    assert client.post(URL, json=_req(idempotency_key="idem-new")).status_code == 202
+    assert [r.outcome for r in _generate(sm)] == ["generated"]
+
+
+def _ref(sm, key):
+    with sm() as s:
+        return s.query(ExternalDispatch).filter_by(idempotency_key=key).one().public_reference
 
 
 def test_llm_unavailable_uses_the_existing_deterministic_fallback_with_this_requests_offer(client, sm, fake_llm):
     # draft_message's normal initial-outreach fallback, unchanged: it is built from
     # the transient campaign's value_prop, i.e. THIS request's, not the placeholder.
     fake_llm.queue_error(LLMUnavailableError("down"))
-    r = client.post(URL, json=_req())
-    assert r.status_code == 202
+    assert client.post(URL, json=_req()).status_code == 202
+    assert [r.outcome for r in _generate(sm)] == ["generated"]
     with sm() as s:
         m = s.query(Message).one()
         assert "LeadBoost-authorized outreach" not in m.body
         assert s.query(ExternalDispatch).one().grounding_context["value_prop"] == VP_A
 
 
-def test_draft_that_grounding_hard_blocks_is_not_queued(client, sm, fake_llm):
+def test_draft_that_grounding_hard_blocks_is_failed_with_no_message(client, sm, fake_llm, send_spy):
     # claims a figure that neither the offer nor the facts support
     _queue_draft(fake_llm, body="Hi Jane,\n\nWe saved Acme-sized teams $90,000 last year.\n\nBest")
     r = client.post(URL, json=_req(context={"value_proposition": "We help finance teams.", "recipient_facts": []}))
-    assert r.status_code == 422
-    c = _counts(sm)
-    assert c["messages"] == 0 and c["dispatches"] == 0
+    assert r.status_code == 202
+    (res,) = _generate(sm)
+    assert res.outcome == "failed"
+    with sm() as s:
+        d = s.query(ExternalDispatch).one()
+        assert d.state == S.FAILED.value and d.message_id is None
+        assert d.error_message.startswith("generation_grounding_blocked")
+        assert s.query(Message).count() == 0
+    assert send_spy.calls == []
 
 
-def test_a_claim_supported_by_the_requests_own_facts_is_accepted(client, sm, fake_llm):
+def test_a_claim_supported_by_the_requests_own_facts_is_generated(client, sm, fake_llm):
     _queue_draft(fake_llm, body="Hi Jane,\n\nCongrats on raising $50,000 in seed funding.\n\nBest")
     r = client.post(URL, json=_req(context={
         "value_proposition": "We help finance teams.", "recipient_facts": ["Acme raised $50,000 in seed funding."]}))
     assert r.status_code == 202
+    assert [x.outcome for x in _generate(sm)] == ["generated"]
 
 
 # ---------------------------------------------------------------- contact handling
 
 def test_new_contact_has_no_native_follow_up_and_existing_one_is_not_clobbered(client, sm, fake_llm):
-    _queue_draft(fake_llm)
     assert client.post(URL, json=_req()).status_code == 202
     with sm() as s:
         k = s.query(Contact).one()
         assert k.next_action_at is None
         s.execute(text("UPDATE contacts SET status='active', next_action_at=:t"), {"t": "2030-01-01 00:00:00"})
         s.commit()
-    _queue_draft(fake_llm)
     r = client.post(URL, json=_req(idempotency_key="idem-2", external_action_id="482"))
     # the existing active-follow-up conflict guard is preserved: nothing mutated
     assert r.status_code == 409
     with sm() as s:
         assert s.query(Contact).one().next_action_at is not None
-        assert s.query(Message).count() == 1 and s.query(ExternalDispatch).count() == 1
+        assert s.query(ExternalDispatch).count() == 1
 
 
 # ---------------------------------------------------------------- immutable per-dispatch grounding
@@ -475,6 +516,7 @@ def test_request_a_and_b_keep_their_own_grounding_snapshots(client, sm, fake_llm
                recipient={"email": "sam@globex.example.com", "name": "Sam"},
                context={"value_proposition": VP_B, "recipient_facts": FACTS_B})
     assert ra.status_code == rb.status_code == 202
+    assert [r.outcome for r in _generate(sm)] == ["generated", "generated"]   # oldest first: A then B
     with sm() as s:
         da = s.query(ExternalDispatch).filter_by(idempotency_key="A").one()
         db_ = s.query(ExternalDispatch).filter_by(idempotency_key="B").one()
@@ -496,6 +538,7 @@ def test_worker_grounds_against_the_snapshot_not_later_shared_row_changes(client
     monkeypatch.setattr(w.settings, "live_sending_enabled", True)
     _queue_draft(fake_llm, body=BODY_A)
     assert _post(client, idempotency_key="A").status_code == 202
+    assert [r.outcome for r in _generate(sm)] == ["generated"]
     # "request B" arrives later and (were context shared) would have replaced it:
     with sm() as s:
         s.query(Campaign).update({"value_prop": VP_B, "proof_points": "Totally different proof."})
@@ -513,6 +556,7 @@ def test_worker_ignores_shared_row_support_when_the_snapshot_does_not_have_it(cl
     monkeypatch.setattr(w.settings, "live_sending_enabled", True)
     _queue_draft(fake_llm, body=BODY_A)
     assert _post(client, idempotency_key="A").status_code == 202
+    assert [r.outcome for r in _generate(sm)] == ["generated"]
     with sm() as s:
         # Core UPDATE (bypasses the ORM write-once guard) to simulate a corrupted snapshot
         s.execute(text("UPDATE external_dispatches SET grounding_context = :g"),
@@ -536,7 +580,6 @@ def test_legacy_dispatch_without_snapshot_still_grounds_against_shared_rows(sm):
 
 
 def test_grounding_context_is_write_once_at_the_orm_level(client, sm, fake_llm):
-    _queue_draft(fake_llm)
     assert _post(client).status_code == 202
     with sm() as s:
         d = s.query(ExternalDispatch).one()
@@ -559,6 +602,7 @@ def test_message_created_by_the_endpoint_cannot_be_approved_natively(client, sm,
     monkeypatch.setattr(messages_module, "send_email", legacy)
     _queue_draft(fake_llm)
     assert _post(client).status_code == 202
+    assert [r.outcome for r in _generate(sm)] == ["generated"]
     with sm() as s:
         mid = s.query(Message).one().id
     r = client.post(f"/messages/{mid}/approve")

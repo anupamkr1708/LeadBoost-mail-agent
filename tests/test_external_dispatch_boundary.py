@@ -131,6 +131,10 @@ def test_full_pipeline_runs_with_llm_and_engine_modules_unimportable(tmp_path):
             state = s.get(ExternalDispatch, did).state
         print(res.outcome, state, len(fake.calls))
     """)
+    from cryptography.fernet import Fernet
+
     out = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True,
-                         timeout=180, env={**os.environ, "PYTHONPATH": ROOT})
+                         timeout=180,
+                         env={**os.environ, "PYTHONPATH": ROOT,
+                              "MAILBOX_ENCRYPTION_KEY": Fernet.generate_key().decode()})
     assert out.stdout.strip() == "sent sent 1", out.stdout + out.stderr

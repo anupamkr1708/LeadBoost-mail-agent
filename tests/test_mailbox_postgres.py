@@ -3,7 +3,7 @@ Real-PostgreSQL race tests for the Mailbox uniqueness guarantee (M1).
 
 Skipped (never faked with SQLite) unless POSTGRES_TEST_URL points at a
 reachable PostgreSQL -- same contract as the other *_postgres.py suites.
-Dedicated test database only: the mailboxes table is TRUNCATEd.
+Dedicated test database only: mailboxes (and, via CASCADE, external_dispatches) are TRUNCATEd.
 """
 
 from __future__ import annotations
@@ -62,10 +62,10 @@ def factory():
     eng = create_engine(POSTGRES_TEST_URL, pool_size=20)
     Base.metadata.create_all(bind=eng)
     with eng.begin() as c:
-        c.execute(text("TRUNCATE mailboxes RESTART IDENTITY"))
+        c.execute(text("TRUNCATE mailboxes RESTART IDENTITY CASCADE"))
     yield sessionmaker(bind=eng)
     with eng.begin() as c:
-        c.execute(text("TRUNCATE mailboxes RESTART IDENTITY"))
+        c.execute(text("TRUNCATE mailboxes RESTART IDENTITY CASCADE"))
     eng.dispose()
 
 

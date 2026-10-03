@@ -502,7 +502,10 @@ def test_migration_006_upgrade_idempotent_downgrade_on_sqlite(tmp_path, monkeypa
 # ----------------------------------------------------------------- compatibility
 
 def test_existing_schema_and_campaign_flow_are_untouched(client, sm):
-    assert "mailbox_id" not in ExternalDispatch.__table__.c
+    # M2-A: dispatches reference their mailbox (nullable; credentials never copied onto the row).
+    assert "mailbox_id" in ExternalDispatch.__table__.c
+    assert ExternalDispatch.__table__.c.mailbox_id.nullable is True
+    assert not {"smtp_password", "smtp_password_enc"} & set(ExternalDispatch.__table__.c.keys())
     cols = inspect(sm.kw["bind"]).get_columns("campaigns")
     assert {"sender_name", "sender_org", "sender_email", "reply_to_email"} <= {c["name"] for c in cols}
     _create(client)

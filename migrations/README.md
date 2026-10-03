@@ -86,6 +86,19 @@ Run once, in this order, against a fresh or partially-migrated database:
    physical inbox twice and face ambiguous inbound routing; M3 must decide how
    physical-mailbox identity interacts with multi-tenant ownership.
 
+9. `007_external_dispatch_mailbox.py` -- M2-A: nullable
+   `external_dispatches.mailbox_id` (FK -> `mailboxes.id`, RESTRICT). Apply
+   BEFORE deploying M2-A. Dispatches still QUEUED at deploy time have NULL
+   `mailbox_id` and will FAIL pre-SMTP as `no_mailbox` (they never send through
+   the old global SMTP identity): drain the queue first, or accept those
+   failures (callers retry with a new idempotency key).
+
+10. `008_external_dispatch_deferred_message.py` -- M2-B:
+    `external_dispatches.message_id` becomes NULLABLE (PostgreSQL
+    `DROP NOT NULL`; no-op on SQLite, which is built from the models). Apply
+    BEFORE deploying M2-B and after 007. The new internal state `generating`
+    needs no DDL. Downgrade refuses to run while any row has NULL `message_id`.
+
 **Deployment note (as of this migration):** none of these eight scripts are
 run automatically by this repo's `render.yaml` -- its `buildCommand` only
 installs dependencies. Until a pre-deploy migration step is added (tracked
@@ -122,10 +135,13 @@ python migrations/003_message_id_unique_constraint.py
 python migrations/004_external_dispatch_and_campaign_integration_source.py
 python migrations/005_external_dispatch_grounding_context.py
 python migrations/006_mailboxes.py
+python migrations/007_external_dispatch_mailbox.py
+python migrations/008_external_dispatch_deferred_message.py
 ```
 
 To revert 005 only: `python migrations/005_external_dispatch_grounding_context.py --downgrade`.
 To revert 006 only (destroys all mailbox records/credentials): `python migrations/006_mailboxes.py --downgrade`.
+To revert 007 / 008: `--downgrade` on each (008 refuses while any dispatch has `message_id` NULL).
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/
 indexes/constraints that already exist.

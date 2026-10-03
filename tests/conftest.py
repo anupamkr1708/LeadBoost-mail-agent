@@ -55,6 +55,24 @@ def force_test_dry_run(monkeypatch):
     monkeypatch.setattr(sender.settings, "live_sending_enabled", False)
 
 
+@pytest.fixture(autouse=True, scope="session")
+def mailbox_encryption_key():
+    """M2-A: dispatch execution decrypts mailbox credentials, so the whole
+    test session gets a valid throwaway Fernet key (never a real one).
+    Session-scoped on purpose: several worker tests call monkeypatch.undo()
+    mid-test, which must not remove it. Tests that exercise a missing or
+    invalid key override it themselves with their own monkeypatch."""
+    from cryptography.fernet import Fernet
+    from pydantic import SecretStr
+
+    from mailer_agent.config import get_settings
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(get_settings(), "mailbox_encryption_key", SecretStr(Fernet.generate_key().decode()))
+    yield
+    mp.undo()
+
+
 @pytest.fixture
 def use_real_llm(monkeypatch):
     """

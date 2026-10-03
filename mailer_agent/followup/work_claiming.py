@@ -493,7 +493,11 @@ def claim_next_external_dispatch(
     def _guarded_claim(dispatch_id: int) -> bool:
         result = db.execute(
             update(ExternalDispatch)
-            .where(ExternalDispatch.id == dispatch_id, ExternalDispatch.state == queued)
+            .where(
+                ExternalDispatch.id == dispatch_id,
+                ExternalDispatch.state == queued,
+                ExternalDispatch.message_id.is_not(None),   # M2-B: never send a row still awaiting generation
+            )
             .values(
                 state=sending,
                 claimed_by=worker_id,
@@ -507,7 +511,7 @@ def claim_next_external_dispatch(
     if _is_postgres(db):
         row = db.execute(
             select(ExternalDispatch.id, ExternalDispatch.organization_id)
-            .where(ExternalDispatch.state == queued)
+            .where(ExternalDispatch.state == queued, ExternalDispatch.message_id.is_not(None))
             .order_by(ExternalDispatch.id)
             .limit(1)
             .with_for_update(skip_locked=True)
@@ -518,7 +522,7 @@ def claim_next_external_dispatch(
     else:
         candidates = db.execute(
             select(ExternalDispatch.id, ExternalDispatch.organization_id)
-            .where(ExternalDispatch.state == queued)
+            .where(ExternalDispatch.state == queued, ExternalDispatch.message_id.is_not(None))
             .order_by(ExternalDispatch.id)
             .limit(10)
         ).all()
@@ -700,6 +704,183 @@ def finish_external_dispatch(
         .execution_options(synchronize_session=False)
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# M2-B: generation claiming (QUEUED, message_id NULL -> GENERATING -> QUEUED/FAILED)
+# ---------------------------------------------------------------------------
+
+def claim_next_generation_dispatch(
+    db: Session,
+    worker_id: str,
+    now: Optional[datetime] = None,
+) -> Optional[ClaimedDispatch]:
+    """
+    Atomically claim the oldest accepted-but-ungenerated dispatch
+    (state=QUEUED AND message_id IS NULL) for *worker_id*: state=GENERATING,
+    claimed_by, claimed_at (the fencing token), in the caller's open
+    transaction. Same two-statement SKIP LOCKED shape as
+    claim_next_external_dispatch; does not commit, no I/O beyond the database.
+    """
+    claimed_at = _naive_utc(now)
+    queued = ExternalDispatchState.QUEUED.value
+    generating = ExternalDispatchState.GENERATING.value
+
+    def _guarded_claim(dispatch_id: int) -> bool:
+        result = db.execute(
+            update(ExternalDispatch)
+            .where(
+                ExternalDispatch.id == dispatch_id,
+                ExternalDispatch.state == queued,
+                ExternalDispatch.message_id.is_(None),
+            )
+            .values(
+                state=generating,
+                claimed_by=worker_id,
+                claimed_at=claimed_at,
+                updated_at=_utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount == 1
+
+    base = (
+        select(ExternalDispatch.id, ExternalDispatch.organization_id)
+        .where(ExternalDispatch.state == queued, ExternalDispatch.message_id.is_(None))
+        .order_by(ExternalDispatch.id)
+    )
+    if _is_postgres(db):
+        row = db.execute(base.limit(1).with_for_update(skip_locked=True)).first()
+        if row is None or not _guarded_claim(row.id):
+            return None
+        chosen = row
+    else:
+        chosen = next((c for c in db.execute(base.limit(10)).all() if _guarded_claim(c.id)), None)
+        if chosen is None:
+            return None
+
+    logger.info(
+        "Worker %s claimed external_dispatch id=%d org=%s for generation (QUEUED -> GENERATING)",
+        worker_id, chosen.id, chosen.organization_id,
+    )
+    return ClaimedDispatch(
+        dispatch_id=chosen.id,
+        organization_id=chosen.organization_id,
+        worker_id=worker_id,
+        claimed_at=claimed_at,
+    )
+
+
+def _generation_fence(claim: ClaimedDispatch):
+    return and_(
+        ExternalDispatch.id == claim.dispatch_id,
+        ExternalDispatch.organization_id == claim.organization_id,
+        ExternalDispatch.state == ExternalDispatchState.GENERATING.value,
+        ExternalDispatch.claimed_by == claim.worker_id,
+        ExternalDispatch.claimed_at == claim.claimed_at,
+        ExternalDispatch.message_id.is_(None),
+    )
+
+
+def complete_generation(db: Session, claim: ClaimedDispatch, message_id: int) -> bool:
+    """
+    OWNERSHIP-FENCED GENERATING -> QUEUED: attach the freshly flushed Message
+    and clear the claim, only if the row is STILL the one this worker claimed
+    (id, org, state, claimed_by, exact claimed_at, message_id NULL). False
+    writes nothing -- the caller must then roll back its Message insert, so a
+    worker that lost its lease can never leave a second Message behind.
+    Does not commit.
+    """
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(_generation_fence(claim))
+        .values(
+            state=ExternalDispatchState.QUEUED.value,
+            message_id=message_id,
+            claimed_by=None,
+            claimed_at=None,
+            updated_at=_utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
+def fail_generation(db: Session, claim: ClaimedDispatch, error_message: str) -> bool:
+    """
+    OWNERSHIP-FENCED GENERATING -> FAILED. No Message exists (message_id stays
+    NULL); nothing was or will be sent. Same fence as complete_generation.
+    Does not commit.
+    """
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(_generation_fence(claim))
+        .values(
+            state=ExternalDispatchState.FAILED.value,
+            claimed_by=None,
+            claimed_at=None,
+            error_message=error_message,
+            updated_at=_utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
+def recover_expired_generations(
+    db: Session,
+    *,
+    now: Optional[datetime] = None,
+    lease_seconds: Optional[int] = None,
+    limit: int = 100,
+) -> List[int]:
+    """
+    Expired GENERATING lease -> QUEUED (message_id still NULL), claim cleared.
+
+    Safe -- and deliberately the opposite of SENDING recovery -- because
+    generation has no external side effect: nothing was transmitted and no
+    Message was committed (the Message and the GENERATING -> QUEUED move are
+    one fenced commit), so the row is simply regenerated. A late worker's
+    complete_generation then matches nothing and its Message is rolled back.
+    Safe to run repeatedly/concurrently: every UPDATE re-checks the expiry
+    predicate; SKIP LOCKED on PostgreSQL. Does not commit. Returns the ids.
+    """
+    lease = (
+        settings.external_dispatch_generation_lease_seconds
+        if lease_seconds is None else lease_seconds
+    )
+    cutoff = _naive_utc(now) - timedelta(seconds=lease)
+    expired = and_(
+        ExternalDispatch.state == ExternalDispatchState.GENERATING.value,
+        ExternalDispatch.message_id.is_(None),
+        or_(ExternalDispatch.claimed_at.is_(None), ExternalDispatch.claimed_at < cutoff),
+    )
+    query = select(ExternalDispatch.id, ExternalDispatch.organization_id, ExternalDispatch.claimed_by).where(expired).order_by(ExternalDispatch.id).limit(limit)
+    if _is_postgres(db):
+        query = query.with_for_update(skip_locked=True)
+
+    recovered: List[int] = []
+    for row in db.execute(query).all():
+        result = db.execute(
+            update(ExternalDispatch)
+            .where(ExternalDispatch.id == row.id, expired)
+            .values(
+                state=ExternalDispatchState.QUEUED.value,
+                claimed_by=None,
+                claimed_at=None,
+                updated_at=_utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            continue
+        logger.warning(
+            "external_dispatch generation lease recovery: GENERATING -> QUEUED id=%d org=%s "
+            "previous_worker=%s lease=%ds (nothing sent; will regenerate)",
+            row.id, row.organization_id, row.claimed_by, lease,
+        )
+        recovered.append(row.id)
+    return recovered
 
 
 def annotate_unknown_dispatch(

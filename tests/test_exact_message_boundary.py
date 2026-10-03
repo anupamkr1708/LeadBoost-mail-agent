@@ -71,6 +71,8 @@ ROOT = Path(__file__).resolve().parent.parent
 EXACT_MESSAGE_PY = ROOT / "mailer_agent" / "mail" / "exact_message.py"
 INTEGRATIONS_PY = ROOT / "mailer_agent" / "api" / "integrations.py"
 
+from tests.dispatch_support import seed_org_mailboxes
+
 ORG_A, ORG_B = "org-a", "org-b"
 
 
@@ -105,6 +107,7 @@ def db_session():
     )
     Base.metadata.create_all(bind=eng)
     session = sessionmaker(bind=eng)()
+    seed_org_mailboxes(session)
     try:
         yield session
     finally:

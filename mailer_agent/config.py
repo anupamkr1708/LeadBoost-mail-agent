@@ -204,6 +204,10 @@ class Settings(BaseSettings):
     # real outcome of a still-running send. 900 s clears the measured
     # worst realistic case with margin.
     external_dispatch_lease_seconds: int = 900
+    # M2-B: lease for a GENERATING row (one LLM draft, which has the provider's
+    # own retry/fallback). Unlike SENDING, an expired GENERATING lease is safe
+    # to return to QUEUED -- generation has no external side effect.
+    external_dispatch_generation_lease_seconds: int = 300
     # On SIGTERM: how long the worker waits for in-flight dispatches to
     # finish before marking the ones it still owns UNKNOWN. Keep it under
     # the platform's shutdown grace period.

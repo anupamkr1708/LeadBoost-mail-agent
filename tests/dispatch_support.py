@@ -14,16 +14,65 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from mailer_agent.mail.exact_message import create_authorized_message
+from mailer_agent.mailbox_secrets import encrypt_secret
 from mailer_agent.models import (
     Campaign,
     Contact,
     ExternalDispatch,
     ExternalDispatchState,
+    Mailbox,
+    MailboxStatus,
 )
 
 
 def naive_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+MAILBOX_SMTP_PASSWORD = "mbx-smtp-secret-9f2c"
+
+
+def seed_mailbox(
+    db,
+    *,
+    org: str = "org-a",
+    email: str = "outreach@sender.example.org",
+    status: str = MailboxStatus.ACTIVE.value,
+    smtp_host: str = "smtp.mailbox.example",
+    smtp_port: int = 2525,
+    smtp_use_tls: bool = False,
+    password: str = MAILBOX_SMTP_PASSWORD,
+) -> Mailbox:
+    """Get-or-create the org's mailbox (unique per org+address). Needs
+    MAILBOX_ENCRYPTION_KEY, which tests/conftest.py provides for every test."""
+    mailbox = (
+        db.query(Mailbox)
+        .filter(Mailbox.organization_id == org, Mailbox.email_address == email)
+        .first()
+    )
+    if mailbox is None:
+        mailbox = Mailbox(
+            organization_id=org,
+            email_address=email,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_use_tls=smtp_use_tls,
+            smtp_username=email,
+            smtp_password_enc=encrypt_secret(password),
+            status=status,
+        )
+        db.add(mailbox)
+        db.flush()
+    return mailbox
+
+
+def seed_org_mailboxes(
+    db, orgs=("org-a", "org-b"), email: str = "outreach@mailer.example.com"
+) -> None:
+    """Give each org exactly one ACTIVE mailbox (what intake now requires)."""
+    for org in orgs:
+        seed_mailbox(db, org=org, email=email)
+    db.commit()
 
 
 def seed_dispatch(
@@ -40,6 +89,10 @@ def seed_dispatch(
     sender_email: str = "outreach@sender.example.org",
     proof_points: str | None = None,
     commit: bool = True,
+    mailbox: bool = True,
+    mailbox_status: str = MailboxStatus.ACTIVE.value,
+    smtp_host: str = "smtp.mailbox.example",
+    smtp_port: int = 2525,
 ) -> ExternalDispatch:
     """One integration Campaign per org (get-or-create), one Contact, one
     DRAFT Message and one ExternalDispatch -- the same shape the HTTP
@@ -68,6 +121,14 @@ def seed_dispatch(
     message = create_authorized_message(contact_id=contact.id, subject=subject, body=body)
     db.add(message)
     db.flush()
+    mailbox_row = (
+        seed_mailbox(
+            db, org=org, email=sender_email, status=mailbox_status,
+            smtp_host=smtp_host, smtp_port=smtp_port,
+        )
+        if mailbox
+        else None
+    )
     idem = idem or f"idem-{uuid.uuid4().hex[:10]}"
     dispatch = ExternalDispatch(
         organization_id=org,
@@ -77,6 +138,7 @@ def seed_dispatch(
         campaign_id=campaign.id,
         contact_id=contact.id,
         message_id=message.id,
+        mailbox_id=mailbox_row.id if mailbox_row else None,
         request_fingerprint="f" * 64,
         public_reference=uuid.uuid4().hex,
         state=state,

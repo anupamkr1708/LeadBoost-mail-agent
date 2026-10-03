@@ -28,12 +28,14 @@ from mailer_agent.api.main import app
 from mailer_agent.config import get_settings
 from mailer_agent.db import get_db
 from mailer_agent.models import Base, ExternalDispatch, ExternalDispatchState, Message
-from tests.dispatch_support import seed_dispatch
+from tests.dispatch_support import seed_dispatch, seed_org_mailboxes
 
 ORG_A = "org-a"
 ORG_B = "org-b"
 BASE = "/integrations/leadboost/outreach-actions"
-ALL_STATES = [s.value for s in ExternalDispatchState]
+# The public vocabulary. GENERATING (M2-B) is internal and reads as "queued"
+# (see test_generating_is_reported_as_queued_and_get_mutates_nothing).
+ALL_STATES = [s.value for s in ExternalDispatchState if s is not ExternalDispatchState.GENERATING]
 EXPECTED_KEYS = {"accepted", "state", "mailing_agent_reference", "updated_at"}
 
 
@@ -66,6 +68,7 @@ def engine():
 @pytest.fixture()
 def db(engine):
     session = sessionmaker(bind=engine)()
+    seed_org_mailboxes(session)
     try:
         yield session
     finally:
@@ -148,6 +151,23 @@ def test_get_returns_200_with_exact_durable_state(client, db, state):
     assert body["accepted"] is True
     assert body["state"] == state
     assert body["mailing_agent_reference"] == d.public_reference
+
+
+def test_generating_is_reported_as_queued_and_get_mutates_nothing(client, db):
+    d = seed_dispatch(db, org=ORG_A, idem="k1", state="generating", claimed_by="gen-w", claimed_at=None)
+    before = _snapshot(db, ExternalDispatch, d.id)
+    body = client.get(f"{BASE}/k1").json()
+    assert set(body) == EXPECTED_KEYS and body["state"] == "queued"
+    assert body["mailing_agent_reference"] == d.public_reference
+    assert _snapshot(db, ExternalDispatch, d.id) == before            # GET never advances/recovers it
+
+
+def test_deferred_message_row_is_readable_before_its_message_exists(client, db):
+    d = seed_dispatch(db, org=ORG_A, idem="k1", state="queued")
+    d.message_id = None                                               # accepted, generation pending
+    db.commit()
+    body = client.get(f"{BASE}/k1").json()
+    assert body["state"] == "queued" and body["mailing_agent_reference"] == d.public_reference
 
 
 def test_unknown_is_never_translated(client, db):
