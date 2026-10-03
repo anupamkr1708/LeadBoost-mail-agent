@@ -20,7 +20,11 @@ Transactions -- explicit, and never open across SMTP
   Transaction B  (own session; ONE commit)
       claim QUEUED -> SENDING (FOR UPDATE SKIP LOCKED on PostgreSQL)
       load Campaign / Contact / Message with tenant-scoped predicates
-      validate wiring -> suppression -> grounding -> LIVE_SENDING_ENABLED
+      validate wiring -> mailbox (M2-A: present, same org, ACTIVE) ->
+        suppression -> grounding -> LIVE_SENDING_ENABLED
+      decrypt the mailbox SMTP password for this operation (M2-A);
+        an unset/invalid MAILBOX_ENCRYPTION_KEY rolls back and leaves the row
+        QUEUED (deployment problem); an undecryptable token is FAILED
       mint + persist Message.message_id_header, Message.status = SENDING
       COMMIT, then the session is CLOSED.
       Any gate failure ends here as FAILED (QUEUED -> SENDING -> FAILED
@@ -73,7 +77,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from sqlalchemy import select
@@ -94,12 +98,19 @@ from mailer_agent.mail.exact_message import (
     build_exact_send_input,
     evaluate_exact_message_grounding,
 )
-from mailer_agent.mail.sender import SendOutcome, generate_message_id, send_email
+from mailer_agent.mail.sender import SendOutcome, SmtpConfig, generate_message_id, send_email
+from mailer_agent.mailbox_secrets import (
+    MailboxDecryptionError,
+    MailboxEncryptionUnavailable,
+    decrypt_secret,
+)
 from mailer_agent.models import (
     Campaign,
     Contact,
     ExternalDispatch,
     ExternalDispatchState as S,
+    Mailbox,
+    MailboxStatus,
     Message,
     MessageStatus,
 )
@@ -219,6 +230,12 @@ class _Deferred(Exception):
     """Shutdown was requested before B committed: roll back, leave QUEUED."""
 
 
+class _Unavailable(Exception):
+    """A deployment-level precondition is missing (MAILBOX_ENCRYPTION_KEY
+    unset/invalid). Not a property of this dispatch, so it is NOT failed:
+    roll back, leave QUEUED, and retry once the deployment is fixed."""
+
+
 @dataclass(frozen=True)
 class _Ctx:
     """Correlation identifiers for logging. Never credentials, never bodies."""
@@ -297,6 +314,50 @@ def _load_tenant_scoped(db: Session, dispatch: ExternalDispatch):
     return campaign, contact, message
 
 
+def _load_active_mailbox(db: Session, dispatch: ExternalDispatch) -> Mailbox:
+    """
+    M2-A: the dispatch's Mailer-owned mailbox, proven to belong to the
+    dispatch's organization (predicate in the query) and to be ACTIVE *now*.
+    ACTIVE is evaluated here, at claim time; a mailbox disabled after
+    acceptance fails the dispatch before SMTP. Once B has committed SENDING,
+    disabling a mailbox does not interrupt that in-flight send. A missing,
+    foreign or disabled mailbox is a hard, non-retried refusal.
+    """
+    if dispatch.mailbox_id is None:
+        raise _Gate("no_mailbox: dispatch has no mailbox; not sent")
+    mailbox = db.execute(
+        select(Mailbox).where(
+            Mailbox.id == dispatch.mailbox_id,
+            Mailbox.organization_id == dispatch.organization_id,
+        )
+    ).scalar_one_or_none()
+    if mailbox is None:
+        raise _Gate("tenant_mismatch: mailbox not found for this organization")
+    if mailbox.status != MailboxStatus.ACTIVE.value:
+        raise _Gate("mailbox_disabled: mailbox is not ACTIVE; not sent")
+    return mailbox
+
+
+def _smtp_config_for(mailbox: Mailbox) -> SmtpConfig:
+    """Decrypt the SMTP password for THIS operation only (IMAP is not touched)."""
+    try:
+        password = decrypt_secret(mailbox.smtp_password_enc)
+    except MailboxEncryptionUnavailable as exc:
+        raise _Unavailable(str(exc)) from exc
+    except MailboxDecryptionError as exc:
+        raise _Gate(
+            "mailbox_credentials_undecryptable: stored SMTP credential cannot be "
+            "decrypted with the configured key; not sent"
+        ) from exc
+    return SmtpConfig(
+        host=mailbox.smtp_host,
+        port=mailbox.smtp_port,
+        use_tls=mailbox.smtp_use_tls,
+        username=mailbox.smtp_username,
+        password=password,
+    )
+
+
 def _fail_in_b(db: Session, claim: ClaimedDispatch, ctx: _Ctx, reason: str) -> DispatchResult:
     won = finish_external_dispatch(db, claim, new_state=S.FAILED, error_message=reason)
     db.commit()
@@ -339,6 +400,11 @@ def _transaction_b(
             except ExactMessageError as exc:
                 raise _Gate(f"wiring_error: {exc}") from exc
 
+            mailbox = _load_active_mailbox(db, dispatch)
+            # The mailbox is the sending identity: From (and the Message-ID
+            # domain) is its address, not the deployment-level campaign sender.
+            send_input = replace(send_input, from_email=mailbox.email_address)
+
             if is_email_suppressed(db, contact.email):
                 raise _Gate("suppressed: recipient is on the suppression list; not sent")
 
@@ -361,6 +427,8 @@ def _transaction_b(
                     "the message was NOT sent"
                 )
 
+            smtp_config = _smtp_config_for(mailbox)
+
             message_id = generate_message_id(send_input.from_email)
             message.message_id_header = message_id
             message.status = MessageStatus.SENDING.value
@@ -369,7 +437,7 @@ def _transaction_b(
             db.flush()
         except _Gate as gate:
             return _fail_in_b(db, claim, ctx, gate.reason)
-        except (SQLAlchemyError, _Deferred):
+        except (SQLAlchemyError, _Deferred, _Unavailable):
             raise
         except Exception as exc:  # noqa: BLE001 -- deterministic pre-SMTP bug/data error
             logger.exception("external_dispatch internal error before SMTP %s", ctx)
@@ -385,12 +453,18 @@ def _transaction_b(
         return _Prepared(
             claim=claim,
             ctx=ctx,
-            send_kwargs=send_input.as_send_email_kwargs(),
+            send_kwargs={**send_input.as_send_email_kwargs(), "smtp_config": smtp_config},
             message_id=message_id,
         )
     except _Deferred:
         db.rollback()
         logger.info("external_dispatch deferred by shutdown; left QUEUED")
+        return None
+    except _Unavailable as exc:
+        db.rollback()
+        logger.error(
+            "external_dispatch left QUEUED: deployment cannot decrypt mailbox credentials (%s)", exc
+        )
         return None
     finally:
         if claim is not None and not handed_off:

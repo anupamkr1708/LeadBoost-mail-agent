@@ -564,6 +564,16 @@ class ExternalDispatch(Base):
     # "resolved later" design would need.
     message_id = Column(Integer, ForeignKey("messages.id", ondelete="RESTRICT"), nullable=False)
 
+    # M2-A: the Mailer-owned sending identity this dispatch executes through.
+    # Resolved from the authenticated organization at acceptance (exactly one
+    # ACTIVE mailbox) and re-validated by the worker at claim time (tenant,
+    # ACTIVE, decryptable) -- never trusted from the caller. NULL only on rows
+    # accepted before M2-A; the worker fails those pre-SMTP as no_mailbox.
+    # Credentials are NOT copied here: they are decrypted per operation from
+    # the Mailbox row. RESTRICT: a mailbox with dispatch history cannot be
+    # deleted out from under it.
+    mailbox_id = Column(Integer, ForeignKey("mailboxes.id", ondelete="RESTRICT"), nullable=True)
+
     # SHA-256 hex digest over a canonical JSON serialization of
     # {external_action_id, recipient_email, recipient_name, subject,
     # body} -- see api/integrations.py::_compute_request_fingerprint.

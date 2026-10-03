@@ -48,6 +48,8 @@ from mailer_agent.models import (
     Message,
 )
 
+from tests.dispatch_support import seed_org_mailboxes
+
 ORG_A = "org-a"
 ORG_B = "org-b"
 
@@ -120,6 +122,7 @@ def engine():
 @pytest.fixture()
 def db_session(engine):
     session = sessionmaker(bind=engine)()
+    seed_org_mailboxes(session)
     try:
         yield session
     finally:
@@ -172,6 +175,7 @@ def test_external_dispatch_model_exists_with_expected_columns():
         "request_fingerprint", "public_reference", "state", "claimed_by",
         "claimed_at", "error_message", "created_at", "updated_at",
         "grounding_context",  # C9.2
+        "mailbox_id",  # M2-A
     }
 
 
@@ -547,6 +551,8 @@ def test_concurrent_identical_requests_converge_on_one_dispatch(tmp_path, org_ho
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"timeout": 30})
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as seed_session:
+        seed_org_mailboxes(seed_session)
 
     def _get_db_override():
         db = SessionLocal()
@@ -630,6 +636,8 @@ def test_concurrent_first_use_creates_exactly_one_campaign(tmp_path, org_holder)
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"timeout": 30})
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as seed_session:
+        seed_org_mailboxes(seed_session)
 
     def _get_db_override():
         db = SessionLocal()

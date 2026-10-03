@@ -80,6 +80,7 @@ from mailer_agent.api.deps import get_integration_org_id, require_api_key
 from mailer_agent.api.integrations import (
     _get_or_create_integration_campaign,
     _get_or_create_integration_contact,
+    _resolve_sole_active_mailbox,
 )
 from mailer_agent.db import get_db
 from mailer_agent.llm.agent import draft_message
@@ -212,6 +213,9 @@ def create_leadboost_generated_outreach(
         )
         return _replay_or_conflict(existing, fingerprint)
 
+    # M2-A: no mailbox / ambiguous mailbox -> 409 before any row or LLM call.
+    mailbox_id = _resolve_sole_active_mailbox(db, org_id)
+
     campaign = _get_or_create_integration_campaign(db, org_id)
     contact = _get_or_create_integration_contact(db, campaign.id, email, payload.recipient.name)
 
@@ -295,6 +299,7 @@ def create_leadboost_generated_outreach(
         campaign_id=campaign_id,
         contact_id=contact_id,
         message_id=message.id,
+        mailbox_id=mailbox_id,
         request_fingerprint=fingerprint,
         public_reference=uuid.uuid4().hex,
         state=ExternalDispatchState.QUEUED.value,

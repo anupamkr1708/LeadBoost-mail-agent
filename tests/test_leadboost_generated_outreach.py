@@ -34,7 +34,7 @@ from mailer_agent.models import (
     Message,
     MessageStatus,
 )
-from tests.dispatch_support import FakeSender, TrackingFactory
+from tests.dispatch_support import FakeSender, TrackingFactory, seed_org_mailboxes
 
 ORG_A, ORG_B = "org-a", "org-b"
 URL = "/integrations/leadboost/outreach-requests"
@@ -71,7 +71,10 @@ def sm(tmp_path):
         f"sqlite:///{tmp_path/'gen.db'}", connect_args={"check_same_thread": False, "timeout": 15}
     )
     Base.metadata.create_all(bind=eng)
-    yield sessionmaker(bind=eng)
+    sm_ = sessionmaker(bind=eng)
+    with sm_() as s:
+        seed_org_mailboxes(s)
+    yield sm_
     eng.dispose()
 
 

@@ -28,7 +28,7 @@ from mailer_agent.api.main import app
 from mailer_agent.config import get_settings
 from mailer_agent.db import get_db
 from mailer_agent.models import Base, ExternalDispatch, ExternalDispatchState, Message
-from tests.dispatch_support import seed_dispatch
+from tests.dispatch_support import seed_dispatch, seed_org_mailboxes
 
 ORG_A = "org-a"
 ORG_B = "org-b"
@@ -66,6 +66,7 @@ def engine():
 @pytest.fixture()
 def db(engine):
     session = sessionmaker(bind=engine)()
+    seed_org_mailboxes(session)
     try:
         yield session
     finally:

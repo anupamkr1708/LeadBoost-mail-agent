@@ -68,6 +68,8 @@ from mailer_agent.models import (
     ContactStatus,
     ExternalDispatch,
     ExternalDispatchState,
+    Mailbox,
+    MailboxStatus,
 )
 from mailer_agent.mail.exact_message import create_authorized_message
 from mailer_agent.schemas import (
@@ -126,6 +128,44 @@ def _compute_request_fingerprint(
 # ---------------------------------------------------------------------------
 # Campaign get-or-create (C4)
 # ---------------------------------------------------------------------------
+
+def _resolve_sole_active_mailbox(db: Session, org_id: str) -> int:
+    """
+    M2-A: the id of the organization's Mailer-owned sending mailbox.
+
+    The organization must have EXACTLY ONE ACTIVE mailbox: none -> 409, more
+    than one -> 409 (no request field selects between them; the request
+    contract stays closed). org_id comes only from the API key and is in the
+    query predicate. Returns a plain id so no ORM state is held across a
+    later commit/rollback. Credentials are not read here; the worker decrypts
+    per operation. The worker re-validates the mailbox at claim time.
+    """
+    ids = [
+        row[0]
+        for row in db.query(Mailbox.id)
+        .filter(
+            Mailbox.organization_id == org_id,
+            Mailbox.status == MailboxStatus.ACTIVE.value,
+        )
+        .order_by(Mailbox.id)
+        .limit(2)
+        .all()
+    ]
+    if not ids:
+        raise HTTPException(
+            status_code=409,
+            detail="No active mailbox is configured for this organization; nothing was queued.",
+        )
+    if len(ids) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This organization has more than one active mailbox; exactly one "
+                "is required for dispatch. Nothing was queued."
+            ),
+        )
+    return ids[0]
+
 
 def _get_or_create_integration_campaign(db: Session, org_id: str) -> Campaign:
     """
@@ -432,6 +472,10 @@ def create_leadboost_outreach_action(
             ),
         )
 
+    # M2-A: resolve the sending mailbox before creating any row, so a missing
+    # or ambiguous mailbox leaves nothing behind. Replays returned above.
+    mailbox_id = _resolve_sole_active_mailbox(db, org_id)
+
     campaign = _get_or_create_integration_campaign(db, org_id)
     contact = _get_or_create_integration_contact(
         db, campaign.id, payload.recipient.email, payload.recipient.name
@@ -458,6 +502,7 @@ def create_leadboost_outreach_action(
         campaign_id=campaign.id,
         contact_id=contact.id,
         message_id=message.id,
+        mailbox_id=mailbox_id,
         request_fingerprint=fingerprint,
         public_reference=uuid.uuid4().hex,
         state=ExternalDispatchState.QUEUED.value,

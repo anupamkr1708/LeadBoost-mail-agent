@@ -105,11 +105,9 @@ def test_queued_to_sent_with_exact_message_and_claim_released(factory, runtime, 
 
 def test_exact_bytes_on_the_wire_through_the_real_sender(factory, runtime, live, monkeypatch):
     with FakeSMTPServer() as srv:
-        s = sender.settings
-        for k, v in dict(smtp_host="127.0.0.1", smtp_port=srv.port, smtp_use_tls=False,
-                         smtp_username="u", smtp_password="p").items():
-            monkeypatch.setattr(s, k, v)
-        did = seed(factory, subject="Wire subject", body=CLEAN_BODY)
+        # The Mailer-owned mailbox carries the transport; global settings.smtp_* are NOT patched.
+        did = seed(factory, subject="Wire subject", body=CLEAN_BODY,
+                   smtp_host="127.0.0.1", smtp_port=srv.port)
 
         res = run(factory, runtime)
 
