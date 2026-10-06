@@ -35,6 +35,10 @@ services:
         value: "false"
       - key: API_KEY
         sync: false           # set manually in the dashboard -- see README
+      - key: MAILBOX_ENCRYPTION_KEY
+        sync: false           # Fernet key for mailbox SMTP/IMAP credentials. Set the SAME value
+                              # on mailer-agent-api and mailer-agent-worker; losing or changing it
+                              # makes stored mailbox credentials unreadable. See README.
       - key: GROQ_API_KEY
         sync: false
       - key: SMTP_USERNAME
@@ -61,6 +65,10 @@ services:
         value: "false"
       - key: AUTO_REPLY_ENABLED
         value: "false"
+      - key: MAILBOX_ENCRYPTION_KEY
+        sync: false           # Fernet key for mailbox SMTP/IMAP credentials. Set the SAME value
+                              # on mailer-agent-api and mailer-agent-worker; losing or changing it
+                              # makes stored mailbox credentials unreadable. See README.
       - key: GROQ_API_KEY
         sync: false
       - key: SMTP_USERNAME
