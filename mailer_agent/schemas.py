@@ -305,13 +305,26 @@ class MailboxCreate(BaseModel):
 
 
 class MailboxUpdate(BaseModel):
-    """Omitted field = unchanged. Passwords are write-only replacements."""
+    """
+    Omitted field = unchanged. Passwords are write-only replacements.
+
+    L1: SMTP transport metadata (host, port, TLS flag, username) is updatable so
+    an external control plane whose own connection settings can change after
+    provisioning (LeadBoost's EmailAccount) can keep this mailbox in sync. This
+    is deliberately NOT identity: email_address, organization_id and
+    public_reference are still not accepted here (extra="forbid" -> 422), and
+    IMAP metadata stays out until M3 defines inbound ownership.
+    """
 
     model_config = _STRICT
 
     status: MailboxStatus | None = None
     smtp_password: _Password | None = None
     imap_password: _Password | None = None
+    smtp_host: _Text | None = None
+    smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    smtp_use_tls: bool | None = None
+    smtp_username: _Text | None = None
 
     @model_validator(mode="after")
     def _no_explicit_null(self) -> "MailboxUpdate":

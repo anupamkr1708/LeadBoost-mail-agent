@@ -4,7 +4,8 @@ Mailbox API (M1): Mailer-owned sending identities with encrypted credentials.
     POST   /mailboxes
     GET    /mailboxes
     GET    /mailboxes/{public_reference}
-    PATCH  /mailboxes/{public_reference}     (status, write-only password replacement)
+    PATCH  /mailboxes/{public_reference}     (status, SMTP transport metadata, write-only
+                                             password replacement)
 
 Organization comes only from the authenticated key (get_authenticated_org_id,
 fail-closed). A reference owned by another organization is indistinguishable
@@ -176,6 +177,16 @@ def update_mailbox(
 
     if payload.status is not None:
         mailbox.status = payload.status.value
+    # L1 transport metadata (never identity -- see MailboxUpdate). `is not None`,
+    # not truthiness: smtp_use_tls=False is a real value.
+    if payload.smtp_host is not None:
+        mailbox.smtp_host = payload.smtp_host
+    if payload.smtp_port is not None:
+        mailbox.smtp_port = payload.smtp_port
+    if payload.smtp_use_tls is not None:
+        mailbox.smtp_use_tls = payload.smtp_use_tls
+    if payload.smtp_username is not None:
+        mailbox.smtp_username = payload.smtp_username
     if smtp_enc is not None:
         mailbox.smtp_password_enc = smtp_enc
     if imap_enc is not None:
