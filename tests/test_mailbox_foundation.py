@@ -354,7 +354,10 @@ def test_imap_password_on_smtp_only_mailbox_is_rejected(client, sm):
 @pytest.mark.parametrize("body", [
     {"smtp_password": ""}, {"imap_password": ""}, {"status": None}, {"smtp_password": None},
     {"email_address": "z@example.com"}, {"organization_id": "x"}, {"public_reference": "x"},
-    {"smtp_password_enc": "x"}, {"smtp_host": "evil.example.com"},
+    {"smtp_password_enc": "x"},
+    # L1 revision: smtp_host/port/use_tls/username became updatable (see
+    # tests/test_l1_mailbox_transport_update.py). IMAP metadata still is not.
+    {"imap_host": "evil.example.com"}, {"imap_port": 993}, {"imap_username": "x"},
 ])
 def test_patch_schema_rejects_empty_null_and_immutable_fields(client, body):
     ref = _create(client)["public_reference"]

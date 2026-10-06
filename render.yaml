@@ -39,6 +39,9 @@ services:
         sync: false           # Fernet key for mailbox SMTP/IMAP credentials. Set the SAME value
                               # on mailer-agent-api and mailer-agent-worker; losing or changing it
                               # makes stored mailbox credentials unreadable. See README.
+      - key: ORG_KEY_MAP
+        sync: false           # JSON {"<api_key>":"<org_id>"}: one key per tenant (LeadBoost L1 needs one
+                              # per LeadBoost organization). API service only. Never commit values.
       - key: GROQ_API_KEY
         sync: false
       - key: SMTP_USERNAME
