@@ -33,3 +33,9 @@ response, or a concurrent caller, converges on one mailbox.
 ## Transport limit
 `smtp_use_tls=true` means STARTTLS only. Mailer has no implicit-TLS (SMTP_SSL,
 port 465) path; LeadBoost therefore does not provision accounts using that mode.
+
+## Deployment prerequisites for the integrated path
+* `MAILBOX_ENCRYPTION_KEY` — API **and** worker (same value). Mailbox create/update and sending fail closed without it.
+* `ORG_KEY_MAP` — API only; one key per LeadBoost organization.
+* `LEADBOOST_INTEGRATION_SENDER_EMAIL` — API. While empty, the **first** generated-outreach request of every
+  organization returns `503`. (Pre-existing M2 requirement; found by the L1 cross-service E2E.)
