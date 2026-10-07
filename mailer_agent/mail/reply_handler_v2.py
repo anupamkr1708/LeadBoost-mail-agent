@@ -188,7 +188,7 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
         # window under true concurrency: two transactions can both see
         # "not found" before either commits (e.g. the same email
         # arriving via webhook and IMAP nearly simultaneously). The
-        # uq_messages_message_id_header constraint (see models.py,
+        # uq_messages_message_id_no_mailbox index (see models.py,
         # migrations/003_message_id_unique_constraint.py) is what
         # actually closes that race -- this except clause is what makes
         # hitting it a graceful "someone else already handled this"
