@@ -23,7 +23,7 @@ from mailer_agent.models import (
     Campaign, Contact, ExternalDispatch, Mailbox, MailboxStatus, Message,
 )
 from tests.m3_support import (
-    FakeImapWorld, give_imap, inbound_rows, make_session_factory, raw_email,
+    FakeImapWorld, inbound_rows, make_session_factory, raw_email,
     seed_org_with_imap_mailbox,
 )
 
@@ -104,7 +104,7 @@ def test_same_rfc_message_id_in_both_mailboxes_is_stored_once_per_organization(e
 def test_wrong_tenant_thread_reference_is_never_attached(env):
     """Mailbox A receives a reply whose In-Reply-To is Org B's outbound message,
     from an address Org A has no contact for: nothing is persisted anywhere."""
-    ids = two_orgs(env, same_contact_email=False)  # org-a lead@example.com, org-b other@example.com
+    two_orgs(env, same_contact_email=False)  # org-a lead@example.com, org-b other@example.com
     env.world.inject(HOST_A, USER_A, raw_email(
         from_addr="other@example.com", message_id="<x@p>", in_reply_to=OUT_B, references=[OUT_B]))
     cycle(env)
@@ -113,7 +113,7 @@ def test_wrong_tenant_thread_reference_is_never_attached(env):
 
 
 def test_to_header_is_never_used_for_tenant_or_contact_resolution(env):
-    ids = two_orgs(env, same_contact_email=False)
+    two_orgs(env, same_contact_email=False)
     # Addressed (To:) to org B's mailbox address, but it arrived in mailbox A and the
     # sender is only a contact of org B: must not be attached to org B.
     env.world.inject(HOST_A, USER_A, raw_email(
@@ -417,7 +417,7 @@ def test_reply_to_a_message_sent_through_a_different_mailbox_is_not_claimed_by_t
     """Same organization, two mailboxes: a thread whose outbound message went out
     through mailbox A2 is not attached by THREAD when it shows up in mailbox A1
     (sender address also unknown) -- scoping is per mailbox, not merely per org."""
-    ids = two_orgs(env, same_contact_email=False)
+    two_orgs(env, same_contact_email=False)
     with env.sm() as db:
         other = Mailbox(
             organization_id="org-a", email_address="second@org-a.example.org", smtp_host="s",
@@ -435,7 +435,7 @@ def test_reply_to_a_message_sent_through_a_different_mailbox_is_not_claimed_by_t
 
 def test_ambiguous_thread_match_never_guesses(env):
     """References point at two different contacts of the same org."""
-    ids = two_orgs(env, same_contact_email=False)
+    two_orgs(env, same_contact_email=False)
     with env.sm() as db:
         camp = db.query(Campaign).filter(Campaign.organization_id == "org-a").one()
         c2 = Contact(campaign_id=camp.id, email="second@example.com")
@@ -453,7 +453,7 @@ def test_ambiguous_thread_match_never_guesses(env):
 
 
 def test_ambiguous_sender_address_within_an_org_never_guesses(env):
-    ids = two_orgs(env)
+    two_orgs(env)
     with env.sm() as db:
         other = Campaign(name="native", organization_id="org-a", sender_name="n", sender_org="o",
                          sender_email="s@a.example", value_prop="v")
@@ -479,7 +479,7 @@ def test_subject_alone_never_correlates(env):
 def test_message_without_message_id_uses_a_synthetic_identity_and_dedupes(env):
     ids = two_orgs(env)
     raw = raw_email(message_id=None)
-    uid = env.world.inject(HOST_A, USER_A, raw)
+    env.world.inject(HOST_A, USER_A, raw)
     cycle(env)
     import hashlib
     expected = "synthetic:" + hashlib.sha256(raw).hexdigest()

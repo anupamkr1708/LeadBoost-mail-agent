@@ -22,7 +22,11 @@ ids are never accepted in a request body. Keys are provisioned by an operator
 
 PATCH now also accepts `smtp_host`, `smtp_port`, `smtp_use_tls`, `smtp_username`
 (L1). It still rejects `email_address`, `organization_id`, `public_reference` and
-any IMAP metadata (422). A reference owned by another organization is
+a partial IMAP set (422). Since M3, PATCH accepts IMAP configuration as an
+all-or-none set (`imap_host`, `imap_port`, `imap_username`, `imap_password`
+together; `imap_password` alone rotates an existing configuration). LeadBoost
+does NOT send IMAP fields: inbound is provisioned through the Mailer API with the
+organization's key, and the password is write-only. A reference owned by another organization is
 indistinguishable from an unknown one (404).
 
 ## Idempotent provisioning

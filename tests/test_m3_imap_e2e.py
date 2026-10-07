@@ -46,7 +46,7 @@ from mailer_agent.config import get_settings  # noqa: E402
 from mailer_agent.mail import mailbox_inbound  # noqa: E402
 from mailer_agent.mailbox_secrets import encrypt_secret  # noqa: E402
 from mailer_agent.models import Base, Mailbox, MailboxStatus  # noqa: E402
-from tests.m3_support import give_imap, inbound_rows, raw_email, seed_org_with_imap_mailbox  # noqa: E402
+from tests.m3_support import inbound_rows, raw_email, seed_org_with_imap_mailbox  # noqa: E402
 
 OUT_A, OUT_B = "<out-a@mailer.a>", "<out-b@mailer.b>"
 

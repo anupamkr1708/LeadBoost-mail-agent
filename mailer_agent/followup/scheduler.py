@@ -18,7 +18,6 @@ from mailer_agent.mail.imap_reader import fetch_unseen_replies
 from mailer_agent.mail.mailbox_inbound import poll_all_mailboxes
 from mailer_agent.mail.reply_handler import process_inbound_email
 from mailer_agent.models import Contact
-from mailer_agent.utils.datetime_utils import utcnow
 
 logger = logging.getLogger("mailer_agent.scheduler")
 settings = get_settings()

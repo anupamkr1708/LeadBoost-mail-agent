@@ -46,7 +46,7 @@ pytestmark.append(pytest.mark.skipif(not _pg_available(), reason="POSTGRES_TEST_
 
 from mailer_agent.mail import imap_reader, mailbox_inbound  # noqa: E402
 from mailer_agent.mail import reply_handler_v2 as rh  # noqa: E402
-from mailer_agent.models import Base, Contact, Mailbox, Message  # noqa: E402
+from mailer_agent.models import Base, Message  # noqa: E402
 from tests.m3_support import (  # noqa: E402
     FakeImapWorld, inbound_rows, raw_email, seed_org_with_imap_mailbox,
 )
