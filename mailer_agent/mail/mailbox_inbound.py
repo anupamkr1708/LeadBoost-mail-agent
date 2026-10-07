@@ -38,7 +38,6 @@ still holds because inbound persistence is idempotent on (mailbox_id, Message-ID
 
 from __future__ import annotations
 
-import imaplib
 import logging
 from dataclasses import dataclass, field
 from typing import Callable
@@ -46,7 +45,7 @@ from typing import Callable
 from sqlalchemy.orm import Session
 
 from mailer_agent.config import get_settings
-from mailer_agent.mail.imap_reader import InboundEmail, drain_unseen
+from mailer_agent.mail.imap_reader import InboundEmail, drain_unseen, open_authenticated_connection
 from mailer_agent.mail.reply_handler_v2 import process_mailbox_inbound
 from mailer_agent.mailbox_secrets import (
     MailboxDecryptionError,
@@ -176,11 +175,11 @@ def poll_mailbox(
             )
             return outcome
 
-        conn = imaplib.IMAP4_SSL(
-            target.imap_host, target.imap_port, timeout=get_settings().imap_timeout_seconds
-        )
         try:
-            conn.login(target.imap_username, password)
+            conn = open_authenticated_connection(
+                target.imap_host, target.imap_port, target.imap_username, password,
+                get_settings().imap_timeout_seconds,
+            )
         finally:
             password = None  # noqa: F841 - drop the only plaintext reference
         # ----------------------------------------------------------------------

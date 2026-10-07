@@ -36,7 +36,7 @@ OUT_A, OUT_B = "<out-a@mailer.a>", "<out-b@mailer.b>"
 def env(tmp_path, monkeypatch):
     sm, eng = make_session_factory(tmp_path)
     world = FakeImapWorld()
-    monkeypatch.setattr(mailbox_inbound.imaplib, "IMAP4_SSL", world.connection_factory())
+    monkeypatch.setattr(imap_reader.imaplib, "IMAP4_SSL", world.connection_factory())
     import mailer_agent.llm.provider_v2 as provider_module
     monkeypatch.setattr(provider_module, "is_llm_available", lambda: False)  # deterministic classify
     yield SimpleNamespace(sm=sm, world=world)

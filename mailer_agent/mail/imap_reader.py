@@ -119,6 +119,27 @@ def parse_inbound_bytes(raw: bytes) -> InboundEmail:
     )
 
 
+def open_authenticated_connection(
+    host: str, port: int, username: str, password: str, timeout: float
+) -> "imaplib.IMAP4_SSL":
+    """
+    TLS connect + LOGIN for ONE mailbox's own identity (imaplib stays confined to
+    this module). The plaintext password is only ever a parameter of this call;
+    it is not stored, logged, or put into an exception here. A failed LOGIN closes
+    the half-open connection before re-raising.
+    """
+    conn = imaplib.IMAP4_SSL(host, port, timeout=timeout)
+    try:
+        conn.login(username, password)
+    except Exception:
+        try:
+            conn.logout()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return conn
+
+
 class ImapPollError(RuntimeError):
     """The IMAP server refused SELECT/SEARCH. Carries no server text or credentials."""
 
