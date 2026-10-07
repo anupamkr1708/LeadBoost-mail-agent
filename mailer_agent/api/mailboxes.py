@@ -4,8 +4,9 @@ Mailbox API (M1): Mailer-owned sending identities with encrypted credentials.
     POST   /mailboxes
     GET    /mailboxes
     GET    /mailboxes/{public_reference}
-    PATCH  /mailboxes/{public_reference}     (status, SMTP transport metadata, write-only
-                                             password replacement)
+    PATCH  /mailboxes/{public_reference}     (status, SMTP transport metadata, IMAP
+                                             configuration as an all-or-none set,
+                                             write-only password replacement)
 
 Organization comes only from the authenticated key (get_authenticated_org_id,
 fail-closed). A reference owned by another organization is indistinguishable
@@ -156,7 +157,11 @@ def update_mailbox(
 ):
     mailbox = _get_owned(db, org_id, public_reference)
 
-    if payload.imap_password is not None and mailbox.imap_host is None:
+    # imap_password alone is a rotation and needs an existing IMAP configuration;
+    # a full IMAP set (host/port/username/password -- all-or-none, enforced by
+    # MailboxUpdate) may create or replace that configuration (M3).
+    sets_imap_config = payload.imap_host is not None
+    if payload.imap_password is not None and not sets_imap_config and mailbox.imap_host is None:
         raise HTTPException(status_code=409, detail="Mailbox has no IMAP configuration")
 
     # Encrypt everything before mutating anything so a 503 leaves the row untouched.
@@ -189,6 +194,10 @@ def update_mailbox(
         mailbox.smtp_username = payload.smtp_username
     if smtp_enc is not None:
         mailbox.smtp_password_enc = smtp_enc
+    if sets_imap_config:
+        mailbox.imap_host = payload.imap_host
+        mailbox.imap_port = payload.imap_port
+        mailbox.imap_username = payload.imap_username
     if imap_enc is not None:
         mailbox.imap_password_enc = imap_enc
 

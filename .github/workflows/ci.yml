@@ -136,7 +136,8 @@ jobs:
           python -m pytest -o addopts="" \
             tests/test_external_dispatch_postgres.py \
             tests/test_leadboost_generated_outreach_postgres.py \
-            tests/test_postgresql_concurrency.py -v
+            tests/test_postgresql_concurrency.py \
+            tests/test_m3_inbound_postgres.py -v
 
   local-smtp:
     name: Local SMTP protocol integration
@@ -161,3 +162,35 @@ jobs:
         # spins up a real aiosmtpd server on localhost only.
         run: |
           python -m pytest -o addopts="" tests/test_smtp_local_integration.py -v
+
+
+  m3-imap-e2e:
+    name: M3 real IMAP end-to-end (disposable Dovecot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install a disposable IMAP server
+        # Throw-away local Dovecot on 127.0.0.1 with a self-signed cert and
+        # generated accounts; no external network or real mailbox is used.
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dovecot-imapd
+          sudo systemctl stop dovecot || true
+
+      - name: Run M3 IMAP end-to-end test
+        # Root is needed so Dovecot can drop to its service users.
+        run: |
+          sudo -E env "PATH=$PATH" python -m pytest -o addopts="" tests/test_m3_imap_e2e.py -v

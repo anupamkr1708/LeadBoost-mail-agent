@@ -312,8 +312,16 @@ class MailboxUpdate(BaseModel):
     an external control plane whose own connection settings can change after
     provisioning (LeadBoost's EmailAccount) can keep this mailbox in sync. This
     is deliberately NOT identity: email_address, organization_id and
-    public_reference are still not accepted here (extra="forbid" -> 422), and
-    IMAP metadata stays out until M3 defines inbound ownership.
+    public_reference are still not accepted here (extra="forbid" -> 422).
+
+    M3: IMAP configuration is accepted as an all-or-none set (imap_host,
+    imap_port, imap_username, imap_password together) so an existing mailbox --
+    e.g. one provisioned by LeadBoost without IMAP -- can be given an inbound
+    identity, and replaced as a whole. The password is required with any other
+    IMAP field on purpose: changing the host or username without re-supplying
+    the secret would send the previously stored password to the new target.
+    imap_password alone remains valid as a pure credential rotation for a
+    mailbox that already has IMAP configured (enforced in the API).
     """
 
     model_config = _STRICT
@@ -321,6 +329,9 @@ class MailboxUpdate(BaseModel):
     status: MailboxStatus | None = None
     smtp_password: _Password | None = None
     imap_password: _Password | None = None
+    imap_host: _Text | None = None
+    imap_port: int | None = Field(default=None, ge=1, le=65535)
+    imap_username: _Text | None = None
     smtp_host: _Text | None = None
     smtp_port: int | None = Field(default=None, ge=1, le=65535)
     smtp_use_tls: bool | None = None
@@ -331,6 +342,18 @@ class MailboxUpdate(BaseModel):
         for name in self.model_fields_set:
             if getattr(self, name) is None:
                 raise ValueError(f"{name} must not be null")
+        return self
+
+    @model_validator(mode="after")
+    def _imap_config_all_or_none(self) -> "MailboxUpdate":
+        config = (self.imap_host, self.imap_port, self.imap_username)
+        if any(v is not None for v in config) and (
+            any(v is None for v in config) or self.imap_password is None
+        ):
+            raise ValueError(
+                "imap_host, imap_port, imap_username and imap_password must be "
+                "provided together or not at all"
+            )
         return self
 
 

@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
@@ -36,6 +35,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
     UniqueConstraint,
 )
 from sqlalchemy import event, inspect as sa_inspect
@@ -309,35 +309,52 @@ class Message(Base):
 
     error_message = Column(Text, nullable=True)  # populated when status=failed
 
+    # M3: the Mailer Mailbox an inbound message was received through. Set ONLY
+    # by mailbox-bound IMAP polling (mail/mailbox_inbound.py), from the polled
+    # Mailbox row -- never from message content. NULL for every outbound row
+    # and for inbound rows that arrived through the webhook or the legacy
+    # deployment-global IMAP poll. It scopes the inbound dedupe identity below.
+    mailbox_id = Column(Integer, ForeignKey("mailboxes.id", ondelete="RESTRICT"), nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     contact = relationship("Contact", back_populates="messages")
 
     __table_args__ = (
-        # Message-ID is meant to be globally unique by construction (ours
-        # are generated via email.utils.make_msgid(); real inbound ones
-        # are unique per email infrastructure convention), so this is a
-        # plain global constraint, not organization-scoped.
+        # Message-ID dedupe identity (M3 split of the former global constraint).
         #
-        # Without this, the dedup check in
-        # mail/reply_handler_v2.py::process_inbound_email_v2 ("does a
-        # Message with this message_id_header already exist? if not,
-        # insert") is a classic check-then-insert race: under true
-        # concurrency (the same email arriving via webhook and IMAP
-        # nearly simultaneously, or a retried webhook delivery), two
-        # transactions can both see "not found" before either commits,
-        # and both insert -- producing two logical messages for what
-        # should be one. NULL values remain unconstrained (multiple
-        # DRAFT/unsent messages with no Message-ID yet are expected and
-        # fine) -- only non-NULL collisions are rejected.
+        # Rows WITHOUT a mailbox (all outbound rows -- our own Message-IDs are
+        # globally unique by construction -- plus webhook / legacy-global-IMAP
+        # inbound) keep exactly the original rule: one row per non-NULL
+        # Message-ID, globally.
         #
-        # The application-level check-then-insert is kept (it avoids an
-        # exception on the common, non-racing path and gives a cleaner
-        # log message), but this constraint is what actually makes
-        # duplicate-prevention correct under concurrency: see
-        # mail/reply_handler_v2.py's IntegrityError handling around the
-        # inbound-message insert, and tests/test_postgresql_concurrency.py.
-        UniqueConstraint("message_id_header", name="uq_messages_message_id_header"),
+        # Rows WITH a mailbox (mailbox-bound IMAP inbound) are unique per
+        # (mailbox_id, Message-ID): the same RFC Message-ID can legitimately
+        # arrive in two organizations' mailboxes (shared CC, mailing list) and
+        # each organization must get its own record. A global rule made the
+        # second organization's copy look like a "duplicate" of the first's.
+        #
+        # NULL Message-IDs remain unconstrained in both indexes. The
+        # application-level check-then-insert in mail/reply_handler_v2.py is
+        # kept for the common path; these indexes are what make it correct under
+        # concurrency (see tests/test_postgresql_concurrency.py and
+        # tests/test_m3_inbound_postgres.py). Partial indexes (not named
+        # UNIQUE CONSTRAINTs) so one DDL works on PostgreSQL and SQLite.
+        Index(
+            "uq_messages_message_id_no_mailbox",
+            "message_id_header",
+            unique=True,
+            postgresql_where=text("mailbox_id IS NULL"),
+            sqlite_where=text("mailbox_id IS NULL"),
+        ),
+        Index(
+            "uq_messages_mailbox_message_id",
+            "mailbox_id",
+            "message_id_header",
+            unique=True,
+            postgresql_where=text("mailbox_id IS NOT NULL"),
+            sqlite_where=text("mailbox_id IS NOT NULL"),
+        ),
     )
 
 

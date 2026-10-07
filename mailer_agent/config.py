@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     imap_username: str = ""
     imap_password: str = ""
     imap_poll_seconds: int = 120
+    # M3: socket timeout for a mailbox-bound IMAP connection, so one hung server
+    # cannot stall every other mailbox's poll. Applies to the per-Mailbox path only.
+    imap_timeout_seconds: int = 30
 
     # --- Follow-up scheduler ---------------------------------------------
     followup_poll_seconds: int = 300

@@ -6,8 +6,8 @@ username after a mailbox has been provisioned. Before L1 the Mailer PATCH only
 accepted status + passwords, so those changes could not be synchronized.
 
 Hard limits asserted here: identity (email_address, organization_id,
-public_reference) is still immutable, IMAP metadata is still not updatable
-(M3), the organization still comes only from the API key, and no response or
+public_reference) is still immutable, IMAP metadata is only accepted as the
+all-or-none set added by M3 (a partial set stays rejected), the organization still comes only from the API key, and no response or
 log ever carries a secret.
 """
 

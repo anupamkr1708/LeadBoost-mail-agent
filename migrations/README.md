@@ -81,10 +81,13 @@ Run once, in this order, against a fresh or partially-migrated database:
    against direct database reads; it does NOT protect against compromise of
    the application host, where the database connection and the key coexist.
    Uniqueness is `(organization_id, email_address)` and `public_reference`.
-   **M3 consideration (deliberately not solved here):** two organizations may
-   register the same address, so per-mailbox IMAP polling could later poll one
-   physical inbox twice and face ambiguous inbound routing; M3 must decide how
-   physical-mailbox identity interacts with multi-tenant ownership.
+   **M3 consideration:** two organizations may register the same address, so
+   per-mailbox IMAP polling could poll one physical inbox twice. M3 does NOT
+   deduplicate physical inboxes: each Mailbox is its own inbound identity, and
+   a message is stored once per (mailbox, Message-ID), so each organization
+   that receives it keeps its own record (see migration 009). Do not give two
+   Mailboxes IMAP access to the same physical account unless both organizations
+   are meant to receive its mail.
 
 9. `007_external_dispatch_mailbox.py` -- M2-A: nullable
    `external_dispatches.mailbox_id` (FK -> `mailboxes.id`, RESTRICT). Apply
@@ -145,3 +148,15 @@ To revert 007 / 008: `--downgrade` on each (008 refuses while any dispatch has `
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/
 indexes/constraints that already exist.
+
+10. `009_messages_mailbox_scoped_dedupe.py` -- M3: nullable `messages.mailbox_id`
+   (FK -> `mailboxes.id`, RESTRICT) and the replacement of the global
+   `uq_messages_message_id_header` constraint by two partial unique indexes:
+   `UNIQUE(message_id_header) WHERE mailbox_id IS NULL` (exactly the old rule for
+   every existing row: outbound, webhook, legacy-global-IMAP) and
+   `UNIQUE(mailbox_id, message_id_header) WHERE mailbox_id IS NOT NULL` (the
+   mailbox-bound inbound identity). Apply BEFORE deploying M3 code: the ORM
+   selects `messages.mailbox_id` on every Message query. Idempotent; has a
+   `--downgrade` that refuses to run if a Message-ID is now stored more than
+   once. SQLite note: an inline UNIQUE from pre-M3 `CREATE TABLE` cannot be
+   dropped there -- recreate development databases from the models.
