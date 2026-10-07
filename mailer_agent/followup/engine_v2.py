@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from mailer_agent.config import get_settings
 from mailer_agent.followup.conversation_aware import FollowUpScheduler
 from mailer_agent.llm.agent import draft_message
+from mailer_agent.mail.imap_reader import is_synthetic_id
 from mailer_agent.mail.sender import SendOutcome, send_email
 from mailer_agent.memory.store import build_conversation_context, maybe_summarize_older_messages
 from mailer_agent.models import (
@@ -381,7 +382,10 @@ class IntegratedFollowUpEngine:
     def _most_recent_message_id(self, contact: Contact) -> Optional[str]:
         """Get most recent outbound Message-ID for threading."""
         for m in reversed(contact.messages):
-            if m.message_id_header:
+            # M3: a "synthetic:<sha256>" dedupe identity (inbound mail that had no
+            # real Message-ID) is not an RFC Message-ID and must never become an
+            # In-Reply-To / References value.
+            if m.message_id_header and not is_synthetic_id(m.message_id_header):
                 return m.message_id_header
         return None
     

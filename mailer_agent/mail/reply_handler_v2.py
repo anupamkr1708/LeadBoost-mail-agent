@@ -15,20 +15,22 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mailer_agent.config import get_settings
 from mailer_agent.llm.agent import ContextualFallbackUnavailable, draft_message
-from mailer_agent.mail.imap_reader import InboundEmail, as_reply_subject
+from mailer_agent.mail.imap_reader import InboundEmail, as_reply_subject, is_synthetic_id
 from mailer_agent.mail.sender import SendOutcome, send_email
 from mailer_agent.memory.store import build_conversation_context, maybe_summarize_older_messages
 from mailer_agent.policy.guardrails import authorize_action
 from mailer_agent.policy.next_action import PLANNER_PROMPT_VERSION, plan_next_action
 from mailer_agent.models import (
+    Campaign,
     Contact,
     ContactStatus,
+    ExternalDispatch,
     Message,
     MessageDirection,
     MessageStatus,
@@ -213,6 +215,26 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
             "message_id": existing.id if existing else None,
         }
     
+    # Steps 4-6 (classification, state transition, reply drafting, memory) are
+    # shared with the mailbox-bound path -- see _classify_and_apply_inbound.
+    return _classify_and_apply_inbound(db, email_in, contact, campaign, inbound_msg)
+
+
+def _classify_and_apply_inbound(
+    db: Session,
+    email_in: InboundEmail,
+    contact: Contact,
+    campaign,
+    inbound_msg: Message,
+) -> dict:
+    """
+    Everything after the inbound Message row exists and its contact is known:
+    semantic classification, state-machine transition, (gated) reply drafting,
+    memory summarization. Extracted unchanged from process_inbound_email_v2 so
+    the webhook/legacy path and the M3 mailbox-bound path run the SAME
+    classification and prompt-injection-hardened machinery. The caller owns the
+    transaction; this never commits.
+    """
     # Update contact timestamps
     contact.last_reply_at = utcnow()
     
@@ -362,6 +384,194 @@ def process_inbound_email_v2(db: Session, email_in: InboundEmail) -> dict:
     maybe_summarize_older_messages(db, contact)
     
     return result
+
+
+# ---------------------------------------------------------------------------
+# M3: mailbox-bound inbound
+# ---------------------------------------------------------------------------
+
+_UNMATCHED = "no_match"
+_AMBIGUOUS = "ambiguous"
+
+
+def process_mailbox_inbound(
+    db: Session,
+    email_in: InboundEmail,
+    *,
+    mailbox_id: int,
+    organization_id: str,
+) -> dict:
+    """
+    Inbound processing for mail received through ONE Mailer Mailbox (M3).
+
+    `mailbox_id` and `organization_id` come from the polled Mailbox row, never
+    from the message: the tenant is bound before any content is turned into
+    application state, and every lookup below is parameterized by it. Nothing in
+    the message (From, To, Subject, Message-ID, body) selects or widens the tenant.
+
+    Differences from process_inbound_email_v2 (the webhook / legacy-global-IMAP
+    path, which is unchanged):
+      * dedupe identity is (mailbox_id, Message-ID) -- or (mailbox_id,
+        "synthetic:<sha256>") for a message with no usable Message-ID -- not a
+        global Message-ID, so another organization's copy of the same email is
+        never mistaken for a duplicate (and never leaks its contact id);
+      * correlation is organization- and mailbox-scoped (see
+        _correlate_mailbox_inbound); no To:-header resolution;
+      * unmatched or ambiguous mail is NOT persisted and NOT guessed: it returns
+        an unmatched result carrying only a reason, and the caller marks it Seen
+        (existing behaviour -- no orphan table in M3).
+
+    The caller owns the transaction: it must commit before marking the IMAP
+    message Seen. This function never commits.
+    """
+    email_in = replace(
+        email_in,
+        message_id=_normalize_message_id(email_in.message_id),
+        in_reply_to=_normalize_message_id(email_in.in_reply_to),
+        references=[
+            r for r in (_normalize_message_id(ref) for ref in email_in.references) if r
+        ],
+    )
+    identity = email_in.message_id or email_in.synthetic_id
+    if not identity:
+        # parse_inbound_bytes always provides one of the two; refuse rather than
+        # persist an un-dedupable row.
+        raise ValueError("mailbox inbound requires a Message-ID or synthetic identity")
+
+    def _existing():
+        return (
+            db.query(Message)
+            .filter(
+                Message.mailbox_id == mailbox_id,
+                Message.message_id_header == identity,
+                Message.direction == MessageDirection.INBOUND.value,
+            )
+            .first()
+        )
+
+    existing = _existing()
+    if existing:
+        logger.info("Duplicate inbound for mailbox %s (already stored), skipping", mailbox_id)
+        return {
+            "matched": True, "contact_id": existing.contact_id,
+            "action": "skipped_duplicate", "message_id": existing.id,
+        }
+
+    contact, reason = _correlate_mailbox_inbound(
+        db, email_in, mailbox_id=mailbox_id, organization_id=organization_id
+    )
+    if contact is None:
+        # Metadata only: no addresses, subject or body in the log line.
+        logger.info("Inbound for mailbox %s not attached to any contact (%s); not persisted", mailbox_id, reason)
+        return {"matched": False, "action": f"unmatched_{reason}", "reason": reason}
+
+    campaign = contact.campaign
+    inbound_msg = Message(
+        contact_id=contact.id,
+        mailbox_id=mailbox_id,
+        direction=MessageDirection.INBOUND.value,
+        message_type=None,
+        subject=email_in.subject,
+        body=email_in.body_text,
+        status=MessageStatus.RECEIVED.value,
+        message_id_header=identity,
+        in_reply_to_header=email_in.in_reply_to,
+        references_header=" ".join(email_in.references) if email_in.references else None,
+    )
+    db.add(inbound_msg)
+    try:
+        db.flush()
+    except IntegrityError:
+        # Lost a race against a concurrent poll of the same mailbox: the
+        # (mailbox_id, Message-ID) index is what makes that safe.
+        db.rollback()
+        existing = _existing()
+        logger.info("Concurrent duplicate for mailbox %s resolved by unique index", mailbox_id)
+        return {
+            "matched": True,
+            "contact_id": existing.contact_id if existing else None,
+            "action": "skipped_duplicate",
+            "message_id": existing.id if existing else None,
+        }
+
+    return _classify_and_apply_inbound(db, email_in, contact, campaign, inbound_msg)
+
+
+def _correlate_mailbox_inbound(
+    db: Session, email_in: InboundEmail, *, mailbox_id: int, organization_id: str
+) -> tuple[Contact | None, str | None]:
+    """
+    Safe correlation inside ONE organization, in this order:
+
+      1. RFC threading: In-Reply-To / References matched against Mailer-stored
+         messages of this organization. A stored message only counts if it
+         belongs to this mailbox: an inbound row must carry this mailbox_id; an
+         outbound row sent through the Mailer mailbox path must have its
+         ExternalDispatch.mailbox_id == this mailbox. An outbound row with no
+         ExternalDispatch (the native, deployment-global-SMTP path) has no
+         mailbox to compare, so it is accepted on organization scope alone.
+         If the eligible matches span more than one contact the result is
+         AMBIGUOUS -- never "pick the newest".
+      2. Only if no eligible thread match exists: the sender address within this
+         organization, and only when exactly one non-suppressed contact has it.
+
+    No subject matching and no To:-header use. Synthetic identities are never
+    threading identifiers. Returns (contact, None) or (None, reason).
+    """
+    candidate_ids = {
+        v for v in (email_in.in_reply_to, *email_in.references)
+        if v and not is_synthetic_id(v)
+    }
+    if candidate_ids:
+        rows = (
+            db.query(Message)
+            .join(Contact, Message.contact_id == Contact.id)
+            .join(Campaign, Contact.campaign_id == Campaign.id)
+            .filter(
+                Campaign.organization_id == organization_id,
+                Message.message_id_header.in_(candidate_ids),
+                ~Message.message_id_header.like("synthetic:%"),
+            )
+            .all()
+        )
+        contact_ids: set[int] = set()
+        for m in rows:
+            if m.direction == MessageDirection.INBOUND.value:
+                eligible = m.mailbox_id == mailbox_id
+            else:
+                dispatch_mailbox = (
+                    db.query(ExternalDispatch.mailbox_id)
+                    .filter(
+                        ExternalDispatch.message_id == m.id,
+                        ExternalDispatch.organization_id == organization_id,
+                    )
+                    .first()
+                )
+                eligible = dispatch_mailbox is None or dispatch_mailbox[0] == mailbox_id
+            if eligible:
+                contact_ids.add(m.contact_id)
+        if len(contact_ids) > 1:
+            return None, _AMBIGUOUS
+        if len(contact_ids) == 1:
+            return db.get(Contact, next(iter(contact_ids))), None
+
+    if not email_in.from_email:
+        return None, _UNMATCHED
+    candidates = (
+        db.query(Contact)
+        .join(Campaign, Contact.campaign_id == Campaign.id)
+        .filter(
+            Campaign.organization_id == organization_id,
+            func.lower(Contact.email) == email_in.from_email,
+            Contact.status != ContactStatus.SUPPRESSED.value,
+        )
+        .all()
+    )
+    if len(candidates) == 1:
+        return candidates[0], None
+    if len(candidates) > 1:
+        return None, _AMBIGUOUS
+    return None, _UNMATCHED
 
 
 def _find_contact_by_message_id(db: Session, email_in: InboundEmail) -> Contact | None:

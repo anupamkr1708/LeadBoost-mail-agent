@@ -15,6 +15,7 @@ from mailer_agent.config import get_settings
 from mailer_agent.db import session_scope
 from mailer_agent.followup.engine import run_followup_cycle
 from mailer_agent.mail.imap_reader import fetch_unseen_replies
+from mailer_agent.mail.mailbox_inbound import poll_all_mailboxes
 from mailer_agent.mail.reply_handler import process_inbound_email
 from mailer_agent.models import Contact
 from mailer_agent.utils.datetime_utils import utcnow
@@ -43,6 +44,24 @@ def poll_replies_job() -> None:
                 logger.info(f"Processed inbound from {email_in.from_email}: {action}")
             except Exception as e:
                 logger.exception(f"Failed to process inbound email from {email_in.from_email}: {e}")
+
+
+def poll_mailbox_inboxes_job() -> None:
+    """
+    M3: poll every eligible Mailer Mailbox with its own IMAP identity (see
+    mail/mailbox_inbound.py). Independent of poll_replies_job, which remains the
+    deployment-global legacy path and never acts as a fallback for this one.
+    poll_all_mailboxes never raises; per-mailbox failures are in its outcomes.
+    """
+    outcomes = poll_all_mailboxes()
+    if not outcomes:
+        return
+    handled = sum(o.processed for o in outcomes)
+    failed = [o for o in outcomes if o.status not in ("ok", "skipped_ineligible")]
+    logger.info(
+        "Mailbox inbound cycle: %d mailbox(es), %d message(s) handled, %d mailbox failure(s)",
+        len(outcomes), handled, len(failed),
+    )
 
 
 def dispatch_new_contacts_job() -> None:
@@ -265,6 +284,16 @@ def start_scheduler() -> BackgroundScheduler:
         max_instances=1  # Prevent overlapping runs
     )
     
+    # M3: per-Mailbox inbound (each Mailbox's own IMAP identity, tenant bound
+    # from Mailbox.organization_id). Same cadence setting as the legacy poll.
+    scheduler.add_job(
+        poll_mailbox_inboxes_job,
+        "interval",
+        seconds=settings.imap_poll_seconds,
+        id="poll_mailbox_inboxes",
+        max_instances=1
+    )
+
     # Initial outreach dispatch (NEW contacts with next_action_at set)
     scheduler.add_job(
         dispatch_new_contacts_job,
