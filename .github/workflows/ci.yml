@@ -137,7 +137,9 @@ jobs:
             tests/test_external_dispatch_postgres.py \
             tests/test_leadboost_generated_outreach_postgres.py \
             tests/test_postgresql_concurrency.py \
-            tests/test_m3_inbound_postgres.py -v
+            tests/test_m3_inbound_postgres.py \
+            tests/test_leadboost_reconciliation_postgres.py \
+            tests/test_leadboost_conversation_postgres.py -v
 
   local-smtp:
     name: Local SMTP protocol integration
