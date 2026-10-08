@@ -9,6 +9,7 @@ from mailer_agent.api import (
     campaigns,
     contacts,
     integrations,
+    integrations_conversation,
     integrations_generated,
     mailboxes,
     messages,
@@ -68,6 +69,7 @@ app.include_router(webhooks.router)
 app.include_router(system.router)
 app.include_router(integrations.router)
 app.include_router(integrations_generated.router)
+app.include_router(integrations_conversation.router)
 app.include_router(mailboxes.router)
 
 

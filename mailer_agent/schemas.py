@@ -205,6 +205,72 @@ class LeadBoostOutreachActionStatus(BaseModel):
     updated_at: datetime | None = None
 
 
+# ---- LeadBoost conversation read (C9.3) ------------------------------------
+# GET /integrations/leadboost/outreach-actions/{idempotency_key}/conversation
+#
+# Read-only, explicit allowlist. extra="forbid" on EVERY model: these are
+# constructed field-by-field from selected columns (never from an ORM row), so
+# a field that is not declared here cannot reach the wire, and adding one is a
+# deliberate schema change, not an accident of serialization.
+#
+# Deliberately absent (see api/integrations_conversation.py): Message.id and
+# every other database id, Message-ID / In-Reply-To / References, error_message,
+# detected_intent, semantic_analysis, grounding context, claim/lease fields,
+# mailbox addresses and credentials, and the organization.
+
+_PublicDeliveryState = Literal["queued", "sending", "sent", "failed", "unknown"]
+
+
+class LeadBoostConversationAction(BaseModel):
+    """The dispatch this read is rooted on. state is ExternalDispatch.state
+    (the authoritative outbound delivery state) in the same public vocabulary
+    as C9.1: GENERATING reads as queued, UNKNOWN is passed through."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: Literal[True] = True
+    state: _PublicDeliveryState
+    mailing_agent_reference: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # Opaque Mailbox.public_reference of the mailbox the dispatch was bound to,
+    # or None when it is not (yet) bound. Never an address.
+    mailbox_reference: str | None = None
+
+
+class LeadBoostConversationMessage(BaseModel):
+    """One message of the recipient's conversation.
+
+    delivery_state / mailing_agent_reference are set for outbound messages
+    only, and come from the ExternalDispatch that produced the message --
+    never from Message.status. Inbound messages carry the opaque reference of
+    the (organization-owned) mailbox they were received through.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    direction: Literal["outbound", "inbound"]
+    message_type: Literal["initial_outreach", "follow_up", "reply", "closing"] | None = None
+    subject: str | None = None
+    body: str
+    body_truncated: bool = False
+    created_at: datetime | None = None
+    delivery_state: _PublicDeliveryState | None = None
+    mailing_agent_reference: str | None = None
+    mailbox_reference: str | None = None
+
+
+class LeadBoostConversation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: LeadBoostConversationAction
+    # Oldest first within the returned window (the most recent `limit`
+    # messages of the recipient's conversation).
+    messages: list[LeadBoostConversationMessage]
+    # True when older messages exist beyond the window. There is no cursor.
+    has_more: bool
+
+
 # ---- LeadBoost generated-outreach intake (C9.2) ---------------------------
 # POST /integrations/leadboost/outreach-requests. LeadBoost has already
 # authorized the action; Mailer generates the message from the context below.
