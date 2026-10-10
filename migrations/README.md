@@ -102,7 +102,19 @@ Run once, in this order, against a fresh or partially-migrated database:
     BEFORE deploying M2-B and after 007. The new internal state `generating`
     needs no DDL. Downgrade refuses to run while any row has NULL `message_id`.
 
-**Deployment note (as of this migration):** none of these eight scripts are
+11. `009_messages_mailbox_scoped_dedupe.py` -- M3: nullable `messages.mailbox_id`
+    (FK -> `mailboxes.id`, RESTRICT) and the replacement of the global
+    `uq_messages_message_id_header` constraint by two partial unique indexes:
+    `UNIQUE(message_id_header) WHERE mailbox_id IS NULL` (exactly the old rule for
+    every existing row: outbound, webhook, legacy-global-IMAP) and
+    `UNIQUE(mailbox_id, message_id_header) WHERE mailbox_id IS NOT NULL` (the
+    mailbox-bound inbound identity). Apply BEFORE deploying M3 code: the ORM
+    selects `messages.mailbox_id` on every Message query. Idempotent; has a
+    `--downgrade` that refuses to run if a Message-ID is now stored more than
+    once. SQLite note: an inline UNIQUE from pre-M3 `CREATE TABLE` cannot be
+    dropped there -- recreate development databases from the models.
+
+**Deployment note:** none of these scripts are
 run automatically by this repo's `render.yaml` -- its `buildCommand` only
 installs dependencies. Until a pre-deploy migration step is added (tracked
 separately), apply new migrations manually, in the order above, before
@@ -140,23 +152,12 @@ python migrations/005_external_dispatch_grounding_context.py
 python migrations/006_mailboxes.py
 python migrations/007_external_dispatch_mailbox.py
 python migrations/008_external_dispatch_deferred_message.py
+python migrations/009_messages_mailbox_scoped_dedupe.py
 ```
 
 To revert 005 only: `python migrations/005_external_dispatch_grounding_context.py --downgrade`.
 To revert 006 only (destroys all mailbox records/credentials): `python migrations/006_mailboxes.py --downgrade`.
-To revert 007 / 008: `--downgrade` on each (008 refuses while any dispatch has `message_id` NULL).
+To revert 007 / 008 / 009: `--downgrade` on each (008 refuses while any dispatch has `message_id` NULL; 009 refuses if a Message-ID is now stored more than once).
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/
 indexes/constraints that already exist.
-
-10. `009_messages_mailbox_scoped_dedupe.py` -- M3: nullable `messages.mailbox_id`
-   (FK -> `mailboxes.id`, RESTRICT) and the replacement of the global
-   `uq_messages_message_id_header` constraint by two partial unique indexes:
-   `UNIQUE(message_id_header) WHERE mailbox_id IS NULL` (exactly the old rule for
-   every existing row: outbound, webhook, legacy-global-IMAP) and
-   `UNIQUE(mailbox_id, message_id_header) WHERE mailbox_id IS NOT NULL` (the
-   mailbox-bound inbound identity). Apply BEFORE deploying M3 code: the ORM
-   selects `messages.mailbox_id` on every Message query. Idempotent; has a
-   `--downgrade` that refuses to run if a Message-ID is now stored more than
-   once. SQLite note: an inline UNIQUE from pre-M3 `CREATE TABLE` cannot be
-   dropped there -- recreate development databases from the models.
