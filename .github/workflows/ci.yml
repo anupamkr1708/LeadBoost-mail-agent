@@ -167,8 +167,24 @@ jobs:
 
 
   m3-imap-e2e:
-    name: M3 real IMAP end-to-end (disposable Dovecot)
+    name: M3 real IMAP end-to-end + C12 full chain (disposable Dovecot / SMTP, PostgreSQL)
     runs-on: ubuntu-latest
+    services:
+      # Both Dovecot suites pick PostgreSQL up via POSTGRES_TEST_URL; the C12
+      # full-chain test requires it whenever it is set (no silent SQLite fallback).
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mailer_agent
+          POSTGRES_PASSWORD: mailer_agent_test_pw
+          POSTGRES_DB: mailer_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mailer_agent -d mailer_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -192,7 +208,15 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dovecot-imapd
           sudo systemctl stop dovecot || true
 
-      - name: Run M3 IMAP end-to-end test
+      - name: Run M3 IMAP end-to-end + C12 full-chain tests
         # Root is needed so Dovecot can drop to its service users.
+        env:
+          POSTGRES_TEST_URL: postgresql+psycopg2://mailer_agent:mailer_agent_test_pw@localhost:5432/mailer_agent_test
+          C12_ALLOW_DESTRUCTIVE_TEST_DB: "1"
         run: |
-          sudo -E env "PATH=$PATH" python -m pytest -o addopts="" tests/test_m3_imap_e2e.py -v
+          sudo -E env \
+            "PATH=$PATH" \
+            "DATABASE_URL=$POSTGRES_TEST_URL" \
+            "POSTGRES_TEST_URL=$POSTGRES_TEST_URL" \
+            "C12_ALLOW_DESTRUCTIVE_TEST_DB=$C12_ALLOW_DESTRUCTIVE_TEST_DB" \
+            python -m pytest -o addopts="" tests/test_m3_imap_e2e.py tests/test_c12_chain_smtp_imap.py -v
