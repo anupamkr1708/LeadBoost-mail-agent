@@ -227,8 +227,12 @@ operation" (and may then cancel its own action), so a `404` for an existing lega
 - A held draft has no lease and no expiry; it waits until released or cancelled. A stale-draft sweep is not implemented.
 - Content is immutable in v1: no editing and no regeneration, so `draft_version` is always `1`. Either would need
   versioned re-approval.
-- Release/cancel atomicity is a single guarded `UPDATE`. It is tested with sequential orderings and a two-thread race on
-  SQLite; it has not been exercised against PostgreSQL by this change's tests.
+- Release/cancel/fenced-completion atomicity rests on single guarded `UPDATE` statements. It is tested with sequential
+  orderings and a two-thread race on SQLite, under genuine concurrency on PostgreSQL 16
+  (`tests/test_managed_reply_approval_postgres.py`: 25 release-vs-cancel races, 12 concurrent identical releases, a
+  wrong-tenant/wrong-message race, cancel vs the generation worker's fenced completion, and concurrent SMTP claimers
+  that never see a held draft), and end to end by LeadBoost's cross-service E2E. Other PostgreSQL versions and
+  replicated/multi-node setups were not tested.
 
 ## 6. Inbound email
 
