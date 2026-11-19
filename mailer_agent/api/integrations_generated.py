@@ -343,6 +343,10 @@ def create_leadboost_generated_outreach(
         public_reference=uuid.uuid4().hex,
         state=ExternalDispatchState.QUEUED.value,
         grounding_context=grounding,
+        # Every managed reply must have its exact generated content approved before it can be sent.
+        # Applies to ANY caller of this route -- an older LeadBoost that cannot drive the new
+        # draft/release endpoints gets a held draft that never sends, not unreviewed generated text.
+        content_approval_required=reply_parent is not None,
     )
     db.add(dispatch)
 

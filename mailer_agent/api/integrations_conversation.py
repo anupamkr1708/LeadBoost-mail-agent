@@ -91,6 +91,7 @@ from mailer_agent.models import (
     Contact,
     ExternalDispatch,
     ExternalDispatchState,
+    LEGACY_PUBLIC_STATE,
     Mailbox,
     Message,
     MessageDirection,
@@ -115,15 +116,17 @@ BODY_CAP_CHARS = 20_000
 # The public delivery vocabulary -- identical to C9.1's. GENERATING is an
 # internal step of "accepted, not yet completed by a worker" and reads as queued.
 _PUBLIC_STATES = frozenset(
-    s.value for s in ExternalDispatchState if s is not ExternalDispatchState.GENERATING
+    s.value for s in ExternalDispatchState if s.value not in LEGACY_PUBLIC_STATE
 )
 
 
 def _public_state(internal: str) -> str | None:
     """Map ExternalDispatch.state to the public vocabulary (None if it is not a
-    recognised value -- treated by the caller as an integrity failure)."""
-    if internal == ExternalDispatchState.GENERATING.value:
-        return ExternalDispatchState.QUEUED.value
+    recognised value -- treated by the caller as an integrity failure). Internal-only
+    states (GENERATING, and the managed-reply AWAITING_APPROVAL / CANCELLED) are mapped
+    by LEGACY_PUBLIC_STATE so a value LeadBoost does not know is never emitted here."""
+    if internal in LEGACY_PUBLIC_STATE:
+        return LEGACY_PUBLIC_STATE[internal]
     return internal if internal in _PUBLIC_STATES else None
 
 

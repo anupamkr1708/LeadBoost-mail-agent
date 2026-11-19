@@ -93,6 +93,12 @@ def seed_dispatch(
     mailbox_status: str = MailboxStatus.ACTIVE.value,
     smtp_host: str = "smtp.mailbox.example",
     smtp_port: int = 2525,
+    content_approval_required: bool = False,
+    approved_content_sha256: str | None = None,
+    in_reply_to_header: str | None = None,
+    references_header: str | None = None,
+    grounding_context: dict | None = None,
+    with_message: bool = True,
 ) -> ExternalDispatch:
     """One integration Campaign per org (get-or-create), one Contact, one
     DRAFT Message and one ExternalDispatch -- the same shape the HTTP
@@ -118,9 +124,15 @@ def seed_dispatch(
     contact = Contact(campaign_id=campaign.id, name="Jane", email=email, next_action_at=None)
     db.add(contact)
     db.flush()
-    message = create_authorized_message(contact_id=contact.id, subject=subject, body=body)
-    db.add(message)
-    db.flush()
+    message = None
+    if with_message:
+        message = create_authorized_message(contact_id=contact.id, subject=subject, body=body)
+        if in_reply_to_header:
+            message.message_type = "reply"
+            message.in_reply_to_header = in_reply_to_header
+            message.references_header = references_header
+        db.add(message)
+        db.flush()
     mailbox_row = (
         seed_mailbox(
             db, org=org, email=sender_email, status=mailbox_status,
@@ -137,13 +149,16 @@ def seed_dispatch(
         correlation_id="corr-1",
         campaign_id=campaign.id,
         contact_id=contact.id,
-        message_id=message.id,
+        message_id=message.id if message is not None else None,
         mailbox_id=mailbox_row.id if mailbox_row else None,
         request_fingerprint="f" * 64,
         public_reference=uuid.uuid4().hex,
         state=state,
         claimed_by=claimed_by,
         claimed_at=claimed_at,
+        content_approval_required=content_approval_required,
+        approved_content_sha256=approved_content_sha256,
+        grounding_context=grounding_context,
     )
     db.add(dispatch)
     db.flush()

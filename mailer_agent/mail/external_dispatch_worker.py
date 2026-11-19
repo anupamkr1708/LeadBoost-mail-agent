@@ -93,6 +93,7 @@ from mailer_agent.followup.work_claiming import (
     make_worker_id,
     recover_expired_external_dispatches,
 )
+from mailer_agent.mail import content_digest
 from mailer_agent.mail.exact_message import (
     ExactMessageError,
     build_exact_send_input,
@@ -415,6 +416,37 @@ def _fail_in_b(db: Session, claim: ClaimedDispatch, ctx: _Ctx, reason: str) -> D
     )
 
 
+def _verify_approved_content(dispatch: ExternalDispatch, send_input) -> None:
+    """
+    Managed-reply integrity gate: the subject/body about to be handed to SMTP must hash to exactly the
+    digest the release recorded. Raises _Gate (-> FAILED, SMTP never reached, nothing regenerated).
+
+    Applies when the dispatch requires content approval -- and also whenever an approved digest is
+    present at all, so a row cannot slip past by having the flag cleared. A required row with NO
+    recorded digest is refused: "approved" is something this row must prove, not something we assume.
+    The digest is computed from ``send_input`` -- the very values passed to send_email -- not from a
+    separately re-read column, so what is verified is what is transmitted.
+
+    The failure reason is a fixed, content-free code. Only digest PREFIXES are logged (never the text).
+    """
+    recorded = dispatch.approved_content_sha256
+    if not (dispatch.content_approval_required or recorded is not None):
+        return
+    if not content_digest.is_valid_digest(recorded):
+        raise _Gate("approval_missing: no approved content digest is recorded; not sent")
+    try:
+        actual = content_digest.content_sha256(send_input.subject, send_input.body_text)
+        content_digest.enforce_preview_limits(send_input.subject, send_input.body_text)
+    except content_digest.DigestError:
+        raise _Gate("approval_content_unverifiable: content cannot be fingerprinted; not sent") from None
+    if not content_digest.digests_equal(actual, recorded):
+        logger.error(
+            "external_dispatch approved-content mismatch dispatch_id=%s approved=%s actual=%s",
+            dispatch.id, recorded[:12], actual[:12],
+        )
+        raise _Gate("approval_content_mismatch: message no longer matches the approved content; not sent")
+
+
 def _transaction_b(
     factory: SessionFactory, worker_id: str, runtime: DispatchRuntime
 ) -> "None | DispatchResult | _Prepared":
@@ -449,6 +481,10 @@ def _transaction_b(
                 send_input = build_exact_send_input(message, contact, campaign)
             except ExactMessageError as exc:
                 raise _Gate(f"wiring_error: {exc}") from exc
+
+            # Managed replies: prove the exact approved content before any other gate spends work or
+            # touches SMTP. Ordinary dispatches (flag FALSE, no digest) pass through untouched.
+            _verify_approved_content(dispatch, send_input)
 
             mailbox = _load_active_mailbox(db, dispatch)
             # The mailbox is the sending identity: From (and the Message-ID

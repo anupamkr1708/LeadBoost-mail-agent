@@ -40,6 +40,7 @@ from mailer_agent.models import (
     Base,
     Campaign,
     ExternalDispatch,
+    LEGACY_PUBLIC_STATE,
     ExternalDispatchState,
     Message,
 )
@@ -55,7 +56,10 @@ ORG_A = "org-a"
 ORG_B = "org-b"
 BASE = "/integrations/leadboost/outreach-actions"
 C91 = BASE  # the frozen reconciliation GET lives at BASE/{key}
-ALL_STATES = [s.value for s in ExternalDispatchState if s is not ExternalDispatchState.GENERATING]
+# The five PUBLIC delivery states, each of which must pass through unchanged. GENERATING and the managed-reply
+# AWAITING_APPROVAL / CANCELLED are internal-only: they are mapped (LEGACY_PUBLIC_STATE), never emitted -- see
+# test_internal_states_are_mapped_not_leaked below. This list is the same five values it always was.
+ALL_STATES = [s.value for s in ExternalDispatchState if s.value not in LEGACY_PUBLIC_STATE]
 
 TOP_KEYS = {"action", "messages", "has_more"}
 ACTION_KEYS = {"accepted", "state", "mailing_agent_reference", "created_at", "updated_at", "mailbox_reference"}
@@ -254,6 +258,23 @@ def test_unknown_is_never_translated(client, db):
     body = client.get(url("k1")).json()
     assert body["action"]["state"] == "unknown"
     assert body["messages"][0]["delivery_state"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "internal, public",
+    [("awaiting_approval", "queued"), ("cancelled", "failed"), ("generating", "queued")],
+)
+def test_internal_states_are_mapped_not_leaked(client, db, internal, public):
+    """A held managed-reply draft has sent nothing (queued); a cancelled one never will (failed).
+    LeadBoost validates this vocabulary strictly, so an internal value must never be emitted."""
+    seed_dispatch(db, org=ORG_A, idem="k1", state=internal)
+    body = client.get(url("k1")).json()
+    assert body["action"]["state"] == public
+    assert body["messages"][0]["delivery_state"] == public
+
+
+def test_public_vocabulary_is_exactly_the_five_c91_states():
+    assert sorted(ALL_STATES) == ["failed", "queued", "sending", "sent", "unknown"]
 
 
 def test_generating_reads_as_queued_like_c91(client, db):

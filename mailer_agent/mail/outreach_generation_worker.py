@@ -9,6 +9,7 @@ the existing C6-C8 dispatch worker then sends:
 
     QUEUED (message_id NULL) --claim--> GENERATING --LLM--> QUEUED (message set)
                                                     \\-----> FAILED (no Message)
+    managed reply (in_reply_to): the success edge lands in AWAITING_APPROVAL -- message set, NOT sendable
 
 Transactions -- never open across the LLM call
   G1 (own session, ONE commit)  claim -> GENERATING, load Campaign/Contact with
@@ -271,7 +272,13 @@ def _transaction_g2(factory: SessionFactory, prepared: _Prepared, draft, failure
                     message.references_header = p.get("references_header")
                 db.add(message)
                 db.flush()
-                won = complete_generation(db, claim, message.id)
+                # A managed reply finishes into the approval hold, never into a sendable state: the
+                # user must see and approve this exact subject/body first. Ordinary outreach
+                # (no reply_parent) takes the unchanged QUEUED path.
+                if prepared.reply_parent is not None:
+                    won = complete_generation(db, claim, message.id, hold_for_approval=True)
+                else:
+                    won = complete_generation(db, claim, message.id)   # byte-for-byte the pre-existing call
             if not won:
                 db.rollback()      # a lost fence discards the Message insert: no second Message, ever
                 return False

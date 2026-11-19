@@ -200,10 +200,11 @@ def test_full_canonical_sequence_on_empty_database_then_idempotent_rerun(disposa
 
     first = disposable_db.run()
     assert first.returncode == 0, _out(first)
-    assert "(11/14) migrations/009_messages_mailbox_scoped_dedupe.py" in _out(first)
-    assert "(12/14) migrations/010_worker_runtime_status.py" in _out(first)
-    assert "(13/14) migrations/011_unmatched_inbound_messages.py" in _out(first)
-    assert "(14/14) migrations/012_message_reply_reference.py" in _out(first)
+    assert "(11/15) migrations/009_messages_mailbox_scoped_dedupe.py" in _out(first)
+    assert "(12/15) migrations/010_worker_runtime_status.py" in _out(first)
+    assert "(13/15) migrations/011_unmatched_inbound_messages.py" in _out(first)
+    assert "(14/15) migrations/012_message_reply_reference.py" in _out(first)
+    assert "(15/15) migrations/013_external_dispatch_content_approval.py" in _out(first)
     assert "ABSENT" not in _out(first), "every schema marker must be present after the run"
 
     tables = disposable_db.tables()
@@ -215,6 +216,7 @@ def test_full_canonical_sequence_on_empty_database_then_idempotent_rerun(disposa
     assert "ix_messages_inbound_created_at" in _out(first)
     assert "012  messages.reply_reference column" in _out(first)
     assert "012  uq_messages_reply_reference" in _out(first)
+    assert "013  external_dispatches.content_approval_required" in _out(first)
     with disposable_db.engine.connect() as c:
         names = {i["name"] for i in inspect(c).get_indexes("messages")}
         names |= {u["name"] for u in inspect(c).get_unique_constraints("messages")}
@@ -260,7 +262,7 @@ def test_migration_012_backfills_existing_rows_after_a_legacy_schema_upgrade(dis
 
     first = disposable_db.run()
     assert first.returncode == 0, _out(first)
-    assert "(14/14) migrations/012_message_reply_reference.py" in _out(first)
+    assert "(14/15) migrations/012_message_reply_reference.py" in _out(first)
     with disposable_db.engine.connect() as conn:
         rows = conn.execute(
             text("SELECT id, reply_reference FROM messages WHERE id IN (:outbound_id, :inbound_id) ORDER BY id"),
@@ -406,3 +408,277 @@ def test_verify_names_the_columns_a_legacy_shaped_database_lacks(disposable_db):
     assert "missing column external_dispatches.mailbox_id" in _out(p)
     assert "missing column messages.mailbox_id" in _out(p)
     assert "missing table mailboxes" in _out(p)
+
+
+# --------------------------------------------------------------------------
+# Managed-reply rollout gate (migration 013): legacy reply dispatches must not still be able to send unreviewed text.
+# `grounding_context` is a JSON column: the gate uses a JSON-key predicate, never LIKE.
+# --------------------------------------------------------------------------
+_REPLY_OBJ = '{"reply_parent": {"message_id": 1, "subject": "Re: Hello"}}'
+
+
+def _reply_db(db: _Disposable, rows, *, pre_013: bool = False):
+    """Create the schema and seed dispatches. rows = [(state, grounding_json_or_None, approval_flag, has_message)].
+    With pre_013=True the three migration-013 columns are dropped afterwards, as on a database that has not run it."""
+    from sqlalchemy.orm import sessionmaker
+
+    from mailer_agent.models import Base
+    from tests.dispatch_support import seed_dispatch
+
+    Base.metadata.create_all(bind=db.engine)
+    ids = []
+    with sessionmaker(bind=db.engine)() as s:
+        for i, (state, _g, flag, _hm) in enumerate(rows):
+            ids.append(seed_dispatch(s, idem=f"k{i}", email=f"u{i}@example.com", state=state, content_approval_required=flag).id)
+    with db.engine.begin() as c:
+        for did, (_state, grounding, _flag, has_message) in zip(ids, rows):
+            c.execute(
+                text("UPDATE external_dispatches SET grounding_context = CAST(:g AS json) WHERE id = :i"),
+                {"g": grounding, "i": did},
+            )
+            if not has_message:
+                c.execute(text("UPDATE external_dispatches SET message_id = NULL WHERE id = :i"), {"i": did})
+        if pre_013:
+            for col in ("content_approval_required", "approved_content_sha256", "approved_at"):
+                c.execute(text(f"ALTER TABLE external_dispatches DROP COLUMN {col}"))
+    return ids
+
+
+def _gate(db: _Disposable) -> subprocess.CompletedProcess:
+    return _preflight("gate", DATABASE_URL=db.dsn, MIGRATE_DISPOSABLE_TEST_DB="yes")
+
+
+def _state_counts(db: _Disposable):
+    with db.engine.connect() as c:
+        return dict(c.execute(text("SELECT state, count(*) FROM external_dispatches GROUP BY state")).all())
+
+
+_UNRESOLVED_LEGACY = [
+    pytest.param("queued", True, id="queued-with-message"),
+    pytest.param("queued", False, id="queued-without-message"),
+    pytest.param("generating", True, id="generating-with-message"),
+    pytest.param("generating", False, id="generating-without-message"),
+    pytest.param("sending", True, id="sending"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+@pytest.mark.parametrize("state, has_message", _UNRESOLVED_LEGACY)
+def test_gate_refuses_every_unresolved_legacy_managed_reply(disposable_db, state, has_message):
+    """Queued-WITHOUT-a-message used to pass. It must block: the new generation worker would generate it into
+    AWAITING_APPROVAL, where LeadBoost's new UI treats the old action as legacy and cannot review or release it."""
+    _reply_db(disposable_db, [(state, _REPLY_OBJ, False, has_message)])
+    before = _state_counts(disposable_db)
+    p = _gate(disposable_db)
+    assert p.returncode == 4, _out(p)
+    assert "unresolved legacy managed-reply dispatch" in _out(p) and "Nothing was changed" in _out(p)
+    assert "Legacy managed replies" in _out(p), "the refusal must point at the operator procedure"
+    assert _state_counts(disposable_db) == before, "a refused gate must change nothing"
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_gate_refusal_for_a_queued_reply_without_a_message_explains_the_stranding_and_lists_the_row(disposable_db):
+    ids = _reply_db(disposable_db, [("queued", _REPLY_OBJ, False, False)])
+    p = _gate(disposable_db)
+    out = _out(p)
+    assert p.returncode == 4, out
+    assert "stranding the draft" in out and "queued" in out
+    assert f"id={ids[0]}" in out and "key=k0" in out, "the operator must be able to identify the row"
+    assert "u0@example.com" not in out and "Re: Hello" not in out, "ids and states only: no addresses, no content"
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_gate_lists_only_the_blocking_rows_and_caps_the_listing(disposable_db):
+    rows = [("queued", _REPLY_OBJ, False, i % 2 == 0) for i in range(53)] + [("sent", _REPLY_OBJ, False, True)]
+    _reply_db(disposable_db, rows)
+    p = _gate(disposable_db)
+    out = _out(p)
+    assert p.returncode == 4, out
+    assert out.count("    id=") == 50 and "more not listed" in out
+    assert "state=sent" not in out
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_gate_passes_only_when_the_last_unresolved_legacy_reply_has_resolved(disposable_db):
+    """The documented drain loop: blocked while any row is unresolved, passes once every one is terminal."""
+    ids = _reply_db(disposable_db, [("queued", _REPLY_OBJ, False, False), ("sending", _REPLY_OBJ, False, True)])
+    assert _gate(disposable_db).returncode == 4
+    with disposable_db.engine.begin() as c:
+        c.execute(text("UPDATE external_dispatches SET state = 'sent' WHERE id = :i"), {"i": ids[1]})
+    p = _gate(disposable_db)
+    assert p.returncode == 4 and f"id={ids[0]}" in _out(p) and f"id={ids[1]}" not in _out(p)
+    with disposable_db.engine.begin() as c:
+        c.execute(text("UPDATE external_dispatches SET state = 'failed' WHERE id = :i"), {"i": ids[0]})
+    assert _gate(disposable_db).returncode == 0
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+@pytest.mark.parametrize("state", ["sent", "failed", "cancelled"])
+def test_gate_ignores_finished_legacy_replies(disposable_db, state):
+    _reply_db(disposable_db, [(state, _REPLY_OBJ, False, True)])
+    assert _gate(disposable_db).returncode == 0
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_gate_reports_but_does_not_block_an_unknown_legacy_reply(disposable_db):
+    """UNKNOWN is an ambiguous SMTP outcome. Nothing re-sends it and the new code never touches it, so it cannot be
+    stranded or double-processed; blocking on it would let one unverifiable row hold every release forever."""
+    _reply_db(disposable_db, [("unknown", _REPLY_OBJ, False, True)])
+    p = _gate(disposable_db)
+    assert p.returncode == 0, _out(p)
+    assert "'unknown'" in _out(p) and "legacy_reply_requires_reconciliation" in _out(p)
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    "grounding",
+    [None, "{}", '{"reply_parent": null}', '{"reply_parent": "not-an-object"}', '{"recipient_facts": ["reply_parent"]}'],
+    ids=["column NULL", "key absent", "JSON null", "non-object value", "text merely mentioning the word"],
+)
+def test_gate_does_not_block_ordinary_dispatches_or_non_object_reply_parent(disposable_db, grounding):
+    """Only an OBJECT under reply_parent marks a managed reply -- including ordinary queued work and values that merely
+    contain the word (which is what a LIKE would wrongly catch)."""
+    _reply_db(disposable_db, [("queued", grounding, False, True)])
+    assert _gate(disposable_db).returncode == 0
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    "state, has_message",
+    [("awaiting_approval", True), ("queued", True), ("sending", True), ("generating", True), ("queued", False)],
+)
+def test_gate_passes_for_replies_created_by_the_new_code(disposable_db, state, has_message):
+    """New code sets content_approval_required on every reply at acceptance, so after the rollout the gate is quiet --
+    including a RELEASED reply (queued with a message, digest recorded) and one still being generated."""
+    _reply_db(disposable_db, [(state, _REPLY_OBJ, True, has_message)])
+    assert _gate(disposable_db).returncode == 0
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+@pytest.mark.parametrize("has_message", [True, False], ids=["with-message", "without-message"])
+def test_gate_before_migration_013_treats_every_in_flight_reply_as_legacy(disposable_db, has_message):
+    _reply_db(disposable_db, [("queued", _REPLY_OBJ, False, has_message)], pre_013=True)
+    p = _gate(disposable_db)
+    assert p.returncode == 4, _out(p)
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_gate_handles_a_jsonb_grounding_column(disposable_db):
+    _reply_db(disposable_db, [("queued", _REPLY_OBJ, False, True)])
+    with disposable_db.engine.begin() as c:
+        c.execute(text("ALTER TABLE external_dispatches ALTER COLUMN grounding_context TYPE jsonb USING grounding_context::jsonb"))
+    assert _gate(disposable_db).returncode == 4
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_the_old_like_form_is_not_valid_on_a_json_column(disposable_db):
+    """Why the first rollout query was wrong: PostgreSQL has no `json ~~ text` operator, so it would have errored
+    (or, hand-adapted with a cast, matched the word inside any string)."""
+    from sqlalchemy.exc import ProgrammingError
+
+    _reply_db(disposable_db, [("queued", _REPLY_OBJ, False, True)])
+    with disposable_db.engine.connect() as c:
+        with pytest.raises(ProgrammingError, match="operator does not exist"):
+            c.execute(text("SELECT id FROM external_dispatches WHERE grounding_context LIKE '%reply_parent%'"))
+    with disposable_db.engine.connect() as c:   # the documented predicate runs and finds the row
+        n = c.execute(text(
+            "SELECT count(*) FROM external_dispatches WHERE json_typeof(grounding_context -> 'reply_parent') = 'object'"
+        )).scalar()
+    assert n == 1
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+@pytest.mark.parametrize("has_message", [True, False], ids=["with-message", "without-message"])
+def test_the_release_wrapper_refuses_before_any_migration_while_a_legacy_reply_is_in_flight(disposable_db, has_message):
+    _reply_db(disposable_db, [("queued", _REPLY_OBJ, False, has_message)], pre_013=True)
+    p = disposable_db.run()
+    assert p.returncode == 4, _out(p)
+    assert "unresolved legacy managed-reply dispatch" in _out(p)
+    with disposable_db.engine.connect() as c:
+        cols = {r["name"] for r in inspect(c).get_columns("external_dispatches")}
+    assert "content_approval_required" not in cols, "no migration step may have run"
+    assert _state_counts(disposable_db) == {"queued": 1}
+
+
+# ---- the operator's "abandon an unclaimed legacy reply" statements, executed exactly as documented ----------------
+
+def _doc_sql(marker: str) -> str:
+    """The fenced SQL block that follows `<!-- marker -->` in migrations/README.md -- the text an operator runs."""
+    import re
+    from pathlib import Path
+
+    text_ = (Path(__file__).resolve().parents[1] / "migrations" / "README.md").read_text()
+    m = re.search(r"<!-- " + re.escape(marker) + r" -->\s*```sql\n(.*?)```", text_, re.S)
+    assert m, f"documented statement {marker!r} not found"
+    return m.group(1)
+
+
+def _run_doc_sql(db, marker, dispatch_id):
+    with db.engine.begin() as c:
+        return c.execute(text(_doc_sql(marker)), {"dispatch_id": dispatch_id}).all()
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_documented_abandon_statement_before_013_fails_only_an_unclaimed_queued_legacy_reply(disposable_db):
+    rows = [
+        ("queued", _REPLY_OBJ, False, False),        # 0: queued, no message          -> abandoned
+        ("queued", _REPLY_OBJ, False, True),         # 1: queued, with message        -> abandoned
+        ("queued", _REPLY_OBJ, False, True),         # 2: queued but claimed by a worker -> untouched
+        ("sending", _REPLY_OBJ, False, True),        # 3: sending                     -> untouched
+        ("sent", _REPLY_OBJ, False, True),           # 4: finished                    -> untouched
+        ("queued", '{"proof_points": []}', False, True),  # 5: ordinary outreach, no reply_parent -> untouched
+    ]
+    ids = _reply_db(disposable_db, rows, pre_013=True)
+    with disposable_db.engine.begin() as c:
+        c.execute(text("UPDATE external_dispatches SET claimed_by='w1', claimed_at=now() WHERE id=:i"), {"i": ids[2]})
+    before = {i: _snapshot_row(disposable_db, i) for i in ids}
+
+    results = {i: _run_doc_sql(disposable_db, "legacy-abandon-sql:pre-013", i) for i in ids}
+
+    assert [bool(results[i]) for i in ids] == [True, True, False, False, False, False]
+    after = {i: _snapshot_row(disposable_db, i) for i in ids}
+    for i in ids[2:]:
+        assert after[i] == before[i], "the statement must not touch any other row"
+    for i in ids[:2]:
+        assert after[i]["state"] == "failed" and after[i]["claimed_by"] is None
+        assert after[i]["error_message"] == "operator_abandoned_legacy_reply_before_c95_rollout"
+    # replaying it is a no-op (zero rows), and the gate now sees only the unabandoned unresolved rows
+    assert _run_doc_sql(disposable_db, "legacy-abandon-sql:pre-013", ids[0]) == []
+    p = _gate(disposable_db)
+    assert p.returncode == 4 and f"id={ids[2]}" in _out(p) and f"id={ids[3]}" in _out(p)
+    assert f"id={ids[0]}" not in _out(p) and f"id={ids[1]}" not in _out(p) and f"id={ids[5]}" not in _out(p)
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_documented_abandon_statement_after_013_never_touches_a_new_reply(disposable_db):
+    ids = _reply_db(disposable_db, [
+        ("queued", _REPLY_OBJ, False, False),        # legacy, unclaimed             -> abandoned
+        ("queued", _REPLY_OBJ, True, True),          # NEW reply, released (flag set) -> untouched
+    ])
+    new_before = _snapshot_row(disposable_db, ids[1])
+    assert _run_doc_sql(disposable_db, "legacy-abandon-sql:post-013", ids[0])
+    assert _run_doc_sql(disposable_db, "legacy-abandon-sql:post-013", ids[1]) == []
+    assert _snapshot_row(disposable_db, ids[1]) == new_before
+    assert _snapshot_row(disposable_db, ids[0])["state"] == "failed"
+    assert _gate(disposable_db).returncode == 0
+
+
+def _snapshot_row(db, i):
+    with db.engine.connect() as c:
+        r = c.execute(text("SELECT state, claimed_by, error_message, message_id FROM external_dispatches WHERE id=:i"),
+                      {"i": i}).one()
+    return {"state": r[0], "claimed_by": r[1], "error_message": r[2], "message_id": r[3]}

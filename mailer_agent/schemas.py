@@ -344,6 +344,46 @@ class LeadBoostOutreachRequestIn(BaseModel):
     in_reply_to: LeadBoostReplyParentIn | None = None
 
 
+# ---- Managed-reply content approval (draft read / release / cancel) -----------------------------
+# Wire contract for /integrations/leadboost/reply-drafts/*. Deliberately carries NO internal id,
+# dispatch id, RFC header, grounding context, mailbox or raw error text.
+
+ReplyDraftState = Literal[
+    "generating",         # accepted, the draft does not exist yet
+    "awaiting_approval",  # draft persisted and held; subject/body/content_sha256 are present
+    "queued",             # released for sending, not yet claimed by the SMTP worker
+    "sending",
+    "sent",
+    "failed",
+    "unknown",
+    "cancelled",
+]
+
+
+class LeadBoostReplyDraftOut(BaseModel):
+    """subject/body/content_sha256/draft_version are present exactly when a draft exists (state is
+    awaiting_approval or later). ``body`` is the COMPLETE persisted text -- the endpoint refuses
+    (422) rather than ever return a truncated one. ``content_sha256`` is opaque to callers: it is
+    the digest mail/content_digest.py defines, to be echoed back unchanged to release."""
+
+    model_config = _STRICT
+
+    state: ReplyDraftState
+    subject: str | None = None
+    body: str | None = None
+    content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    draft_version: int | None = None
+    updated_at: datetime | None = None
+
+
+class LeadBoostReplyDraftReleaseIn(BaseModel):
+    """The digest the user approved. Anything but exactly 64 lowercase hex characters is a 422."""
+
+    model_config = _STRICT
+
+    content_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
 # ---- Mailboxes (M1) --------------------------------------------------------
 # Strict on every model (extra="forbid"): organization, public_reference and
 # the encrypted columns are never caller-settable. Passwords are SecretStr so

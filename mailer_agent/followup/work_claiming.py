@@ -782,7 +782,9 @@ def _generation_fence(claim: ClaimedDispatch):
     )
 
 
-def complete_generation(db: Session, claim: ClaimedDispatch, message_id: int) -> bool:
+def complete_generation(
+    db: Session, claim: ClaimedDispatch, message_id: int, *, hold_for_approval: bool = False
+) -> bool:
     """
     OWNERSHIP-FENCED GENERATING -> QUEUED: attach the freshly flushed Message
     and clear the claim, only if the row is STILL the one this worker claimed
@@ -790,13 +792,111 @@ def complete_generation(db: Session, claim: ClaimedDispatch, message_id: int) ->
     writes nothing -- the caller must then roll back its Message insert, so a
     worker that lost its lease can never leave a second Message behind.
     Does not commit.
+
+    ``hold_for_approval=True`` (managed replies only) makes the SAME fenced write land in
+    AWAITING_APPROVAL instead of QUEUED and sets content_approval_required, so the finished draft is
+    invisible to the send claim until release_held_dispatch() succeeds. The default is the unchanged
+    ordinary-outreach behaviour.
     """
+    values = {
+        "state": (
+            ExternalDispatchState.AWAITING_APPROVAL.value
+            if hold_for_approval
+            else ExternalDispatchState.QUEUED.value
+        ),
+        "message_id": message_id,
+        "claimed_by": None,
+        "claimed_at": None,
+        "updated_at": _utcnow(),
+    }
+    if hold_for_approval:
+        values["content_approval_required"] = True
     result = db.execute(
         update(ExternalDispatch)
         .where(_generation_fence(claim))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
+def release_held_dispatch(
+    db: Session,
+    *,
+    organization_id: str,
+    dispatch_id: int,
+    message_id: int,
+    content_sha256: str,
+    approved_at: Optional[datetime] = None,
+) -> bool:
+    """
+    AWAITING_APPROVAL -> QUEUED, recording the approved digest, as ONE atomic UPDATE.
+
+    The WHERE clause re-checks everything that makes the release valid at the instant it runs: the
+    tenant, the exact message the caller was shown, the held state, and that approval is required. It
+    is the only code that moves a held row toward SMTP. The caller has ALREADY recomputed the digest
+    from the stored subject/body and compared it with the caller's digest; this statement stores that
+    digest and the approval time together with the state change, so the evidence and the release are
+    one commit. rowcount 0 means somebody else won (cancel, an earlier release) or the row was never
+    releasable; the caller re-reads to classify. Does not commit.
+
+    The send worker re-verifies the digest again just before SMTP, so a Message edited after this
+    point still cannot be transmitted.
+    """
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(
+            ExternalDispatch.id == dispatch_id,
+            ExternalDispatch.organization_id == organization_id,
+            ExternalDispatch.state == ExternalDispatchState.AWAITING_APPROVAL.value,
+            ExternalDispatch.message_id == message_id,
+            ExternalDispatch.content_approval_required.is_(True),
+        )
         .values(
             state=ExternalDispatchState.QUEUED.value,
-            message_id=message_id,
+            approved_content_sha256=content_sha256,
+            approved_at=approved_at or datetime.now(timezone.utc),
+            updated_at=_utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
+def cancel_unreleased_dispatch(db: Session, *, organization_id: str, dispatch_id: int) -> bool:
+    """
+    Revoke a managed reply that has NOT been released: one atomic UPDATE to CANCELLED, valid from
+    exactly the three states in which nothing can yet be sent --
+
+      * QUEUED with message_id NULL   (accepted, generation not started: the generation claim takes
+                                       only 'queued', so it never will)
+      * GENERATING                    (a worker is mid-LLM: its fenced complete_generation requires
+                                       state='generating', so it loses the fence, rolls its Message
+                                       insert back and writes nothing -- no Message is ever created)
+      * AWAITING_APPROVAL             (the draft exists but is held)
+
+    A released row (QUEUED with a message, SENDING, SENT, ...) never matches, so a cancel that loses
+    the race to release changes nothing and the caller reports a conflict. Restricted to rows that
+    require content approval, so this can never cancel ordinary outreach. Does not commit.
+    """
+    unreleased = or_(
+        ExternalDispatch.state == ExternalDispatchState.AWAITING_APPROVAL.value,
+        ExternalDispatch.state == ExternalDispatchState.GENERATING.value,
+        and_(
+            ExternalDispatch.state == ExternalDispatchState.QUEUED.value,
+            ExternalDispatch.message_id.is_(None),
+        ),
+    )
+    result = db.execute(
+        update(ExternalDispatch)
+        .where(
+            ExternalDispatch.id == dispatch_id,
+            ExternalDispatch.organization_id == organization_id,
+            ExternalDispatch.content_approval_required.is_(True),
+            unreleased,
+        )
+        .values(
+            state=ExternalDispatchState.CANCELLED.value,
             claimed_by=None,
             claimed_at=None,
             updated_at=_utcnow(),

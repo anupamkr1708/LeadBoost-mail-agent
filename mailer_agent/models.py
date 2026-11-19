@@ -38,7 +38,7 @@ from sqlalchemy import (
     text,
     UniqueConstraint,
 )
-from sqlalchemy import event, inspect as sa_inspect
+from sqlalchemy import event, false, inspect as sa_inspect
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 from mailer_agent.utils.datetime_utils import utcnow
@@ -431,13 +431,38 @@ class ExternalDispatchState(str, enum.Enum):
       work_claiming.recover_expired_generations). A QUEUED row with
       message_id NULL is "accepted, awaiting generation"; the send claim
       only ever takes QUEUED rows whose message_id is set.
+
+    AWAITING_APPROVAL (managed replies) -- generation finished and the ONE Message exists
+      (message_id set, still a DRAFT), but nobody has approved this exact subject/body yet.
+      Reached only from GENERATING, via the same fenced write as the ordinary
+      GENERATING -> QUEUED. It is deliberately NOT sendable: the send claim takes only
+      state='queued', so a held row is invisible to the SMTP worker. It leaves this state
+      only through an explicit, tenant-authenticated, content-hash-checked release
+      (-> QUEUED, approved_content_sha256 recorded) or a cancel (-> CANCELLED), each a single
+      atomic UPDATE ... WHERE state='awaiting_approval'. No lease, no expiry (see docs).
+    CANCELLED (managed replies) -- the held draft was revoked before release. Terminal; it never
+      sends. Never reachable from QUEUED/SENDING/SENT: once released, cancelling is refused.
     """
     QUEUED = "queued"
     GENERATING = "generating"
+    AWAITING_APPROVAL = "awaiting_approval"
     SENDING = "sending"
     SENT = "sent"
     FAILED = "failed"
     UNKNOWN = "unknown"
+    CANCELLED = "cancelled"
+
+
+# The delivery vocabulary the EXISTING public endpoints (reconciliation GET, conversation view) have
+# always exposed and that LeadBoost validates strictly: queued | sending | sent | failed | unknown.
+# Internal states outside it are mapped, never leaked. A held managed-reply draft has sent nothing
+# (queued); a cancelled one never will (failed). The true state is available only from the dedicated
+# reply-draft endpoint.
+LEGACY_PUBLIC_STATE = {
+    ExternalDispatchState.GENERATING.value: ExternalDispatchState.QUEUED.value,
+    ExternalDispatchState.AWAITING_APPROVAL.value: ExternalDispatchState.QUEUED.value,
+    ExternalDispatchState.CANCELLED.value: ExternalDispatchState.FAILED.value,
+}
 
 
 def resolve_expired_sending_lease() -> "ExternalDispatchState":
@@ -679,6 +704,19 @@ class ExternalDispatch(Base):
     claimed_at = Column(DateTime, nullable=True)
 
     error_message = Column(Text, nullable=True)
+
+    # Managed-reply content approval (migration 013). TRUE means this dispatch's generated
+    # subject/body must be approved, by digest, before it may be sent: the generation worker
+    # holds it in AWAITING_APPROVAL and the send worker refuses it unless
+    # approved_content_sha256 equals the digest of the message it is about to transmit.
+    # Set at acceptance for every request carrying in_reply_to, and set again (never cleared)
+    # when generation completes into the hold, so a reply accepted before the upgrade is held
+    # too. FALSE for every ordinary dispatch: their behaviour is unchanged.
+    content_approval_required = Column(Boolean, nullable=False, default=False, server_default=false())
+    # SHA-256 hex over mail/content_digest.py's canonical serialization of the exact subject and
+    # body that were approved. Written once, by the release UPDATE; never rewritten.
+    approved_content_sha256 = Column(String(64), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
