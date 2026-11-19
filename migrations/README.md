@@ -182,6 +182,20 @@ work-queue indexes.
     column and every token (references LeadBoost already stored then 404). Rolling the *code* back does not
     require the downgrade.
 
+15. `013_external_dispatch_content_approval.py` -- managed-reply exact-content approval. Adds to
+    `external_dispatches`: `content_approval_required BOOLEAN NOT NULL DEFAULT FALSE`,
+    `approved_content_sha256 VARCHAR(64) NULL`, `approved_at TIMESTAMPTZ NULL`. Additive; every existing row gets
+    `FALSE`, so ordinary and already-finished dispatches behave exactly as before. No table, no index, no backfill.
+    The new internal states (`awaiting_approval`, `cancelled`) need no DDL: `state` is a plain string column with no
+    CHECK constraint. **Apply before deploying the code**: the ORM selects these columns on every dispatch query.
+    **Gated** (see "Legacy managed replies" below and `docs/API_AND_INTEGRATION.md` §5A "Rollout"):
+    `scripts/migrate_preflight.py gate`, which the release wrapper runs before any migration, **refuses (exit 4)**
+    while ANY unresolved legacy managed-reply dispatch exists -- queued (with or without a generated message),
+    generating, or sending. Stop/drain all pre-approval workers and pause LeadBoost reply traffic first. --downgrade` DROPS the columns and the
+    approval evidence, and **refuses to run** while any managed-reply dispatch still depends on them
+    (`queued`, `generating`, `awaiting_approval` or `sending` with the flag set), because dropping the flag would turn a held or approved
+    draft into an ordinary sendable row. Rolling the *code* back does not require the downgrade.
+
 **Wrapper evidence.** The guarded wrapper `scripts/migrate_release.sh` (with `--status` and `--check-only`) is covered in CI against a disposable PostgreSQL by `tests/test_migrate_release.py`. At the time of that observation the canonical sequence had 11 steps; it has also been run against the dedicated Supabase database: all 11 steps completed and the final `--status` reported the expected markers present (operator-reported). Migration 010 (PR4) has NOT been run against that database -- applying it is an operator-controlled release step. A code deployment and a migration are separate release actions: the wrapper is never run by startup or by every deploy.
 
 **Startup race (fixed in code).** `init_db()` (create-missing-tables) runs at API and worker start in the default `SCHEMA_INIT_MODE=create`. Two processes starting together against an empty database produced a duplicate-sequence error once on hosted infrastructure. `init_db()` now takes a transaction-scoped PostgreSQL advisory lock, so concurrent callers queue and later ones find the tables already present; this was reproduced and fixed on disposable PostgreSQL (`tests/test_schema_init.py`), not re-observed on hosted infrastructure. Still run the wrapper before the first start of a new database: it remains the source of truth, because `init_db()` creates tables only and applies none of the canonical constraints/indexes. A deployed service can set `SCHEMA_INIT_MODE=verify` so it runs no DDL at all; `python scripts/migrate_preflight.py verify` is the read-only dry run of that check.
@@ -196,6 +210,87 @@ separately), apply new migrations manually, in the order above, before
 deploying application code that depends on them -- in particular, deploying
 the Phase C integration endpoint without first running `004_...py` (or the
 C9.2 code without `005_...py`) against that environment will 500 on first use.
+
+## Legacy managed replies (operator procedure for the migration-013 gate)
+
+A *legacy* managed reply was accepted before approval-by-digest existed (migration 013 gives it
+`content_approval_required = false`; its `grounding_context` JSON still holds a `reply_parent` object). Its LeadBoost
+action is a pre-approval (C9.4) one, which the new LeadBoost UI treats as legacy: it can be neither reviewed nor
+released. The new Mailer worker would generate a still-queued one into `AWAITING_APPROVAL`, **stranding** the draft, and a
+queued-with-message one would be sent unreviewed. So the first release does **not** migrate old approvals into new
+content approvals: it requires that no such row is unresolved, and it never edits a row into the approval states.
+
+**Order matters; do not skip steps.** (Mailer first, then LeadBoost, as always.)
+
+1. **Pause LeadBoost reply traffic.** At the edge (reverse proxy / load balancer) reject every state-changing request to
+   `POST /api/v2/outreach-actions` and `POST /api/v2/outreach-actions/{id}/(approve|dispatch|cancel|reply-draft)` with
+   `503` + `Retry-After`. Reply and ordinary actions share these paths, so ordinary outreach writes pause too; reads stay
+   up. Also stop any LeadBoost process that can call the Mailer's `POST /integrations/leadboost/outreach-requests`.
+2. **Drain old API requests.** Take the old LeadBoost API and the old Mailer API out of rotation for those routes and wait
+   until their in-flight request count is zero (server/proxy logs). After this, nothing can create a new legacy reply.
+3. **Keep the OLD Mailer workers running (generation and SMTP) and let them drain.** They finish the legacy rows exactly as
+   C9.4 always did (generate, then send): that is what "drain" means here. Do **not** start any new-code worker yet.
+4. **Run the gate until it passes** (read-only; repeat while draining):
+
+   ```bash
+   DATABASE_URL=... python scripts/migrate_preflight.py gate        # exit 0 = nothing unresolved
+   ```
+
+   A refusal lists each blocking row (`id`, `org`, `key`, `state`, `updated_at` -- never content or addresses). With traffic
+   paused the count can only fall.
+5. **Resolve what does not drain.** For each remaining blocking row, decide deliberately:
+
+   | Row | Why it is stuck | Decision |
+   |---|---|---|
+   | `queued`, no message | Old generation worker not running, or the LLM provider is failing. | Fix the cause and let it drain, **or** abandon it (below). |
+   | `queued`, with message | Old SMTP worker not running, mailbox inactive, or sending disabled. | Fix the cause and let it send under the old C9.4 contract, **or** abandon it (below). |
+   | `generating` | A worker holds (or lost) the lease. | Wait: the old generation worker's lease sweep returns it to `queued`. Then as above. |
+   | `sending` | In flight, or its worker died mid-send. | Wait: the old SMTP worker's lease sweep resolves an expired `sending` to `unknown` (never re-queued, never re-sent). **Do not abandon a `sending` row.** |
+
+   *Abandoning* a row that has **not been claimed** marks it `failed` ("definitely not sent") in the Mailer; the LeadBoost
+   action is left exactly as it is, and its next reconciliation shows the Mailer's `failed`. It is a business decision: that
+   reply will never be sent. Use the statement for the schema you are on. It is a single atomic `UPDATE` guarded on
+   `state = 'queued'` and `claimed_by IS NULL`, so it cannot race a worker that claims the row (one of them wins), and it
+   does nothing to a row in any other state or to any non-reply dispatch. Set `:dispatch_id` to the id the gate printed.
+
+   <!-- legacy-abandon-sql:pre-013 -->
+   ```sql
+   -- Before migration 013 has run (no content_approval_required column yet). Use jsonb_typeof if the column is jsonb.
+   UPDATE external_dispatches
+      SET state = 'failed', error_message = 'operator_abandoned_legacy_reply_before_c95_rollout',
+          claimed_by = NULL, claimed_at = NULL, updated_at = now()
+    WHERE id = :dispatch_id
+      AND state = 'queued' AND claimed_by IS NULL
+      AND json_typeof(grounding_context -> 'reply_parent') = 'object'
+   RETURNING id, state;
+   ```
+
+   <!-- legacy-abandon-sql:post-013 -->
+   ```sql
+   -- After migration 013 (adds the legacy predicate: a NEW reply has the flag set and is never touched).
+   UPDATE external_dispatches
+      SET state = 'failed', error_message = 'operator_abandoned_legacy_reply_before_c95_rollout',
+          claimed_by = NULL, claimed_at = NULL, updated_at = now()
+    WHERE id = :dispatch_id
+      AND state = 'queued' AND claimed_by IS NULL
+      AND content_approval_required = false
+      AND json_typeof(grounding_context -> 'reply_parent') = 'object'
+   RETURNING id, state;
+   ```
+
+   One row returned = abandoned; zero rows = it moved or was never eligible: re-run the gate and look again.
+6. **Stop the old workers** (SIGTERM, wait for exit, confirm no old process remains) and **re-run the gate once more**. It must
+   exit 0. If a `sending` row appears because a worker died mid-send, start one OLD SMTP worker only until its lease
+   sweep has resolved it to `unknown`, stop it, and re-run.
+7. Run the release wrapper (it runs the gate again before migrating), then deploy and start the NEW Mailer workers, then
+   deploy LeadBoost, then lift the traffic pause. A caller that predates the draft endpoints (an older LeadBoost) gets a held
+   draft that never sends: that fails closed.
+
+**Left behind on purpose.** Legacy replies that finished (`sent`, `failed`, `cancelled`) need nothing. Legacy `unknown`
+replies do not block the gate (nothing re-sends them), but the Mailer answers `409 legacy_reply_requires_reconciliation`
+to a cancel of one and LeadBoost refuses to mark its action cancelled: reconcile each against the sender's Sent folder.
+Nothing in this procedure creates an `AWAITING_APPROVAL` draft for an old action, converts an old approval, or deletes or
+resets LeadBoost action history.
 
 ## Known duplicate
 
@@ -271,6 +366,7 @@ python migrations/009_messages_mailbox_scoped_dedupe.py
 python migrations/010_worker_runtime_status.py
 python migrations/011_unmatched_inbound_messages.py
 python migrations/012_message_reply_reference.py
+python migrations/013_external_dispatch_content_approval.py
 ```
 
 To revert 005 only: `python migrations/005_external_dispatch_grounding_context.py --downgrade`.
@@ -279,6 +375,7 @@ To revert 007 / 008 / 009: `--downgrade` on each (008 refuses while any dispatch
 To revert 010 (drops operator telemetry only -- two status tables and one index; no business data): `python migrations/010_worker_runtime_status.py --downgrade`.
 To revert 011 (DESTROYS every retained unmatched/ambiguous message -- export unresolved rows first): `python migrations/011_unmatched_inbound_messages.py --downgrade`.
 To revert 012 (drops the column and every opaque reply reference; references LeadBoost already stored stop resolving and a re-run mints different ones): `python migrations/012_message_reply_reference.py --downgrade`.
+To revert 013 (drops the content-approval columns and the recorded approvals; refuses while a managed reply is held or released-and-unfinished): `python migrations/013_external_dispatch_content_approval.py --downgrade`.
 
 Safe to re-run the whole sequence any time; every step no-ops on columns/
 indexes/constraints that already exist.

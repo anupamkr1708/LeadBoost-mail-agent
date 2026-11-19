@@ -151,6 +151,9 @@ def approve_and_send_draft(
     # authorization route -- including for a Message whose dispatch already
     # failed, ended UNKNOWN or completed (the active-dispatch guard below only
     # covers queued/sending). Checked first so every state gets the same answer.
+    # Managed replies (held in AWAITING_APPROVAL) are released only by the integration-key endpoint
+    # POST /integrations/leadboost/reply-drafts/{key}/release, which verifies the exact content digest;
+    # this guard deliberately stays in force for them (docs/API_AND_INTEGRATION.md section 5A).
     if contact_is_integration_managed(msg.contact):
         raise HTTPException(
             status_code=409,
