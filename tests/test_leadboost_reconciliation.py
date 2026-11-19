@@ -27,7 +27,13 @@ from mailer_agent.api.deps import get_current_org_id, require_api_key
 from mailer_agent.api.main import app
 from mailer_agent.config import get_settings
 from mailer_agent.db import get_db
-from mailer_agent.models import Base, ExternalDispatch, ExternalDispatchState, Message
+from mailer_agent.models import (
+    Base,
+    ExternalDispatch,
+    ExternalDispatchState,
+    LEGACY_PUBLIC_STATE,
+    Message,
+)
 from tests.dispatch_support import seed_dispatch, seed_org_mailboxes
 
 ORG_A = "org-a"
@@ -35,7 +41,10 @@ ORG_B = "org-b"
 BASE = "/integrations/leadboost/outreach-actions"
 # The public vocabulary. GENERATING (M2-B) is internal and reads as "queued"
 # (see test_generating_is_reported_as_queued_and_get_mutates_nothing).
-ALL_STATES = [s.value for s in ExternalDispatchState if s is not ExternalDispatchState.GENERATING]
+# The public delivery states, each reported unchanged. GENERATING and the managed-reply AWAITING_APPROVAL /
+# CANCELLED are internal-only and are mapped (LEGACY_PUBLIC_STATE) -- see the mapping test below.
+# Same five values this list always held.
+ALL_STATES = [s.value for s in ExternalDispatchState if s.value not in LEGACY_PUBLIC_STATE]
 EXPECTED_KEYS = {"accepted", "state", "mailing_agent_reference", "updated_at"}
 
 
@@ -151,6 +160,17 @@ def test_get_returns_200_with_exact_durable_state(client, db, state):
     assert body["accepted"] is True
     assert body["state"] == state
     assert body["mailing_agent_reference"] == d.public_reference
+
+
+@pytest.mark.parametrize("internal, public", [("awaiting_approval", "queued"), ("cancelled", "failed")])
+def test_managed_reply_states_are_mapped_to_the_public_vocabulary_and_get_mutates_nothing(
+    client, db, internal, public
+):
+    d = seed_dispatch(db, org=ORG_A, idem="k1", state=internal, content_approval_required=True)
+    before = _snapshot(db, ExternalDispatch, d.id)
+    body = client.get(f"{BASE}/k1").json()
+    assert set(body) == EXPECTED_KEYS and body["state"] == public
+    assert _snapshot(db, ExternalDispatch, d.id) == before
 
 
 def test_generating_is_reported_as_queued_and_get_mutates_nothing(client, db):

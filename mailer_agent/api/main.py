@@ -11,6 +11,7 @@ from mailer_agent.api import (
     integrations,
     integrations_conversation,
     integrations_generated,
+    integrations_reply_drafts,
     mailboxes,
     messages,
     system,
@@ -133,6 +134,7 @@ app.include_router(system.router)
 app.include_router(integrations.router)
 app.include_router(integrations_generated.router)
 app.include_router(integrations_conversation.router)
+app.include_router(integrations_reply_drafts.router)
 app.include_router(mailboxes.router)
 
 

@@ -15,6 +15,7 @@ api.deps._KEY_MAP and use the REAL dependencies.
 
 from __future__ import annotations
 
+import copy
 import json
 import ast
 import os
@@ -40,7 +41,9 @@ from mailer_agent.models import (
     Base,
     Campaign,
     ExternalDispatch,
+    LEGACY_PUBLIC_STATE,
     ExternalDispatchState,
+    Mailbox,
     Message,
 )
 from mailer_agent.schemas import (
@@ -55,7 +58,10 @@ ORG_A = "org-a"
 ORG_B = "org-b"
 BASE = "/integrations/leadboost/outreach-actions"
 C91 = BASE  # the frozen reconciliation GET lives at BASE/{key}
-ALL_STATES = [s.value for s in ExternalDispatchState if s is not ExternalDispatchState.GENERATING]
+# The five PUBLIC delivery states, each of which must pass through unchanged. GENERATING and the managed-reply
+# AWAITING_APPROVAL / CANCELLED are internal-only: they are mapped (LEGACY_PUBLIC_STATE), never emitted -- see
+# test_internal_states_are_mapped_not_leaked below. This list is the same five values it always was.
+ALL_STATES = [s.value for s in ExternalDispatchState if s.value not in LEGACY_PUBLIC_STATE]
 
 TOP_KEYS = {"action", "messages", "has_more"}
 ACTION_KEYS = {"accepted", "state", "mailing_agent_reference", "created_at", "updated_at", "mailbox_reference"}
@@ -254,6 +260,23 @@ def test_unknown_is_never_translated(client, db):
     body = client.get(url("k1")).json()
     assert body["action"]["state"] == "unknown"
     assert body["messages"][0]["delivery_state"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "internal, public",
+    [("awaiting_approval", "queued"), ("cancelled", "failed"), ("generating", "queued")],
+)
+def test_internal_states_are_mapped_not_leaked(client, db, internal, public):
+    """A held managed-reply draft has sent nothing (queued); a cancelled one never will (failed).
+    LeadBoost validates this vocabulary strictly, so an internal value must never be emitted."""
+    seed_dispatch(db, org=ORG_A, idem="k1", state=internal)
+    body = client.get(url("k1")).json()
+    assert body["action"]["state"] == public
+    assert body["messages"][0]["delivery_state"] == public
+
+
+def test_public_vocabulary_is_exactly_the_five_c91_states():
+    assert sorted(ALL_STATES) == ["failed", "queued", "sending", "sent", "unknown"]
 
 
 def test_generating_reads_as_queued_like_c91(client, db):
@@ -578,6 +601,99 @@ def test_no_state_is_advanced_by_reading(client, db, state):
 # Information exposure
 # ---------------------------------------------------------------------------
 
+# The forbidden-fragment list below is UNCHANGED from the original test; it only moved to module level so that the
+# regression tests can prove, on synthetic payloads, what the scan accepts and rejects.
+#
+# What changed is WHAT it is run over. A conversation response also carries values that are random or wall-clock
+# BY CONSTRUCTION and are legitimately public: the opaque uuid4-hex references and the ISO timestamps. A short
+# fragment occurs in those by chance -- "535" inside a 32-hex reference or inside the microseconds of
+# "2026-11-17T10:27:03.535862", "0.93" inside "...:40.930881" -- which made this test fail roughly 1 run in 50.
+# Those leaves are now (1) required to have exactly the shape they may have, (2) compared by the test with the
+# exact value in the database, and (3) blanked before the scan. EVERY other value -- all free text (subject, body)
+# and every state -- is scanned with the full, unchanged list.
+FORBIDDEN_FRAGMENTS = (
+    "hunter2", "Traceback", "AUTH PLAIN", "SMTPAuthenticationError", "535", "worker-host-42", ORG_A,
+    "corr-LEAK", "481-LEAK", "GROUNDING-SENTINEL", "SEMANTIC-SENTINEL", "CLASSIFIER-REASON-SENTINEL",
+    "outbound-abc123", "IN-REPLY-TO", "REFS-ONE", "SYNTHETIC-ID", "interested", "0.93",
+    "lead@example.com", "outreach@sender.example.org", "smtp.mailbox.example",
+    MAILBOX_SMTP_PASSWORD, "password", "ciphertext", "gAAAA",          # Fernet ciphertexts start with gAAAA
+    "campaign_id", "contact_id", "message_id", "organization_id", "claimed_by", "claimed_at",
+    "error", "request_fingerprint", "external_action_id", "correlation_id", "detected_intent",
+    "semantic_analysis", "in_reply_to", "references", "idempotency",
+)
+
+_HEX32 = re.compile(r"[0-9a-f]{32}")
+_ISO_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?")
+ACTION_REFERENCE_FIELDS = ("mailing_agent_reference", "mailbox_reference")
+ACTION_TIMESTAMP_FIELDS = ("created_at", "updated_at")
+MESSAGE_REFERENCE_FIELDS = ("mailing_agent_reference", "mailbox_reference", "message_reference")
+MESSAGE_TIMESTAMP_FIELDS = ("created_at",)
+
+
+def _blank_reference(owner: dict, field: str, where: str):
+    """Assert an opaque-reference leaf is None or exactly 32 lowercase hex, blank it, return what it was."""
+    value = owner[field]
+    if value is not None:
+        assert isinstance(value, str) and _HEX32.fullmatch(value), f"{where}.{field} is not an opaque 32-hex reference"
+    owner[field] = None
+    return value
+
+
+def _blank_timestamp(owner: dict, field: str, where: str):
+    """Assert a timestamp leaf is None or a bare ISO-8601 datetime that parses, blank it, return what it was."""
+    value = owner[field]
+    if value is not None:
+        assert isinstance(value, str) and _ISO_DATETIME.fullmatch(value), f"{where}.{field} is not an ISO-8601 datetime"
+        try:
+            datetime.fromisoformat(value)
+        except ValueError as exc:                      # right shape, not a real datetime (month 13, hour 99, ...)
+            raise AssertionError(f"{where}.{field} is not a valid datetime: {exc}") from exc
+    owner[field] = None
+    return value
+
+
+def scrub_random_leaves(body: dict) -> tuple[dict, dict]:
+    """Assert the exact key sets, then validate and blank every random-valued leaf.
+
+    Returns (scrubbed deep copy, the leaf values that were blanked) so the caller can compare the leaves with
+    the database. Keys stay in the copy (value None), so key NAMES are still scanned; only the values go."""
+    scrubbed = copy.deepcopy(body)
+    assert isinstance(scrubbed, dict) and set(scrubbed) == TOP_KEYS, f"top-level keys: {sorted(scrubbed)}"
+    action = scrubbed["action"]
+    assert isinstance(action, dict) and set(action) == ACTION_KEYS, f"action keys: {sorted(action)}"
+    messages = scrubbed["messages"]
+    assert isinstance(messages, list)
+    leaves: dict = {"action": {}, "messages": []}
+    for field in ACTION_REFERENCE_FIELDS:
+        leaves["action"][field] = _blank_reference(action, field, "action")
+    for field in ACTION_TIMESTAMP_FIELDS:
+        leaves["action"][field] = _blank_timestamp(action, field, "action")
+    for i, message in enumerate(messages):
+        assert isinstance(message, dict) and set(message) == MESSAGE_KEYS, f"messages[{i}] keys: {sorted(message)}"
+        row = {}
+        for field in MESSAGE_REFERENCE_FIELDS:
+            row[field] = _blank_reference(message, field, f"messages[{i}]")
+        for field in MESSAGE_TIMESTAMP_FIELDS:
+            row[field] = _blank_timestamp(message, field, f"messages[{i}]")
+        leaves["messages"].append(row)
+    return scrubbed, leaves
+
+
+def assert_response_is_private(body: dict, forbidden=FORBIDDEN_FRAGMENTS) -> dict:
+    """Key sets + leaf shapes, then the forbidden-fragment scan over everything that is not a random leaf."""
+    scrubbed, leaves = scrub_random_leaves(body)
+    text = json.dumps(scrubbed)
+    for fragment in forbidden:
+        assert fragment not in text, fragment
+    return leaves
+
+
+def _utc_naive(value) -> datetime:
+    """A datetime (or ISO string) as naive UTC, so SQLite (naive) and PostgreSQL (aware) rows compare alike."""
+    dt = datetime.fromisoformat(value) if isinstance(value, str) else value
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
 def test_response_exposes_no_ids_headers_diagnostics_intent_or_secrets(client, db):
     d = seed_dispatch(db, org=ORG_A, idem="k1", state="unknown")
     secret = "Traceback (most recent call last): smtp password=hunter2 AUTH PLAIN c2VjcmV0"
@@ -603,32 +719,195 @@ def test_response_exposes_no_ids_headers_diagnostics_intent_or_secrets(client, d
     r = client.get(url("k1"))
     assert r.status_code == 200
     body = r.json()
-    # C9.4: the ONE intentional reference on an inbound message -- exposed so LeadBoost can
-    # answer it. It is the persisted OPAQUE token (32 lowercase hex), never the row id. Asserted
-    # explicitly, then removed from the scan: a random hex string may by chance contain a short
-    # forbidden fragment below (e.g. "535"), and this one public token is allowed anyway. Every
-    # other leak assertion is unchanged.
-    inbound_refs = [m.get("message_reference") for m in body["messages"] if m["direction"] == "inbound"]
-    assert inbound_refs == [inbound.reply_reference]
-    assert re.fullmatch(r"[0-9a-f]{32}", inbound_refs[0])
-    assert inbound_refs[0] != str(inbound.id)
-    assert all(m.get("message_reference") is None for m in body["messages"] if m["direction"] == "outbound")
-    for m in body["messages"]:
-        m.pop("message_reference", None)
-    text = json.dumps(body)
-    for forbidden in (
-        "hunter2", "Traceback", "AUTH PLAIN", "SMTPAuthenticationError", "535", "worker-host-42", ORG_A,
-        "corr-LEAK", "481-LEAK", "GROUNDING-SENTINEL", "SEMANTIC-SENTINEL", "CLASSIFIER-REASON-SENTINEL",
-        "outbound-abc123", "IN-REPLY-TO", "REFS-ONE", "SYNTHETIC-ID", "interested", "0.93",
-        "lead@example.com", "outreach@sender.example.org", "smtp.mailbox.example",
-        MAILBOX_SMTP_PASSWORD, "password", "ciphertext", "gAAAA",          # Fernet ciphertexts start with gAAAA
-        "campaign_id", "contact_id", "message_id", "organization_id", "claimed_by", "claimed_at",
-        "error", "request_fingerprint", "external_action_id", "correlation_id", "detected_intent",
-        "semantic_analysis", "in_reply_to", "references", "idempotency",
-    ):
-        assert forbidden not in text, forbidden
+    # Exact key sets, leaf shapes, and the unchanged forbidden-fragment scan over everything but the random leaves.
+    leaves = assert_response_is_private(body)
+
+    # The random / wall-clock leaves are not scanned, so each is pinned to the exact value in the database instead.
+    db.expire_all()
+    action_row = db.get(ExternalDispatch, d.id)
+    box = db.get(Mailbox, d.mailbox_id)
+    outbound_row = db.get(Message, d.message_id)
+    assert [m["direction"] for m in body["messages"]] == ["outbound", "inbound"]
+    assert {k: v for k, v in leaves["action"].items() if k in ACTION_REFERENCE_FIELDS} == {
+        "mailing_agent_reference": action_row.public_reference,
+        "mailbox_reference": box.public_reference,
+    }
+    assert _utc_naive(leaves["action"]["created_at"]) == _utc_naive(action_row.created_at)
+    assert _utc_naive(leaves["action"]["updated_at"]) == _utc_naive(action_row.updated_at)
+    out_leaves, in_leaves = leaves["messages"]
+    assert {k: v for k, v in out_leaves.items() if k in MESSAGE_REFERENCE_FIELDS} == {
+        "mailing_agent_reference": action_row.public_reference,
+        "mailbox_reference": box.public_reference,
+        "message_reference": None,                      # outbound messages carry no reply-parent reference
+    }
+    assert _utc_naive(out_leaves["created_at"]) == _utc_naive(outbound_row.created_at) == _utc_naive(T0)
+    # C9.4: the ONE intentional reference on an inbound message -- exposed so LeadBoost can answer it. It is the
+    # persisted OPAQUE token (32 lowercase hex), never the row id.
+    assert {k: v for k, v in in_leaves.items() if k in MESSAGE_REFERENCE_FIELDS} == {
+        "mailing_agent_reference": None,                # only outbound messages name their dispatch
+        "mailbox_reference": box.public_reference,
+        "message_reference": inbound.reply_reference,
+    }
+    assert re.fullmatch(r"[0-9a-f]{32}", in_leaves["message_reference"])
+    assert in_leaves["message_reference"] != str(inbound.id)
+    assert _utc_naive(in_leaves["created_at"]) == _utc_naive(inbound.created_at) == _utc_naive(T0 + timedelta(hours=1))
+
     assert "id" not in body and all("id" not in m for m in body["messages"])
     assert inbound.id not in {v for m in body["messages"] for v in m.values() if isinstance(v, int)}
+
+
+# ---------------------------------------------------------------------------
+# The scan itself, proven deterministically on synthetic payloads (no database, no clock, no seed)
+# ---------------------------------------------------------------------------
+
+# Exactly the two chance matches that made the original test flaky:
+REF_WITH_535_PREFIX = "61a34535c31d" + "0" * 20            # 32 hex; a real "mailing_agent_reference" looked like this
+REF_WITH_535_SUFFIX = "0" * 25 + "c88535b"                  # 32 hex; ends "...c88535b" like a real "mailbox_reference"
+REF_PLAIN = "a" * 32
+STAMP_WITH_093 = "2026-11-15T05:23:40.930881"                # a real wall-clock "updated_at"; contains "0.93"
+STAMP_WITH_535 = "2026-11-17T10:27:03.535862"                # a real wall-clock "created_at"; contains "535"
+
+
+def _synthetic_response() -> dict:
+    return {
+        "action": {
+            "accepted": True, "state": "unknown", "mailing_agent_reference": REF_WITH_535_PREFIX,
+            "created_at": STAMP_WITH_535, "updated_at": STAMP_WITH_093, "mailbox_reference": REF_WITH_535_SUFFIX,
+        },
+        "messages": [
+            {
+                "direction": "outbound", "message_type": "initial_outreach", "subject": "Quick question",
+                "body": "Hello there,\n\nWould a call next week suit you?\n", "body_truncated": False,
+                "created_at": STAMP_WITH_093, "delivery_state": "unknown",
+                "mailing_agent_reference": REF_WITH_535_PREFIX, "mailbox_reference": REF_WITH_535_SUFFIX,
+                "message_reference": None,
+            },
+            {
+                "direction": "inbound", "message_type": None, "subject": "Re: Quick question",
+                "body": "Please call me.", "body_truncated": False, "created_at": STAMP_WITH_535,
+                "delivery_state": None, "mailing_agent_reference": None, "mailbox_reference": REF_WITH_535_SUFFIX,
+                "message_reference": REF_PLAIN,
+            },
+        ],
+        "has_more": False,
+    }
+
+
+def test_scan_accepts_random_references_and_wall_clock_timestamps_that_contain_forbidden_fragments():
+    payload = _synthetic_response()
+    text = json.dumps(payload)
+    # Guard: this payload really contains the fragments that broke the old whole-response substring scan...
+    assert "535" in text and "0.93" in text
+    assert [f for f in FORBIDDEN_FRAGMENTS if f in text] == ["535", "0.93"]
+    # ...and the scan accepts it, because they sit only in leaves that are shape-checked and blanked.
+    leaves = assert_response_is_private(payload)
+    assert leaves["action"]["mailing_agent_reference"] == REF_WITH_535_PREFIX
+    assert leaves["action"]["updated_at"] == STAMP_WITH_093
+    assert payload == _synthetic_response()          # the caller's payload is not mutated
+
+
+def test_scan_blanks_leaves_in_a_copy_and_keeps_the_key_names_in_scope():
+    scrubbed, _ = scrub_random_leaves(_synthetic_response())
+    assert scrubbed["action"]["mailbox_reference"] is None and scrubbed["messages"][1]["message_reference"] is None
+    assert set(scrubbed["action"]) == ACTION_KEYS and set(scrubbed["messages"][1]) == MESSAGE_KEYS
+    assert "535" not in json.dumps(scrubbed) and "0.93" not in json.dumps(scrubbed)
+
+
+def _mutate(path: tuple, value) -> dict:
+    payload = _synthetic_response()
+    node = payload
+    for step in path[:-1]:
+        node = node[step]
+    node[path[-1]] = value
+    return payload
+
+
+def _rejected(payload: dict) -> bool:
+    try:
+        assert_response_is_private(payload)
+    except AssertionError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize("where", [
+    ("messages", 0, "body"), ("messages", 0, "subject"), ("messages", 1, "body"),
+    ("messages", 0, "message_type"), ("messages", 0, "delivery_state"), ("action", "state"),
+])
+def test_scan_rejects_every_forbidden_fragment_in_any_free_text_or_state_field(where):
+    assert not _rejected(_mutate(where, "an ordinary value"))                       # control: only the fragment can cause a rejection
+    accepted = [f for f in FORBIDDEN_FRAGMENTS if not _rejected(_mutate(where, f"before {f} after"))]
+    assert accepted == [], f"fragments the scan failed to catch in {where}: {accepted}"
+
+
+@pytest.mark.parametrize("path, value", [
+    (("messages", 0, "body"), REF_WITH_535_PREFIX),          # a random-looking hex string is exempt ONLY as a reference leaf...
+    (("messages", 0, "subject"), REF_WITH_535_SUFFIX),       # ...never in free text
+    (("messages", 1, "body"), STAMP_WITH_093),               # and a timestamp is exempt only as a timestamp leaf
+    (("messages", 1, "subject"), STAMP_WITH_535),
+])
+def test_scan_exempts_by_field_not_by_value(path, value):
+    assert _rejected(_mutate(path, value))
+
+
+BAD_REFERENCES = [
+    "lead@example.com", "worker-host-42", "<outbound-abc123@mailer.example.com>", "hunter2", "",
+    "A" * 32,                      # upper-case hex is not the format
+    "a" * 31, "a" * 33, "a" * 31 + "g",
+    "a" * 32 + "\n",
+    12345, 535, {"x": "hunter2"}, ["a" * 32],
+]
+BAD_TIMESTAMPS = [
+    "yesterday", "2026-11-15 05:23:40", "20261115", "2026-11-15",
+    "2026-11-15T05:23:40.930881 password=hunter2", "Traceback 2026-11-15T05:23:40",
+    "2026-13-45T99:99:99",         # right shape, not a real datetime
+    1763184220, {"x": "hunter2"},
+]
+
+
+@pytest.mark.parametrize("path", [
+    ("action", "mailing_agent_reference"), ("action", "mailbox_reference"),
+    ("messages", 0, "mailing_agent_reference"), ("messages", 0, "mailbox_reference"),
+    ("messages", 1, "mailbox_reference"), ("messages", 1, "message_reference"),
+])
+def test_scan_rejects_a_reference_that_is_not_an_opaque_32_hex_token(path):
+    assert not _rejected(_mutate(path, REF_PLAIN))                                  # control: a well-formed token is fine here
+    accepted = [bad for bad in BAD_REFERENCES if not _rejected(_mutate(path, bad))]
+    assert accepted == [], f"values the scan failed to reject at {path}: {accepted}"
+
+
+@pytest.mark.parametrize("path", [("action", "created_at"), ("action", "updated_at"), ("messages", 0, "created_at"), ("messages", 1, "created_at")])
+def test_scan_rejects_a_timestamp_that_is_not_a_bare_iso_datetime(path):
+    assert not _rejected(_mutate(path, STAMP_WITH_093))                             # control: a real timestamp is fine here
+    accepted = [bad for bad in BAD_TIMESTAMPS if not _rejected(_mutate(path, bad))]
+    assert accepted == [], f"values the scan failed to reject at {path}: {accepted}"
+
+
+def test_scan_accepts_missing_references_and_timezone_suffixed_timestamps():
+    payload = _synthetic_response()
+    payload["action"]["mailbox_reference"] = None
+    payload["action"]["created_at"] = "2026-11-15T05:23:40Z"
+    payload["action"]["updated_at"] = "2026-11-15T05:23:40.5+05:30"
+    leaves = assert_response_is_private(payload)
+    assert leaves["action"]["mailbox_reference"] is None
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda p: p.update(id=1),                                              # a top-level id
+    lambda p: p.update(organization_id="org-a"),
+    lambda p: p.pop("has_more"),
+    lambda p: p["action"].update(organization_id="org-a"),
+    lambda p: p["action"].update(error_message="x"),
+    lambda p: p["action"].pop("mailbox_reference"),
+    lambda p: p["messages"][0].update(id=7),                               # a row id on a message
+    lambda p: p["messages"][0].update(message_id_header="<x@y>"),
+    lambda p: p["messages"][1].update(detected_intent="interested"),
+    lambda p: p["messages"][1].pop("message_reference"),
+])
+def test_scan_rejects_any_key_outside_or_missing_from_the_exact_key_sets(mutation):
+    payload = _synthetic_response()
+    mutation(payload)
+    assert _rejected(payload)
 
 
 def test_mailbox_reference_is_opaque_never_an_address(client, db):

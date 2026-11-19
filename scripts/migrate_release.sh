@@ -72,6 +72,7 @@ STEPS=(
   "migrations/010_worker_runtime_status.py"
   "migrations/011_unmatched_inbound_messages.py"
   "migrations/012_message_reply_reference.py"
+  "migrations/013_external_dispatch_content_approval.py"
 )
 
 if [ "$MODE" = status ]; then

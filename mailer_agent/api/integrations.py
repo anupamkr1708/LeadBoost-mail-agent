@@ -68,6 +68,7 @@ from mailer_agent.models import (
     ContactStatus,
     ExternalDispatch,
     ExternalDispatchState,
+    LEGACY_PUBLIC_STATE,
     Mailbox,
     MailboxStatus,
 )
@@ -606,11 +607,10 @@ def get_leadboost_outreach_action(
 
     # GENERATING (M2-B) is an internal step of "accepted, not yet completed by
     # a worker": the public vocabulary is unchanged, so it reads as queued.
-    state = (
-        ExternalDispatchState.QUEUED.value
-        if row.state == ExternalDispatchState.GENERATING.value
-        else row.state
-    )
+    # Managed-reply hold/cancel states are new internal values this endpoint's callers do not know:
+    # a held draft has sent nothing (queued), a cancelled one never will (failed). The real state
+    # is available only from the dedicated reply-draft endpoint.
+    state = LEGACY_PUBLIC_STATE.get(row.state, row.state)
     return LeadBoostOutreachActionStatus(
         accepted=True,
         state=state,
