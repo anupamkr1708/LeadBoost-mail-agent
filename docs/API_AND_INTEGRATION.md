@@ -129,6 +129,12 @@ moves a held row toward SMTP except the release below. Generation of **ordinary*
 | `POST /integrations/leadboost/reply-drafts/{idempotency_key}/release` | Body `{"content_sha256": "<64 lowercase hex>"}`. Authorizes the exact held draft for sending. Does **not** send. |
 | `POST /integrations/leadboost/reply-drafts/{idempotency_key}/cancel` | Revokes an unreleased draft. Idempotent. |
 
+`idempotency_key` may contain `/` (a direct API caller chooses it): send it percent-encoded (`%2F`), as LeadBoost does.
+The Mailer reads everything after `reply-drafts/` and before an optional final `/release` or `/cancel` as the key, so
+`GET .../reply-drafts/a%2Fb` reads the draft whose key is `a/b`. The last segment alone picks the operation: a `POST`
+always needs its own `/release` or `/cancel` suffix, and a `GET` always reads (`GET .../k/release` reads the draft whose
+key is `k/release`, never "release k"). The C9.1 status read keeps its single-segment key.
+
 `state` is one of `generating`, `awaiting_approval`, `queued` (released, not yet claimed), `sending`, `sent`, `failed`,
 `unknown`, `cancelled`. An unknown key, another organization's key, and an ordinary (non-reply) dispatch are all the same
 `404`. No response carries a database id, a dispatch id, an RFC header, grounding context, a mailbox, or raw error text.
