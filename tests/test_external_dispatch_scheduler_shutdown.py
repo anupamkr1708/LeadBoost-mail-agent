@@ -563,3 +563,85 @@ def test_shutdown_drain_waits_for_claim_attempt_before_registration(
     assert not thread.is_alive()
     assert thread_errors == []
     assert runtime.resume_if_idle() is True
+
+
+# --------------------------------------------------------------------------------------------------------------
+# The idle main loop must not depend on the sleep syscall being interrupted by SIGTERM.
+#
+# Evidence behind this (tools/stress_shutdown.py, tools/direct_sigterm.py in the C9.5 V5 package): under CPU load a
+# real `python worker.py` occasionally did NOT run its SIGTERM handler for up to 60 s. Its main thread was in the
+# idle `time.sleep(60)`, the C-level handler had run (CPython's wakeup fd saw signal 15), `_terminating` was still
+# False, nothing was pending, and the process exited by itself, gracefully, exactly when the sleep ended (60.17 s).
+# The test above then failed with "timed out after 30 seconds". Nothing was deadlocked or lost -- shutdown was only
+# late, and a late shutdown is a real problem for a deploy that sends SIGTERM and waits a grace period.
+#
+# The test below recreates that state deterministically, with no load and no luck: SIGTERM is BLOCKED in the worker's
+# main thread and left unblocked in one ordinary helper thread, so the OS delivers it to the helper; the C handler
+# runs there and the main thread's sleep is not interrupted. Only a main loop that wakes up by itself can notice.
+
+_BLOCKED_MAIN_THREAD_DRIVER = r"""
+import runpy, signal, sys, threading, time
+up = threading.Event()
+def receiver():                       # keeps SIGTERM unblocked; created BEFORE the main thread blocks it
+    up.set(); threading.Event().wait()
+threading.Thread(target=receiver, daemon=True, name="sigterm-receiver").start(); up.wait()
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})   # threads started later inherit the block
+_real_sleep = time.sleep
+def _announce(seconds):               # lets the test know the MAIN thread is entering its idle sleep
+    if threading.current_thread() is threading.main_thread() and seconds >= 0.5:
+        print("MAIN-LOOP-SLEEP", seconds, flush=True)
+    return _real_sleep(seconds)
+time.sleep = _announce
+sys.argv = ["worker.py"]
+runpy.run_path("worker.py", run_name="__main__")
+"""
+
+
+def test_main_loop_slice_is_short():
+    """Guards the property the subprocess test below proves: the idle loop never sleeps for long."""
+    assert 0 < worker_mod.MAIN_LOOP_SLICE_SECONDS <= 2.0
+
+
+def test_sigterm_that_does_not_interrupt_the_main_threads_sleep_still_shuts_the_worker_down_promptly(tmp_path):
+    env = {**os.environ, "PYTHONPATH": ROOT, "DATABASE_URL": f"sqlite:///{tmp_path/'p.db'}",
+           "LIVE_SENDING_ENABLED": "false", "AUTO_REPLY_ENABLED": "false"}
+    proc = subprocess.Popen([sys.executable, "-c", _BLOCKED_MAIN_THREAD_DRIVER], cwd=ROOT, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines: list[str] = []
+    started, idle = threading.Event(), threading.Event()
+
+    def pump():
+        for line in proc.stdout:
+            lines.append(line)
+            if "Unified scheduler started" in line:
+                started.set()
+            if line.startswith("MAIN-LOOP-SLEEP"):
+                idle.set()
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        assert started.wait(60), "worker did not start:\n" + "".join(lines)
+        assert idle.wait(60), "main loop never reached its idle sleep:\n" + "".join(lines)
+        # Let the main thread get from the announcement into the sleep syscall itself. This settle only decides
+        # whether a REGRESSION is caught (a long sleep is then certainly in progress); the fixed loop passes
+        # whether or not the settle was long enough.
+        time.sleep(0.5)
+        t0 = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            rc = proc.wait(15)
+        except subprocess.TimeoutExpired:
+            pytest.fail("worker ignored SIGTERM for 15 s: its main loop is waiting out a long sleep instead of "
+                        "noticing a signal that did not interrupt it\n" + "".join(lines))
+        elapsed = time.monotonic() - t0
+        reader.join(5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    text = "".join(lines)
+    assert rc == 0, text
+    assert elapsed < 10, f"shutdown took {elapsed:.1f}s after SIGTERM"
+    assert "Shutting down background worker" in text, text
+    assert "external_dispatch: shutdown requested" in text, text
+    assert text.index("shutdown requested") < text.index("Scheduler stopped"), text

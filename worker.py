@@ -165,6 +165,9 @@ def graceful_shutdown(worker_id: str) -> None:
             "heartbeat will age into stale"
         )
 
+# How long the idle main loop sleeps between looks at pending signals (see the loop below). Keep it small.
+MAIN_LOOP_SLICE_SECONDS = 1.0
+
 if __name__ == "__main__":
     prepare_schema()
     install_signal_handlers()
@@ -185,6 +188,11 @@ if __name__ == "__main__":
     try:
         scheduler = start_scheduler(role=ROLE_WORKER)
         while True:
-            time.sleep(60)
+            # Sleep in SHORT slices. CPython runs the Python-level _handle_sigterm only in the main thread and
+            # only when it executes bytecode; a signal whose C handler ran without interrupting this thread's
+            # sleep (observed under CPU load: handler tripped, sleep not interrupted) would otherwise wait out the WHOLE sleep
+            # before graceful_shutdown starts -- up to 60 s with the old time.sleep(60), longer than a typical
+            # SIGTERM grace period. With a 1 s slice the shutdown starts within about a second either way.
+            time.sleep(MAIN_LOOP_SLICE_SECONDS)
     except (KeyboardInterrupt, SystemExit):
         graceful_shutdown(worker_id)
