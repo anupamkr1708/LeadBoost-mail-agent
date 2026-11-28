@@ -298,6 +298,31 @@ def table_counts(admin: dict, dbname: str) -> dict[str, int]:
     return {n: q(admin, dbname, f'SELECT count(*) FROM "{n}"')[0][0] for n in names}
 
 
+_CONTAINER_VERIFIED: set[tuple[str, int]] = set()
+
+
+def assert_container_serves_endpoint(container: str, port: int) -> None:
+    """The docker client tools connect through the container's own socket, so they must run inside the container that
+    actually serves the validated endpoint (127.0.0.1:<port>): ask Docker which host port it publishes for 5432."""
+    if (container, port) in _CONTAINER_VERIFIED:
+        return
+    env = {k: os.environ[k] for k in CHILD_ENV_ALLOW if k in os.environ}
+    try:
+        p = subprocess.run(
+            ["docker", "port", container, "5432/tcp"], env=env, capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(f"refusing: cannot ask docker which port {container} publishes ({type(exc).__name__}).") from None
+    bindings = sorted({ln.strip() for ln in p.stdout.splitlines() if ln.strip()})
+    if p.returncode != 0 or f"{GUARD_HOST}:{port}" not in bindings:
+        raise Refused(
+            f"refusing: container {container} does not publish 5432 on {GUARD_HOST}:{port} "
+            f"(docker port says: {bindings or 'nothing'}). The client container must be the guarded server."
+        )
+    _CONTAINER_VERIFIED.add((container, port))
+
+
+
 def pg_client_cmd(admin: dict, tool: str, dbname: str, extra: list[str]) -> tuple[list[str], dict]:
     mode = os.environ.get("REHEARSAL_PG_CLIENT", "local")
     env = {k: os.environ[k] for k in CHILD_ENV_ALLOW if k in os.environ}
@@ -306,6 +331,7 @@ def pg_client_cmd(admin: dict, tool: str, dbname: str, extra: list[str]) -> tupl
         container = mode.split(":", 1)[1]
         if not container.startswith("c95-"):
             raise Refused("refusing: REHEARSAL_PG_CLIENT container must be named c95-*")
+        assert_container_serves_endpoint(container, admin["port"])
         return (["docker", "exec", "-i", "-e", "PGPASSWORD", container, tool, "-U", admin["user"], "-d", dbname, *extra], env)
     if not shutil.which(tool):
         raise Refused(f"{tool} not found on PATH (set REHEARSAL_PG_CLIENT=docker:c95-pg16 or install the PostgreSQL client).")
